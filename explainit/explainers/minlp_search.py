@@ -120,110 +120,95 @@ class MINLSearchExplainer:
 # Shapley values for MINLP search
 ##################################
 
-    def calc_shapley(self, r : list, use_approximation: bool = False, num_samples: int = 200) -> list :
+    def calc_shapley(self, r: list, use_approximation: bool = False, num_samples: int = 200) -> list:
         """
-        x : sample (the one that results in prediction closest to target)
-        r : reference (the original sample)
-        f : model predict
-        cat_groups : list of lists containing categorical indices
-        use_approximation : if True, uses sampling-based approximation for faster computation
-        num_samples : number of samples to use for approximation (only used if use_approximation=True)
+        Calculate Shapley values for feature importance in counterfactual explanations.
+        
+        ## What are Shapley Values?
+        
+        Shapley values are a concept from cooperative game theory that fairly distributes 
+        the "contribution" of each feature to a model's prediction. In our context, they 
+        measure how much each feature contributes to the difference between the current 
+        sample and the closest sample that achieves our target prediction.
+        
+        ## Mathematical Foundation
+        
+        For a feature i, the Shapley value φᵢ is calculated as:
+        
+        φᵢ = Σ_{S⊆N\{i}} [|S|!(n-|S|-1)!/n!] × [f(S∪{i}) - f(S)]
+        
+        Where:
+        - N is the set of all features
+        - S is a subset of features not including i
+        - f(S) is the model prediction using features in S from closest_sample, others from reference
+        - n is the total number of features
+        - The weight |S|!(n-|S|-1)!/n! ensures fair attribution
+        
+        ## How It Works
+        
+        1. **Reference vs Target**: We compare the original sample (r) with the closest 
+           sample that achieves our target prediction (self.closest_sample)
+        
+        2. **Marginal Contributions**: For each feature, we calculate its marginal 
+           contribution across all possible subsets of other features
+        
+        3. **Weighted Average**: The final Shapley value is a weighted average of these 
+           marginal contributions, where weights ensure mathematical fairness
+        
+        ## Efficiency Features
+        
+        This vectorized implementation:
+        - Batches model predictions for significant speedup
+        - Supports both exact calculation and sampling-based approximation
+        - Handles categorical features by grouping related columns
+        - Reduces computational complexity from O(2ⁿ × n) individual predictions to batched operations
+        
+        Args:
+            r: Reference sample (original input)
+            use_approximation: If True, uses Monte Carlo sampling for faster computation
+            num_samples: Number of samples for approximation (only used if use_approximation=True)
+            
+        Returns:
+            numpy.ndarray: Shapley values for each feature/feature group
+            
+        Example:
+            >>> explainer = MINLSearchExplainer(model, priorities, sample, target, dataset)
+            >>> shapley_vals = explainer.calc_shapley(sample)
+            >>> print(f"Feature contributions: {shapley_vals}")
         """
-
         cat_groups = [list(elem) for elem in self.priorities['categorical'].keys()]
 
-        def flatten_args(func):
-            """Checks it there are tuples in input and flattens them to list.
-            e.g. if input is [1,2,3,(4,5), (7,8,9)] it provides with
-            [1,2,3,4,5,6,7,8,9]
-            """
-            def wrapper(x):
-                flattened = []
-                for elem in x:
-                    if isinstance(elem, tuple):
-                        flattened.extend(elem)
-                    else:
-                        flattened.append(elem)
-
-                flattened = np.array(flattened)
-                if flattened.ndim == 1:
-                    flattened = flattened.reshape(1, -1)
-                    return func(flattened)
-                return func(flattened)
+        def flatten_args_vectorized(func):
+            """Vectorized version of flatten_args that handles batch inputs"""
+            def wrapper(x_batch):
+                if x_batch.ndim == 1:
+                    x_batch = x_batch.reshape(1, -1)
+                
+                flattened_batch = []
+                for x in x_batch:
+                    flattened = []
+                    for elem in x:
+                        if isinstance(elem, tuple):
+                            flattened.extend(elem)
+                        else:
+                            flattened.append(elem)
+                    flattened_batch.append(flattened)
+                
+                return func(np.array(flattened_batch))
             return wrapper
 
-        def z_of_S(S, r, x):
-            """Hybrid vector for subset S"""
-            z = r.copy()
-            for i in S:
-                z[i] = x[i]
-            return z
-
-        def shapley_value(i, x, r, f, n):
-            total = 0
-            others = [j for j in range(n) if j != i]
-
-            subset_count = 0
-            total_subsets = 2 ** len(others)
-    
-            print(f"Computing Shapley for feature {i}, processing {total_subsets} subsets...")
-    
-            for k in range(len(others)+1):
-                for S in itertools.combinations(others, k):
-                    subset_count += 1
-                    if subset_count % 32 == 0:  # Progress update every 32 subsets
-                        print(f"  Feature {i}: {subset_count}/{total_subsets} subsets processed")
-            
-                    S = set(S)
-                    weight = factorial(len(S)) * factorial(n - len(S) - 1) / factorial(n)
-                    pred_with = f(z_of_S(S | {i}, r, x))
-                    pred_without = f(z_of_S(S, r, x))
-                    # Ensure we get scalar values by flattening if necessary
-                    if isinstance(pred_with, np.ndarray):
-                        pred_with = pred_with.flatten()[0]
-                    if isinstance(pred_without, np.ndarray):
-                        pred_without = pred_without.flatten()[0]
-                    diff = pred_with - pred_without
-                    total += weight * diff
-            return total
-
-        def shapley_value_approximate(i, x, r, f, n, num_samples=200):
-            """Fast approximation of Shapley values using sampling"""
-            total = 0
-            others = [j for j in range(n) if j != i]
-            
-            print(f"Computing approximate Shapley for feature {i}, using {num_samples} samples...")
-            
-            for _ in range(num_samples):
-                # Sample a random subset size
-                subset_size = random.randint(0, len(others))
-                # Sample a random subset of that size
-                if subset_size == 0:
-                    S = set()
-                elif subset_size == len(others):
-                    S = set(others)
-                else:
-                    S = set(random.sample(others, subset_size))
-                
-                # Calculate marginal contribution
-                pred_with = f(z_of_S(S | {i}, r, x))
-                pred_without = f(z_of_S(S, r, x))
-                
-                if isinstance(pred_with, np.ndarray):
-                    pred_with = pred_with.flatten()[0]
-                if isinstance(pred_without, np.ndarray):
-                    pred_without = pred_without.flatten()[0]
-                    
-                diff = pred_with - pred_without
-                total += diff
-            
-            return total / num_samples
+        def z_of_S_batch(S_list, r, x):
+            """Create batch of hybrid vectors for list of subsets S"""
+            z_batch = []
+            for S in S_list:
+                z = r.copy()
+                for i in S:
+                    z[i] = x[i]
+                z_batch.append(z)
+            return np.array(z_batch)
 
         def combine_categories(original, cat_groups, cat_idx):
-            """
-            Modifies variables so that the one-hot encoded features are combined into one as a tuple
-            for example values [23,26,7,0,0,1,0,0,0,1] would be [23,26,7,(0,0,1),(0,0,0,1)]
-            """
+            """Helper function for combining categorical features into tuples"""
             new_list = []
             idx_original = list(range(len(original)))
             passed_groups = []
@@ -233,48 +218,123 @@ class MINLSearchExplainer:
                 else:
                     if idx in passed_groups:
                         continue
-                    # Znajdź grupę indeksów w których jest zawarty idx
+                    # Find the group containing this index
                     for elem in cat_groups:
                         if idx in elem:
                             current_idx = elem
                             break
-                    # Znajdź elementy w oryginalnej liście odpowiadające grupie indeksów
+                    # Extract categorical values as tuple
                     cat_vals = [original[i] for i in current_idx]
-                    # Dodaj do new_list wartości jako tuple
                     new_list.append(tuple(cat_vals))
                     passed_groups.extend(current_idx)
-
             return new_list
 
-        x = self.closest_sample  # Define x here for the no-categorical case
-        f = self.model_pred      # Define f here for the no-categorical case
+        def shapley_value_vectorized(i, x, r, f, n):
+            """Vectorized exact Shapley value calculation"""
+            others = [j for j in range(n) if j != i]
+            
+            # Collect all subsets and their weights
+            all_subsets = []
+            all_subsets_with_i = []
+            all_weights = []
+            
+            total_subsets = 2 ** len(others)
+            print(f"Computing vectorized Shapley for feature {i}, processing {total_subsets} subsets in batches...")
+            
+            for k in range(len(others) + 1):
+                for S in itertools.combinations(others, k):
+                    S = set(S)
+                    weight = factorial(len(S)) * factorial(n - len(S) - 1) / factorial(n)
+                    
+                    all_subsets.append(S)
+                    all_subsets_with_i.append(S | {i})
+                    all_weights.append(weight)
+            
+            # Create batches for prediction
+            z_without_batch = z_of_S_batch(all_subsets, r, x)
+            z_with_batch = z_of_S_batch(all_subsets_with_i, r, x)
+            
+            # Batch predictions
+            pred_without_batch = f(z_without_batch)
+            pred_with_batch = f(z_with_batch)
+            
+            # Ensure we get proper scalar values
+            if pred_without_batch.ndim > 1:
+                pred_without_batch = pred_without_batch.flatten()
+            if pred_with_batch.ndim > 1:
+                pred_with_batch = pred_with_batch.flatten()
+            
+            # Calculate weighted differences
+            diff_batch = pred_with_batch - pred_without_batch
+            weighted_contributions = np.array(all_weights) * diff_batch
+            
+            total = np.sum(weighted_contributions)
+            return total
+
+        def shapley_value_approximate_vectorized(i, x, r, f, n, num_samples=200):
+            """Vectorized approximate Shapley values using sampling"""
+            others = [j for j in range(n) if j != i]
+            
+            print(f"Computing vectorized approximate Shapley for feature {i}, using {num_samples} samples...")
+            
+            # Generate all random subsets at once
+            all_subsets = []
+            all_subsets_with_i = []
+            
+            for _ in range(num_samples):
+                subset_size = random.randint(0, len(others))
+                if subset_size == 0:
+                    S = set()
+                elif subset_size == len(others):
+                    S = set(others)
+                else:
+                    S = set(random.sample(others, subset_size))
+                
+                all_subsets.append(S)
+                all_subsets_with_i.append(S | {i})
+            
+            # Create batches for prediction
+            z_without_batch = z_of_S_batch(all_subsets, r, x)
+            z_with_batch = z_of_S_batch(all_subsets_with_i, r, x)
+            
+            # Batch predictions
+            pred_without_batch = f(z_without_batch)
+            pred_with_batch = f(z_with_batch)
+            
+            # Ensure proper shape
+            if pred_without_batch.ndim > 1:
+                pred_without_batch = pred_without_batch.flatten()
+            if pred_with_batch.ndim > 1:
+                pred_with_batch = pred_with_batch.flatten()
+            
+            # Calculate average marginal contribution
+            diff_batch = pred_with_batch - pred_without_batch
+            total = np.mean(diff_batch)
+            
+            return total
+
+        # Process categorical combinations if needed
+        x = self.closest_sample
+        f = self.model_pred
 
         if cat_groups:
-            #transforms list of values so that categorical values are kept in tuples
-            # so instead [23,26,7,0,0,1,0,0,0,1] you will get [23,26,7,(0,0,1),(0,0,0,1)]
-
-            # Assert that all integers in each group are consecutive
+            # Assert consecutive integers for categorical groups
             for elem in cat_groups:
                 assert all(elem[j] == elem[j-1] + 1 for j in range(1, len(elem))), \
-                f"Elements in group {elem} are not consecutive integers. Make sure that categorical features are next to each other"
+                    f"Elements in group {elem} are not consecutive integers."
 
             cat_idx = [item for sublist in cat_groups for item in sublist]
             x = combine_categories(self.closest_sample, cat_groups, cat_idx)
             r = combine_categories(r, cat_groups, cat_idx)
-
-            # if cat_groups are used then wrapper for f is required
-            # It need to flatten input values of type 
-            # [23,26,7,(0,0,1),(0,0,0,1)] to 
-            # [23,26,7,0,0,1,0,0,0,1]
-            f = flatten_args(self.model_pred)
+            f = flatten_args_vectorized(self.model_pred)
 
         n = len(r)
         
         # Choose between exact and approximate calculation
         if use_approximation:
-            phi = [shapley_value_approximate(i, x, r, f, n, num_samples) for i in range(n)]
+            phi = [shapley_value_approximate_vectorized(i, x, r, f, n, num_samples) for i in range(n)]
         else:
-            phi = [shapley_value(i, x, r, f, n) for i in range(n)]
+            phi = [shapley_value_vectorized(i, x, r, f, n) for i in range(n)]
 
         return np.array(phi, dtype=float)
     
@@ -286,18 +346,23 @@ class MINLSearchExplainer:
         """
         Create modified priorities dictionary based on SHAP values and sample data.
         
-        For categorical features:
-        - If SHAP value is 0: keep only the category from sample
-        - If SHAP value is not 0: keep categories from both sample and closest_sample
+        This method processes the calculated Shapley values to determine which categorical 
+        combinations should be considered during the counterfactual search. The logic is:
         
-        Args:
-            priorities: Original priorities dictionary
-            shap_vals: SHAP values array/list (corresponds to feature groups, not individual indices)
-            sample: Current sample values array/list
-            closest_sample: Closest sample values array/list
+        For categorical features:
+        - If SHAP value is 0: Feature doesn't contribute to prediction difference, 
+          so keep only the category from the original sample
+        - If SHAP value is not 0: Feature contributes to prediction difference, 
+          so allow categories from both sample and closest_sample
+        
+        This reduces the search space by eliminating categorical combinations that 
+        don't contribute to achieving the target prediction.
         
         Returns:
             tuple: (modified_priorities_dict, all_combinations_dict, shap_values_dict)
+                - modified_priorities_dict: Updated priorities with filtered categorical options
+                - all_combinations_dict: All possible categorical combinations to explore
+                - shap_values_dict: SHAP values organized by feature type and index
         """
 
 
@@ -393,16 +458,27 @@ class MINLSearchExplainer:
 
     def constraint_function(self, x, shap_dict, sample, closest_sample, priorities_for_search, basic_prediction):
         """
-        Constraint function based on SHAP values and feature changes. Returns the cumulative effect of feature changes on the prediction.
+        Constraint function based on SHAP values and feature changes. 
+        
+        This function estimates the model prediction for input x using linear approximation
+        based on Shapley values. It's used as a constraint during optimization to ensure
+        the counterfactual achieves the target prediction.
+        
+        The approximation works by:
+        1. Starting with the basic prediction for the original sample
+        2. Adding linear contributions from numerical features based on their Shapley values
+        3. Adding discrete contributions from categorical features based on their Shapley values
+        
         Args:
             x: Current feature values array/list
             shap_dict: Dictionary containing SHAP values for numerical and categorical features
             sample: Original sample feature values array/list
             closest_sample: Closest sample feature values array/list
             priorities_for_search: Modified priorities dictionary
+            basic_prediction: Model prediction for the original sample
+            
         Returns:
-            float: Cumulative effect of feature changes on the prediction. 
-            Basically the difference between model_pred(x) and model_pred(sample) according to Shapley values.
+            float: Estimated prediction value based on Shapley value approximation
         """
         num_shap=shap_dict['numerical']
         cat_shap=shap_dict['categorical']
@@ -654,15 +730,22 @@ class MINLSearchExplainer:
 
     def calculate_total_weight(self, values):
         """
-        Calculate total weight based on priorities dictionary and input values list.
-        Validates that all values are within allowed ranges or acceptable categorical combinations.
+        Calculate total weight (cost) based on priorities dictionary and input values list.
+        
+        This function computes the total cost of changing features from the original sample
+        to the proposed counterfactual values. It validates that all values are within 
+        allowed ranges for numerical features and acceptable categorical combinations.
+        
+        The weight calculation follows the priority functions defined in self.priorities:
+        - For numerical features: applies the weight function to the feature value
+        - For categorical features: uses predefined weights for specific combinations
+        - For unactionable features (priority 0): contributes 0 to total weight
         
         Args:
-            priorities: Dictionary containing numerical and categorical priorities
-            values: List of values where each element corresponds to its index
+            values: List of values where each element corresponds to its feature index
         
         Returns:
-            float: Total calculated weight
+            float: Total calculated weight (cost) for the proposed feature changes
         
         Raises:
             ValueError: If any value is outside allowed range or invalid categorical combination
@@ -716,6 +799,20 @@ class MINLSearchExplainer:
         return total_weight
 
     def find_counterfactuals(self, shap_approx=False, num_samples=200):
+        """
+        Find counterfactual explanations using Mixed-Integer Nonlinear Programming (MINLP) approach.
+        
+        This method uses Shapley values to understand feature importance and then searches for 
+        counterfactual examples that achieve the target prediction while minimizing the total 
+        cost (weight) based on the priority function.
+        
+        Args:
+            shap_approx: If True, uses sampling-based approximation for Shapley value calculation
+            num_samples: Number of samples for Shapley value approximation
+            
+        Returns:
+            list: List of counterfactual examples (modified feature vectors)
+        """
         def create_bounds(priorities, sample):
             bounds = []
             num_part = priorities['numerical']
