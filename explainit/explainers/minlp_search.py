@@ -120,14 +120,16 @@ class MINLSearchExplainer:
 # Shapley values for MINLP search
 ##################################
 
-    def calc_shapley(self, r : list) -> list :
+    def calc_shapley(self, r : list, use_approximation: bool = False, num_samples: int = 200) -> list :
         """
         x : sample (the one that results in prediction closest to target)
         r : reference (the original sample)
         f : model predict
         cat_groups : list of lists containing categorical indices
+        use_approximation : if True, uses sampling-based approximation for faster computation
+        num_samples : number of samples to use for approximation (only used if use_approximation=True)
         """
-        
+
         cat_groups = [list(elem) for elem in self.priorities['categorical'].keys()]
 
         def flatten_args(func):
@@ -160,8 +162,18 @@ class MINLSearchExplainer:
         def shapley_value(i, x, r, f, n):
             total = 0
             others = [j for j in range(n) if j != i]
+
+            subset_count = 0
+            total_subsets = 2 ** len(others)
+    
+            print(f"Computing Shapley for feature {i}, processing {total_subsets} subsets...")
+    
             for k in range(len(others)+1):
                 for S in itertools.combinations(others, k):
+                    subset_count += 1
+                    if subset_count % 32 == 0:  # Progress update every 32 subsets
+                        print(f"  Feature {i}: {subset_count}/{total_subsets} subsets processed")
+            
                     S = set(S)
                     weight = factorial(len(S)) * factorial(n - len(S) - 1) / factorial(n)
                     pred_with = f(z_of_S(S | {i}, r, x))
@@ -173,9 +185,39 @@ class MINLSearchExplainer:
                         pred_without = pred_without.flatten()[0]
                     diff = pred_with - pred_without
                     total += weight * diff
-                    # print(f"Feature {i+1}, S={S}, weight={weight:.3f}, "
-                    #     f"diff={diff}, contrib={weight*diff:.2f}")
             return total
+
+        def shapley_value_approximate(i, x, r, f, n, num_samples=200):
+            """Fast approximation of Shapley values using sampling"""
+            total = 0
+            others = [j for j in range(n) if j != i]
+            
+            print(f"Computing approximate Shapley for feature {i}, using {num_samples} samples...")
+            
+            for _ in range(num_samples):
+                # Sample a random subset size
+                subset_size = random.randint(0, len(others))
+                # Sample a random subset of that size
+                if subset_size == 0:
+                    S = set()
+                elif subset_size == len(others):
+                    S = set(others)
+                else:
+                    S = set(random.sample(others, subset_size))
+                
+                # Calculate marginal contribution
+                pred_with = f(z_of_S(S | {i}, r, x))
+                pred_without = f(z_of_S(S, r, x))
+                
+                if isinstance(pred_with, np.ndarray):
+                    pred_with = pred_with.flatten()[0]
+                if isinstance(pred_without, np.ndarray):
+                    pred_without = pred_without.flatten()[0]
+                    
+                diff = pred_with - pred_without
+                total += diff
+            
+            return total / num_samples
 
         def combine_categories(original, cat_groups, cat_idx):
             """
@@ -204,6 +246,9 @@ class MINLSearchExplainer:
 
             return new_list
 
+        x = self.closest_sample  # Define x here for the no-categorical case
+        f = self.model_pred      # Define f here for the no-categorical case
+
         if cat_groups:
             #transforms list of values so that categorical values are kept in tuples
             # so instead [23,26,7,0,0,1,0,0,0,1] you will get [23,26,7,(0,0,1),(0,0,0,1)]
@@ -224,7 +269,12 @@ class MINLSearchExplainer:
             f = flatten_args(self.model_pred)
 
         n = len(r)
-        phi = [shapley_value(i, x, r, f, n) for i in range(n)]
+        
+        # Choose between exact and approximate calculation
+        if use_approximation:
+            phi = [shapley_value_approximate(i, x, r, f, n, num_samples) for i in range(n)]
+        else:
+            phi = [shapley_value(i, x, r, f, n) for i in range(n)]
 
         return np.array(phi, dtype=float)
     
@@ -559,16 +609,17 @@ class MINLSearchExplainer:
                 'method_used': 'corner_analysis'
             }
 
-    def confirm_existence_of_solution_for_combo(self):
+    def confirm_existence_of_solution_for_combo(self, use_approximation=False, num_samples=200):
 
         # 1. Calculate SHAP values for the sample
-        self.shap_vals = self.calc_shapley(self.sample)
-
+        self.shap_vals = self.calc_shapley(self.sample, use_approximation=use_approximation, num_samples=num_samples)
+        logger.info(f'SHAP values: {self.shap_vals}')
         # 2. Prepare variables for next steps, including categorical combinations
         priorities_for_search, cat_combinations, shap_dict = self.create_modified_priorities()
         self.shap_dict = shap_dict
         # 3. Extract targets for linear search for each categorical combination
         basic_prediction=self.model_pred([self.sample])[0]
+
         target_for_combo, shap_coefficients = self.extract_for_linear_search(cat_combinations, shap_dict, priorities_for_search, basic_prediction=basic_prediction)
         indices_to_modify = list(shap_coefficients.keys())
         coeff_to_linear_search = [elem['coeff'] for elem in shap_coefficients.values()]
@@ -664,7 +715,7 @@ class MINLSearchExplainer:
         
         return total_weight
 
-    def find_counterfactuals(self):
+    def find_counterfactuals(self, shap_approx=False, num_samples=200):
         def create_bounds(priorities, sample):
             bounds = []
             num_part = priorities['numerical']
@@ -676,14 +727,16 @@ class MINLSearchExplainer:
                 bounds.append(temp_bound)
 
             return bounds
-
         bounds = create_bounds(self.priorities, self.sample)
+        logger.info(f"Bounds for numerical features: {bounds}")
         # x0 = np.array([self.closest_sample[idx] for idx in self.priorities['numerical'].keys()])
         # epsilon = 0.01
-        init_vals_per_combo, priorities_for_search = self.confirm_existence_of_solution_for_combo()
+        init_vals_per_combo, priorities_for_search = self.confirm_existence_of_solution_for_combo(use_approximation=shap_approx, num_samples=num_samples)
+        logger.info(f"Initial values per combination: {init_vals_per_combo}")
+        logger.info(f"Priorities for search: {priorities_for_search}")
+
         counterfactuals = []
         for i, values in init_vals_per_combo.items():
-
             prepared_input = self.sample.copy()
             initial_numerical = values['initial_solution']
             cat_combo = values['categorical_combo']
