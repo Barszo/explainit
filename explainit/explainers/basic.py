@@ -52,6 +52,7 @@ def basic_function(
 
 # * INITIAL SELECTION
 
+    numerous_cols_dict = {}
     for n_cols in range(1,max_modifiability+1):
         modification_set = get_combinations_for_modifiability(numerical_idx, list(categorical_groups.values()), actionability, n_cols)
 
@@ -59,8 +60,11 @@ def basic_function(
         
         mod_vals_dict = {}
         for cols_idx in modification_set:
+
+            # * If only one column is selected for modification
             if n_cols == 1:
-                # checking if the feature is categorical
+
+                # ! Categorical features
                 if tuple(cols_idx) in list(unique_categories_dict.keys()):
 
                     # finding set of unique categorical values and removing
@@ -79,21 +83,41 @@ def basic_function(
                             if model_predict([mod_values]) == expected_prediction:
                                 mod_vals_list.append(mod_values)
 
-                # for numerical features
+                # ! Numerical features
+                # TODO: Modify learning rate based on probability, if change did not 
+                # lead to high probability then learning rate should be increased
+                # or decreased accordingly
                 else:
                     
                     lr = learning_rate[cols_idx[0]]
                     if type_of_search == 'gradual':
                         mod_vals_list = []
-                        for i in range(-max_examples, max_examples + 1):
+
+                        # Looking higher than original value
+                        for i in range(0, max_examples + 1):
                             mod_values = original_values.copy()
                             mod_values[cols_idx[0]] += i * lr
                             
                             if model_predict([mod_values]) == expected_prediction:
                                 mod_vals_list.append(mod_values)
+                                break
+
+                        # Looking lower than original value
+                        for i in range(0, max_examples + 1):
+                            mod_values = original_values.copy()
+                            mod_values[cols_idx[0]] -= i * lr
+                            
+                            if model_predict([mod_values]) == expected_prediction:
+                                mod_vals_list.append(mod_values)
+                                break
+
                 mod_vals_dict[cols_idx] = mod_vals_list
+
+            # TODO: handle case with multiple columns selected for modification
             else:
                 pass
+
+            numerous_cols_dict[n_cols] = mod_vals_dict
         print(mod_vals_dict)
 
             # Modify categorical columns with unique_categories_dict
