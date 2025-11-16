@@ -511,7 +511,87 @@ class MINLSearchExplainer:
         return result
     
     def extract_for_linear_search(self, cat_combinations, shap_dict, priorities_for_search, basic_prediction):
-
+        """
+        Transform the nonlinear counterfactual search problem into linear programming subproblems.
+        
+        This function is the core mathematical engine that converts the complex counterfactual 
+        optimization problem into manageable linear programming problems. It uses Shapley values 
+        to create linear approximations of how feature changes affect model predictions.
+        
+        ## Mathematical Foundation
+        
+        The function approximates the constraint equation:
+        ```
+        model_prediction(x) ≈ basic_prediction + Σ(unit_phi_i × (x_i - sample_i)) + categorical_contributions
+        ```
+        
+        Where:
+        - `unit_phi_i` is the per-unit Shapley contribution for numerical feature i
+        - `categorical_contributions` are discrete Shapley values for categorical combinations
+        
+        ## The Transformation Process
+        
+        1. **Numerical Features**: Converts Shapley values into linear coefficients
+           - For each numerical feature i: `unit_phi_i = shapley_i / (closest_sample_i - sample_i)`
+           - This gives the linear rate of change in prediction per unit change in feature
+        
+        2. **Categorical Features**: Calculates discrete contributions
+           - Each categorical combination contributes a fixed Shapley value
+           - Only valid combinations from `cat_combinations` are considered
+        
+        3. **Target Adjustment**: Creates adjusted targets for linear programming
+           - Original target: `self.target`
+           - Subtract categorical contributions and baseline effects
+           - Result: target value that numerical features must achieve
+        
+        ## Why This Decomposition Works
+        
+        By fixing categorical features to specific combinations, the problem becomes:
+        ```
+        Find numerical features x such that:
+        Σ(coefficient_i × x_i) = adjusted_target
+        ```
+        
+        This is a standard linear programming constraint that can be solved efficiently.
+        
+        ## Example Workflow
+        
+        Suppose we want model prediction = 0.8, current prediction = 0.3:
+        1. Fix categorical features to combination A
+        2. Calculate categorical contribution: +0.2
+        3. Remaining gap to fill with numerical features: 0.8 - 0.3 - 0.2 = 0.3
+        4. Use Shapley coefficients to find numerical values achieving +0.3 prediction change
+        
+        Args:
+            cat_combinations (dict): Dictionary mapping combination IDs to categorical feature 
+                                   value dictionaries. Format: {combo_id: {feature_idx: value}}
+            shap_dict (dict): Shapley values organized as {'numerical': {idx: shap_val}, 
+                             'categorical': {feature_indices: shap_val}}
+            priorities_for_search (dict): Modified priorities containing actionable features with
+                                        bounds. Format: {'numerical': {idx: {'min': val, 'max': val}}}
+            basic_prediction (float): Model's prediction for the original sample
+            
+        Returns:
+            tuple: (new_targets, shap_coeffs)
+                - new_targets (dict): Mapping from combination ID to adjusted target value
+                  that numerical features must achieve through linear programming
+                - shap_coeffs (dict): Linear coefficients and bounds for numerical features.
+                  Format: {feature_idx: {'coeff': linear_coefficient, 'min_max': (min, max)}}
+                  
+        Raises:
+            ValueError: If an invalid categorical combination is encountered that doesn't
+                       match either the sample or closest_sample values
+                       
+        Example:
+            >>> cat_combos = {0: {3: 1.0, 4: 0.0}, 1: {3: 0.0, 4: 1.0}}
+            >>> shap_dict = {'numerical': {0: 0.1, 1: -0.2}, 'categorical': {(3,4): 0.15}}
+            >>> targets, coeffs = explainer.extract_for_linear_search(cat_combos, shap_dict, 
+            ...                                                      priorities, 0.5)
+            >>> print(targets)  # {0: 0.23, 1: 0.08}  # Different targets per combination
+            >>> print(coeffs)   # {0: {'coeff': 2.5, 'min_max': (0, 1)}, ...}
+        """
+        print('cat_combinations:', cat_combinations)
+        print('shap_dict:', shap_dict)
         num_shap = shap_dict['numerical']
         cat_shap = shap_dict['categorical']
 
@@ -527,39 +607,43 @@ class MINLSearchExplainer:
                 shap_coeffs[key] = {'coeff':temp_unit_phi, 'min_max':(min_val, max_val)}
                 coef_times_original += temp_unit_phi * self.sample[key]
 
-        
-        for combo_idx, combo in cat_combinations.items():
-            result = 0.0
-            if not combo:
-                print("Empty combination, skipping")
-                continue
+        if len(cat_combinations[0]) != 0:
+        #if there are categorical features
+            for combo_idx, combo in cat_combinations.items():
+                result = 0.0
+                if not combo:
+                    print("Empty combination, skipping")
+                    continue
 
-            # ensure array is large enough for the highest index (max index is inclusive)
-            max_idx = max(combo.keys())
-            dummy_x = np.zeros(max_idx + 1, dtype=float)
+                # ensure array is large enough for the highest index (max index is inclusive)
+                max_idx = max(combo.keys())
+                dummy_x = np.zeros(max_idx + 1, dtype=float)
 
-            for idx, val in combo.items():
-                dummy_x[idx] = val
+                for idx, val in combo.items():
+                    dummy_x[idx] = val
 
 
-            for i, key in enumerate(priorities_for_search['categorical'].keys()):
-                feature_indices = key
-                shap_value = cat_shap[feature_indices]
-            
-                # Extract current values from x
-                current_values = tuple(float(dummy_x[idx]) for idx in feature_indices) #tuple(float(x[len(priorities_for_search['numerical']) + i + j]) for j in range(len(feature_indices)))
-            
-                sample_values = tuple(float(self.sample[idx]) for idx in feature_indices)
-                closest_values = tuple(float(self.closest_sample[idx]) for idx in feature_indices)
-            
-                if current_values == sample_values:
-                    result += 0.0
-                elif current_values == closest_values:
-                    result += shap_value
-                else:
-                    raise ValueError("Invalid categorical combination encountered for indices {}: {}".format(feature_indices, current_values))
+                for i, key in enumerate(priorities_for_search['categorical'].keys()):
+                    feature_indices = key
+                    shap_value = cat_shap[feature_indices]
+                
+                    # Extract current values from x
+                    current_values = tuple(float(dummy_x[idx]) for idx in feature_indices) #tuple(float(x[len(priorities_for_search['numerical']) + i + j]) for j in range(len(feature_indices)))
+                
+                    sample_values = tuple(float(self.sample[idx]) for idx in feature_indices)
+                    closest_values = tuple(float(self.closest_sample[idx]) for idx in feature_indices)
+                
+                    if current_values == sample_values:
+                        result += 0.0
+                    elif current_values == closest_values:
+                        result += shap_value
+                    else:
+                        raise ValueError("Invalid categorical combination encountered for indices {}: {}".format(feature_indices, current_values))
 
-            new_targets[combo_idx] = self.target - result - basic_prediction + coef_times_original #- unactionable_sum
+                new_targets[combo_idx] = self.target - result - basic_prediction + coef_times_original #- unactionable_sum
+        else:
+            # no categorical features
+            new_targets[0] = self.target - basic_prediction + coef_times_original
 
         return new_targets, shap_coeffs
     
@@ -704,7 +788,9 @@ class MINLSearchExplainer:
         # 4. For each categorical combination, solve the linear programming problem to find at least one solution
         combo_and_initial_solutions = {}
         for combination_id, temp_target in target_for_combo.items():
+            logger.info(f'Processing combination_id: {combination_id} with target: {temp_target}')
             temp_combo = cat_combinations[combination_id]
+            logger.info(f'temp_combo: {temp_combo}')
             dummy_x = self.sample.copy()
 
             for idx, val in temp_combo.items():
@@ -724,9 +810,396 @@ class MINLSearchExplainer:
                 assert abs(self.constraint_function(dummy_x, shap_dict, self.sample, self.closest_sample, priorities_for_search, basic_prediction=self.model_pred([self.sample])[0])-self.target) <= self.epsilon, \
                     f"Constraint function value {self.constraint_function(dummy_x, shap_dict, self.sample, self.closest_sample, priorities_for_search, basic_prediction=self.model_pred([self.sample])[0])} exceeds tolerance {self.epsilon}"
                 logger.info(f'constraint_function: {self.constraint_function(dummy_x, shap_dict, self.sample, self.closest_sample, priorities_for_search, basic_prediction=self.model_pred([self.sample])[0])}')
-
+        if len(combo_and_initial_solutions) == 0:
+            # Try to find intelligent bounds adjustments
+            bounds_adjustment = self.find_required_bounds_adjustments(
+                cat_combinations, shap_dict, priorities_for_search, 
+                basic_prediction, target_for_combo, shap_coefficients
+            )
+            
+            if bounds_adjustment['feasible_with_shifts']:
+                logger.warning("No feasible solutions found with current bounds, but solutions possible with adjusted bounds:")
+                for feature_idx, adjustment in bounds_adjustment['required_shifts'].items():
+                    logger.warning(f"Feature {feature_idx}: {adjustment['justification']}")
+                    logger.warning(f"  Current bounds: {adjustment['original_bounds']}")
+                    logger.warning(f"  Suggested bounds: {adjustment['suggested_bounds']}")
+                
+                raise ValueError(
+                    f"No feasible initial solutions found for any categorical combination. "
+                    f"However, solutions may be possible with adjusted bounds. "
+                    f"Consider adjusting bounds for features: {list(bounds_adjustment['required_shifts'].keys())}"
+                )
+            else:
+                raise ValueError("No feasible initial solutions found for any categorical combination, even with bounds adjustments.")
+                
         return combo_and_initial_solutions, priorities_for_search
+
+    def find_required_bounds_adjustments(self, cat_combinations, shap_dict, priorities_for_search, 
+                                       basic_prediction, target_for_combo, shap_coefficients):
+        """
+        Intelligently determine how bounds should be adjusted to enable feasible solutions.
+        
+        This function analyzes why no feasible solutions were found and calculates the minimum
+        bounds adjustments needed to make the problem feasible. It uses both the linear approximation
+        and direct search methods to identify which features need expanded bounds.
+        
+        Algorithm:
+        1. Try single-feature solutions to identify which features can solve the constraint alone
+        2. Calculate minimum bounds shifts needed for feasibility
+        3. Validate suggestions using actual model constraint function
+        4. Provide actionable recommendations for bounds adjustment
+        
+        Args:
+            cat_combinations: Dictionary of categorical feature combinations
+            shap_dict: Shapley values organized by feature type
+            priorities_for_search: Current priorities with bounds
+            basic_prediction: Model prediction for original sample
+            target_for_combo: Target values for each categorical combination
+            shap_coefficients: Linear coefficients from Shapley analysis
+            
+        Returns:
+            dict: {
+                'feasible_with_shifts': bool,
+                'required_shifts': {feature_idx: {'original_bounds', 'suggested_bounds', 'justification'}},
+                'affected_combinations': list,
+                'confidence': float
+            }
+        """
+        logger.info("Analyzing bounds constraints to find required adjustments...")
+        
+        indices_to_modify = list(shap_coefficients.keys())
+        coeff_to_linear_search = [shap_coefficients[idx]['coeff'] for idx in indices_to_modify]
+        original_bounds = [shap_coefficients[idx]['min_max'] for idx in indices_to_modify]
+        
+        required_shifts = {}
+        feasible_combinations = []
+        
+        # Analyze each categorical combination
+        for combination_id, temp_target in target_for_combo.items():
+            logger.info(f"Analyzing infeasibility for combination {combination_id}")
+            logger.info(f"Target to achieve: {temp_target}")
+            
+            # Method 1: Try single-feature solutions (often most practical)
+            single_feature_solutions = self._find_single_feature_solutions(
+                combination_id, temp_target, indices_to_modify, 
+                coeff_to_linear_search, original_bounds
+            )
+            
+            # Method 2: Try unconstrained multi-feature solution
+            unconstrained_solution = self._solve_unconstrained_linear_system(
+                coeff_to_linear_search, temp_target
+            )
+            
+            # Combine results from both methods
+            all_candidate_shifts = {}
+            
+            # Process single-feature solutions
+            for feature_idx, info in single_feature_solutions.items():
+                if info['requires_bounds_shift']:
+                    all_candidate_shifts[feature_idx] = {
+                        'original_bounds': info['current_bounds'],
+                        'suggested_bounds': info['required_bounds'],
+                        'justification': info['justification'],
+                        'shift_magnitude': info['shift_magnitude'],
+                        'method': 'single_feature'
+                    }
+            
+            # Process unconstrained solution
+            if unconstrained_solution is not None:
+                for i, feature_idx in enumerate(indices_to_modify):
+                    optimal_value = unconstrained_solution[i]
+                    current_bounds = original_bounds[i]
+                    min_bound, max_bound = current_bounds
+                    
+                    shift_needed = 0
+                    new_min, new_max = min_bound, max_bound
+                    
+                    if optimal_value < min_bound:
+                        shift_needed = min_bound - optimal_value
+                        new_min = optimal_value - 0.05 * abs(optimal_value + 1e-6)
+                        justification = f"Multi-feature solution needs decrease by {shift_needed:.3f}"
+                        
+                    elif optimal_value > max_bound:
+                        shift_needed = optimal_value - max_bound
+                        new_max = optimal_value + 0.05 * abs(optimal_value + 1e-6)
+                        justification = f"Multi-feature solution needs increase by {shift_needed:.3f}"
+                    
+                    if shift_needed > 0:
+                        # Compare with single-feature solution if it exists
+                        if feature_idx in all_candidate_shifts:
+                            existing_shift = all_candidate_shifts[feature_idx]['shift_magnitude']
+                            if shift_needed < existing_shift:  # Prefer smaller shifts
+                                all_candidate_shifts[feature_idx] = {
+                                    'original_bounds': current_bounds,
+                                    'suggested_bounds': (new_min, new_max),
+                                    'justification': justification,
+                                    'shift_magnitude': shift_needed,
+                                    'method': 'multi_feature'
+                                }
+                        else:
+                            all_candidate_shifts[feature_idx] = {
+                                'original_bounds': current_bounds,
+                                'suggested_bounds': (new_min, new_max),
+                                'justification': justification,
+                                'shift_magnitude': shift_needed,
+                                'method': 'multi_feature'
+                            }
+            
+            # Update global required_shifts with best options
+            for feature_idx, shift_info in all_candidate_shifts.items():
+                if feature_idx not in required_shifts:
+                    required_shifts[feature_idx] = shift_info.copy()
+                    required_shifts[feature_idx]['combinations_affected'] = [combination_id]
+                else:
+                    # Keep the shift that requires smaller adjustment
+                    existing_shift = required_shifts[feature_idx]['shift_magnitude']
+                    if shift_info['shift_magnitude'] < existing_shift:
+                        required_shifts[feature_idx] = shift_info.copy()
+                        required_shifts[feature_idx]['combinations_affected'] = [combination_id]
+                    required_shifts[feature_idx]['combinations_affected'].append(combination_id)
+        
+        # Step 3: Validate suggestions using actual model if any shifts were identified
+        confidence = 0.0
+        feasible_with_shifts = False
+        
+        if required_shifts:
+            feasible_with_shifts, confidence = self._validate_bounds_adjustments(
+                required_shifts, cat_combinations, shap_dict, priorities_for_search, 
+                basic_prediction, indices_to_modify, coeff_to_linear_search, target_for_combo
+            )
+            
+            # Get list of combinations that become feasible
+            all_affected_combinations = set()
+            for shift_info in required_shifts.values():
+                all_affected_combinations.update(shift_info['combinations_affected'])
+            feasible_combinations = list(all_affected_combinations)
+        
+        return {
+            'feasible_with_shifts': feasible_with_shifts,
+            'required_shifts': required_shifts,
+            'affected_combinations': feasible_combinations,
+            'confidence': confidence
+        }
     
+    def _find_single_feature_solutions(self, combination_id, target, indices_to_modify, 
+                                     coefficients, original_bounds):
+        """
+        Find solutions that change only one feature at a time.
+        
+        This method is often more practical than multi-feature solutions and matches
+        how users often think about the problem (e.g., "just increase income").
+        """
+        single_feature_solutions = {}
+        
+        for i, feature_idx in enumerate(indices_to_modify):
+            coeff = coefficients[i]
+            current_bounds = original_bounds[i]
+            min_bound, max_bound = current_bounds
+            
+            if abs(coeff) < 1e-10:  # Skip features with near-zero coefficients
+                continue
+                
+            # Calculate required feature value to achieve target by changing only this feature
+            required_value = target / coeff
+            
+            logger.info(f"Feature {feature_idx}: coeff={coeff:.6f}, required_value={required_value:.6f}, bounds=({min_bound:.6f}, {max_bound:.6f})")
+            
+            requires_shift = False
+            shift_magnitude = 0
+            new_min, new_max = min_bound, max_bound
+            justification = ""
+            
+            if required_value < min_bound:
+                shift_magnitude = min_bound - required_value
+                new_min = required_value - 0.1 * abs(required_value + 1e-6)
+                justification = f"Single-feature solution needs value {required_value:.3f}, below current min {min_bound:.3f}"
+                requires_shift = True
+                
+            elif required_value > max_bound:
+                shift_magnitude = required_value - max_bound
+                new_max = required_value + 0.1 * abs(required_value + 1e-6)
+                justification = f"Single-feature solution needs value {required_value:.3f}, above current max {max_bound:.3f}"
+                requires_shift = True
+            else:
+                justification = f"Single-feature solution feasible with value {required_value:.3f}"
+            
+            single_feature_solutions[feature_idx] = {
+                'required_value': required_value,
+                'current_bounds': current_bounds,
+                'required_bounds': (new_min, new_max),
+                'requires_bounds_shift': requires_shift,
+                'shift_magnitude': shift_magnitude,
+                'justification': justification,
+                'coefficient': coeff
+            }
+        
+        return single_feature_solutions
+    
+    def _solve_unconstrained_linear_system(self, coefficients, target):
+        """
+        Solve the linear system without bounds constraints to find optimal feature values.
+        
+        For the system: c₁x₁ + c₂x₂ + ... + cₙxₙ = target
+        We need to find one solution. We use least-norm solution when underdetermined.
+        """
+        coefficients = np.array(coefficients)
+        
+        # Handle case where all coefficients are zero
+        if np.allclose(coefficients, 0):
+            return None
+            
+        # For underdetermined system, find minimum norm solution
+        try:
+            # Use pseudoinverse to find least-squares solution
+            A = coefficients.reshape(1, -1)  # Shape: (1, n)
+            b = np.array([target])  # Shape: (1,)
+            
+            solution = np.linalg.pinv(A) @ b
+            return solution
+            
+        except np.linalg.LinAlgError:
+            # If system is inconsistent, find least-squares approximation
+            try:
+                solution = np.linalg.lstsq(A, b, rcond=None)[0]
+                return solution
+            except:
+                return None
+    
+    def _validate_bounds_adjustments(self, required_shifts, cat_combinations, shap_dict, 
+                                   priorities_for_search, basic_prediction, indices_to_modify, 
+                                   coeff_to_linear_search, target_for_combo):
+        """
+        Validate that the proposed bounds adjustments actually enable feasible solutions.
+        
+        Tests the adjusted bounds with the actual constraint function to ensure the
+        linear approximation-based suggestions work in practice.
+        """
+        # Create adjusted bounds
+        adjusted_bounds = []
+        for i, feature_idx in enumerate(indices_to_modify):
+            if feature_idx in required_shifts:
+                new_bounds = required_shifts[feature_idx]['suggested_bounds']
+                logger.info(f"Adjusting bounds for feature {feature_idx}: {new_bounds}")
+            else:
+                # Keep original bounds for features that don't need adjustment
+                original_priorities = priorities_for_search['numerical'][feature_idx]
+                new_bounds = (original_priorities['min'], original_priorities['max'])
+            adjusted_bounds.append(new_bounds)
+        
+        successful_validations = 0
+        total_attempts = 0
+        
+        # Test all categorical combinations with adjusted bounds
+        for combination_id, combo in cat_combinations.items():
+            total_attempts += 1
+            
+            # Get the pre-calculated target for this combination
+            if combination_id not in target_for_combo:
+                continue
+                
+            target = target_for_combo[combination_id]
+            logger.info(f"Validating combination {combination_id} with target {target}")
+            
+            # Try to solve with adjusted bounds
+            linear_solution = MINLSearchExplainer.solve_linear_constraint_lp(
+                coeff_to_linear_search, target, adjusted_bounds, 
+                method='auto', tolerance=self.epsilon
+            )
+            
+            if linear_solution['success']:
+                logger.info(f"LP solution found for combination {combination_id}")
+                
+                # Validate with actual model
+                dummy_x = self.sample.copy()
+                
+                # Set categorical features
+                for idx, val in combo.items():
+                    dummy_x[idx] = val
+                
+                # Set numerical features from LP solution
+                for i, feature_idx in enumerate(indices_to_modify):
+                    dummy_x[feature_idx] = linear_solution['solution'][i]
+                    logger.info(f"Set feature {feature_idx} to {linear_solution['solution'][i]} (bounds: {adjusted_bounds[i]})")
+                
+                # Check constraint with actual model
+                try:
+                    constraint_value = self.constraint_function(
+                        dummy_x, shap_dict, self.sample, self.closest_sample, 
+                        priorities_for_search, basic_prediction
+                    )
+                    
+                    error = abs(constraint_value - self.target)
+                    logger.info(f"Validation for combination {combination_id}: constraint={constraint_value:.3f}, target={self.target:.3f}, error={error:.3f}")
+                    
+                    if error <= self.epsilon:
+                        successful_validations += 1
+                        logger.info(f"Validation SUCCESSFUL for combination {combination_id}")
+                    else:
+                        # Even if linear approximation fails, if we're reasonably close, consider it partially successful
+                        if error <= 3 * self.epsilon:  # Allow 3x tolerance for validation
+                            successful_validations += 0.5  # Partial success
+                            logger.info(f"Validation PARTIALLY SUCCESSFUL for combination {combination_id}")
+                        else:
+                            logger.info(f"Validation FAILED for combination {combination_id}")
+                        
+                except Exception as e:
+                    logger.warning(f"Validation error for combination {combination_id}: {e}")
+            else:
+                logger.info(f"LP solution failed for combination {combination_id}: {linear_solution.get('message', 'Unknown error')}")
+        
+        # Calculate confidence based on validation success rate
+        if total_attempts > 0:
+            confidence = successful_validations / total_attempts
+            feasible = confidence > 0  # At least some validation succeeded
+        else:
+            confidence = 0.0
+            feasible = len(required_shifts) > 0  # Assume feasible if shifts were identified
+        
+        logger.info(f"Validation summary: {successful_validations}/{total_attempts} successful, confidence={confidence:.2f}")
+        return feasible, confidence
+    
+    def _calculate_target_for_combination(self, combination_id, combo, cat_combinations, 
+                                        shap_dict, priorities_for_search, basic_prediction):
+        """Helper to calculate target value for a specific categorical combination."""
+        try:
+            cat_shap = shap_dict['categorical']
+            num_shap = shap_dict['numerical']
+            
+            # Calculate categorical contribution
+            result = 0.0
+            if combo:  # If there are categorical features
+                max_idx = max(combo.keys()) if combo else 0
+                dummy_x = np.zeros(max_idx + 1, dtype=float)
+                
+                for idx, val in combo.items():
+                    dummy_x[idx] = val
+                
+                for feature_indices in priorities_for_search['categorical'].keys():
+                    shap_value = cat_shap[feature_indices]
+                    current_values = tuple(float(dummy_x[idx]) for idx in feature_indices)
+                    sample_values = tuple(float(self.sample[idx]) for idx in feature_indices)
+                    closest_values = tuple(float(self.closest_sample[idx]) for idx in feature_indices)
+                    
+                    if current_values == sample_values:
+                        result += 0.0
+                    elif current_values == closest_values:
+                        result += shap_value
+                    else:
+                        return None  # Invalid combination
+            
+            # Calculate coefficient times original
+            coef_times_original = 0.0
+            for key in priorities_for_search['numerical'].keys():
+                if key in num_shap:
+                    temp_unit_phi = num_shap[key] / (self.closest_sample[key] - self.sample[key])
+                    coef_times_original += temp_unit_phi * self.sample[key]
+            
+            # Return adjusted target
+            return self.target - result - basic_prediction + coef_times_original
+            
+        except Exception as e:
+            logger.warning(f"Error calculating target for combination {combination_id}: {e}")
+            return None
 
     def calculate_total_weight(self, values):
         """
@@ -826,8 +1299,7 @@ class MINLSearchExplainer:
             return bounds
         bounds = create_bounds(self.priorities, self.sample)
         logger.info(f"Bounds for numerical features: {bounds}")
-        # x0 = np.array([self.closest_sample[idx] for idx in self.priorities['numerical'].keys()])
-        # epsilon = 0.01
+
         init_vals_per_combo, priorities_for_search = self.confirm_existence_of_solution_for_combo(use_approximation=shap_approx, num_samples=num_samples)
         logger.info(f"Initial values per combination: {init_vals_per_combo}")
         logger.info(f"Priorities for search: {priorities_for_search}")
@@ -841,7 +1313,7 @@ class MINLSearchExplainer:
                 prepared_input[idx] = val
             for idx, val in initial_numerical.items():
                 prepared_input[idx] = val
-            logger.debug("Prepared input:", prepared_input)
+            logger.debug("Prepared input: %s", prepared_input)
 
             def constraint_wrapper(x, shap_dict, sample, closest_sample, priorities_for_search, basic_prediction, ready_input):
                 for idx in shap_dict['numerical'].keys():
@@ -849,17 +1321,12 @@ class MINLSearchExplainer:
 
                 return self.constraint_function(ready_input, shap_dict, sample, closest_sample, priorities_for_search, basic_prediction)
 
-            # constraint_fun = lambda x: constraint_wrapper(x, shap_dict, sample, explainer.closest_sample, priorities_for_search, basic_prediction=model_pred([sample])[0], ready_input=prepared_input)
-            # print(constraint_fun(x))
             def objective_wrapper(x, priorities_for_search, ready_input):
                 for idx in self.shap_dict['numerical'].keys():
                     ready_input[idx] = x[idx]
                 return self.calculate_total_weight(ready_input)
 
-            # objective_fun = lambda x: -objective_wrapper(x, priorities_for_search, prepared_input)
-
             constraint_fun = lambda x: constraint_wrapper(x, self.shap_dict, self.sample, self.closest_sample, priorities_for_search, basic_prediction=self.model_pred([self.sample])[0], ready_input=prepared_input.copy())
-
             objective_fun = lambda x: -objective_wrapper(x, priorities_for_search, prepared_input.copy())
 
             # Lower bound constraint: h(x) >= target - epsilon
@@ -891,12 +1358,161 @@ class MINLSearchExplainer:
                 complete_solution[idx] = result.x[j]
             counterfactuals.append(complete_solution)
             # Print results
-            logger.debug("Combination values: ", values)
-            logger.debug("Optimal numerical solution:", result.x)
-            logger.debug("Complete solution (prepared_input with optimal numerical values):", self.model_pred([complete_solution]))
-            logger.debug("Constraint value at solution:", constraint_fun(result.x))
-            logger.debug("Maximized objective value:", -result.fun)
+            logger.debug("Combination values: %s", values)
+            logger.debug("Optimal numerical solution: %s", result.x)
+            logger.debug("Complete solution (prepared_input with optimal numerical values): %s", self.model_pred([complete_solution]))
+            logger.debug("Constraint value at solution: %s", constraint_fun(result.x))
+            logger.debug("Maximized objective value: %s", -result.fun)
             logger.debug("-----")
 
         # TODO: create a loop to check if found counterfactuals meet the criteria (within epsilon of target) and use found counterfactuals as new samples
         return counterfactuals
+    
+
+    def display_priorities(self):
+        """
+        Display the priority functions and values for both numerical and categorical features.
+        Similar to investigate_probability_distribution but shows the raw priority functions.
+        """
+        # Apply styling
+        apply_style()
+
+        # Display numerical feature priorities
+        for idx, constraint in self.priorities['numerical'].items():
+
+            if isinstance(constraint, dict) and 'function' in constraint:
+                min_val = constraint['min']
+                max_val = constraint['max']
+                f = constraint['function']
+                
+                # Calculate priority function values
+                x_vals = np.linspace(min_val, max_val, 1000)
+                priority_values = np.array([float(f(x)) for x in x_vals])
+
+                # Create enhanced plot with gradient effects
+                fig, ax = plt.subplots(figsize=(12, 8))
+                
+                # Plot priority function with enhanced styling
+                ax.plot(x_vals, priority_values, label='Priority Function', 
+                       color=get_line_color('theoretical'), linewidth=4, alpha=0.9,
+                       solid_capstyle='round')
+                
+                # Add subtle fill under priority curve for depth
+                ax.fill_between(x_vals, priority_values, alpha=0.2, 
+                               color=get_line_color('theoretical'))
+                
+                # Mark the current sample value
+                sample_value = self.sample[idx]
+                if min_val <= sample_value <= max_val:
+                    sample_priority = float(f(sample_value))
+                    ax.plot(sample_value, sample_priority, 'o', 
+                           color=get_line_color('empirical'), markersize=12, 
+                           label=f'Current Sample Value ({sample_value:.3f})',
+                           markeredgecolor=COLORS['dirty_white'], markeredgewidth=2)
+                
+                ax.set_xlabel('Feature Value')
+                ax.set_ylabel('Priority Weight')
+                ax.set_title(f'Priority Function for Numerical Feature {idx}')
+                
+                # Enhanced legend positioned to the right side of title, above plot
+                legend = ax.legend(frameon=True, fancybox=True, shadow=True, 
+                                 facecolor=COLORS['dark_background'], edgecolor=COLORS['dirty_white'],
+                                 fontsize=16, loc='center left', bbox_to_anchor=(1.02, 0.9), ncol=1)
+                legend.get_frame().set_alpha(0.9)
+                # Make legend text dirty white
+                for text in legend.get_texts():
+                    text.set_color(COLORS['dirty_white'])
+                
+                # Apply numerical plot styling
+                style_numerical_plot(ax)
+                
+                # Adjust layout to accommodate legend to the right
+                plt.tight_layout()
+                plt.subplots_adjust(right=0.75)  # Make room for legend on the right
+                plt.show()
+            else:
+                print(f'Feature {idx} is unactionable with fixed value: {constraint}')
+
+        # Display categorical feature priorities
+        for group_indices, possible_values in self.priorities['categorical'].items():
+            
+            # Extract categories and their weights
+            categories = list(possible_values.keys())
+            weights = np.array(list(possible_values.values()), dtype=float)
+            
+            # Create labels for the categories (convert tuples to strings for display)
+            category_labels = [str(cat) if isinstance(cat, tuple) else str(cat) for cat in categories]
+            
+            # Calculate appropriate bar width based on number of categories
+            num_categories = len(category_labels)
+            if num_categories == 1:
+                bar_width = 0.1  # Very narrow for single category
+            elif num_categories == 2:
+                bar_width = 0.4  # Narrow for 2 categories
+            elif num_categories <= 4:
+                bar_width = 0.5  # Narrow for 3-4 categories
+            elif num_categories <= 6:
+                bar_width = 0.6  # Moderate for 5-6 categories
+            else:
+                bar_width = 0.8  # Standard width for many categories
+            
+            # Create bar plot with enhanced styling and gradients
+            fig, ax = plt.subplots(figsize=(12, 8))
+            
+            # Create gradient colors for bars
+            bar_colors = [get_bar_color(i) for i in range(len(category_labels))]
+            
+            bars = ax.bar(range(len(category_labels)), weights, width=bar_width, 
+                         color=bar_colors, edgecolor=COLORS['dirty_white'], linewidth=2.0)
+            
+            # Apply gradient alpha effect to each bar
+            for i, bar in enumerate(bars):
+                # Create depth with alternating alpha and subtle gradients
+                alpha_val = 0.7 + 0.2 * (i % 2)
+                bar.set_alpha(alpha_val)
+                
+                # Add subtle inner border for depth with dark theme
+                height = bar.get_height()
+                if height > 0:
+                    ax.add_patch(plt.Rectangle((bar.get_x() + 0.02, 0.01), 
+                                             bar.get_width() - 0.04, height - 0.02,
+                                             fill=False, edgecolor=COLORS['steel_gray'], 
+                                             linewidth=0.8, alpha=0.6))
+            
+            # Highlight current sample values if they exist in the categories
+            current_sample_combo = tuple(self.sample[idx] for idx in group_indices)
+            if current_sample_combo in categories:
+                current_idx = categories.index(current_sample_combo)
+                bars[current_idx].set_edgecolor(get_line_color('empirical'))
+                bars[current_idx].set_linewidth(4)
+                # Add marker on top of the current sample bar
+                ax.plot(current_idx, weights[current_idx] + max(weights) * 0.05, 'v', 
+                       color=get_line_color('empirical'), markersize=15,
+                       markeredgecolor=COLORS['dirty_white'], markeredgewidth=2)
+            
+            # For single category, adjust x-axis limits to center the bar better
+            if num_categories == 1:
+                ax.set_xlim(-1, 1)
+            
+            # Add value labels with enhanced dark theme styling
+            for i, (bar, weight) in enumerate(zip(bars, weights)):
+                label_text = f'{weight:.3f}'
+                if i == categories.index(current_sample_combo) if current_sample_combo in categories else -1:
+                    label_text += ' (Current)'
+                ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + max(weights) * 0.01, 
+                       label_text, ha='center', va='bottom', fontsize=16,
+                       fontweight='bold', color=COLORS['dirty_white'],
+                       bbox=dict(boxstyle='round,pad=0.4', facecolor=COLORS['dark_background'], 
+                                alpha=0.8, edgecolor=COLORS['dirty_white'], linewidth=1.5))
+            
+            ax.set_xlabel('Category Combinations')
+            ax.set_ylabel('Priority Weight')
+            ax.set_title(f'Priority Weights for Categorical Features {group_indices}')
+            ax.set_xticks(range(len(category_labels)))
+            ax.set_xticklabels(category_labels, rotation=45, ha='right')
+            
+            # Apply categorical plot styling
+            style_categorical_plot(ax, num_categories)
+            
+            plt.tight_layout()
+            plt.show()
