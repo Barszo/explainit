@@ -23,14 +23,14 @@ class RandomSearchExplainer:
     def filter_priorities(self):
         """
         Filters the priorities dictionary by removing unactionable features.
-        Unactionable numerical features (with priority 0) are replaced with the sample value.
+        Unactionable numerical features (with priority None or 0) are replaced with the sample value.
         """
         
         new_priorities = {'numerical': {}, 'categorical': {}}
 
-        # Numerical: replace 0 with sample value
+        # Numerical: replace None or 0 with sample value
         for idx, val in self.priorities['numerical'].items():
-            if val == 0:
+            if val is None or val == 0:
                 new_priorities['numerical'][idx] = self.sample[idx]
             else:
                 new_priorities['numerical'][idx] = val
@@ -152,7 +152,11 @@ class RandomSearchExplainer:
             # Adjust layout to accommodate legend to the right
             plt.tight_layout()
             plt.subplots_adjust(right=0.75)  # Make room for legend on the right
-            plt.show()
+            
+            # Save the figure
+            os.makedirs('images', exist_ok=True)
+            plt.savefig(f'images/probability_distribution_feature_{idx}.png', dpi=300, bbox_inches='tight')
+            plt.close()
 
         for group_indices, possible_values in self.priorities['categorical'].items():
             
@@ -237,12 +241,20 @@ class RandomSearchExplainer:
             style_categorical_plot(ax, num_categories)
             
             plt.tight_layout()
-            plt.show()
+            
+            # Save the figure
+            os.makedirs('images', exist_ok=True)
+            group_str = '_'.join(map(str, group_indices))
+            plt.savefig(f'images/probability_distribution_categorical_{group_str}.png', dpi=300, bbox_inches='tight')
+            plt.close()
 
-    def display_priorities(self):
+    def display_priorities(self, exemplar=None):
         """
         Display the priority functions and values for both numerical and categorical features.
         Similar to investigate_probability_distribution but shows the raw priority functions.
+        
+        Args:
+            exemplar: Optional list of exemplar feature values to display on plots
         """
         # Apply styling
         apply_style()
@@ -280,6 +292,16 @@ class RandomSearchExplainer:
                            label=f'Current Sample Value ({sample_value:.3f})',
                            markeredgecolor=COLORS['dirty_white'], markeredgewidth=2)
                 
+                # Mark the exemplar value if provided
+                if exemplar is not None:
+                    exemplar_value = exemplar[idx]
+                    if min_val <= exemplar_value <= max_val:
+                        exemplar_priority = float(f(exemplar_value))
+                        ax.plot(exemplar_value, exemplar_priority, 's', 
+                               color='#FF6B35', markersize=12, 
+                               label=f'Exemplar Value ({exemplar_value:.3f})',
+                               markeredgecolor=COLORS['dirty_white'], markeredgewidth=2)
+                
                 ax.set_xlabel('Feature Value')
                 ax.set_ylabel('Priority Weight')
                 ax.set_title(f'Priority Function for Numerical Feature {idx}')
@@ -299,7 +321,11 @@ class RandomSearchExplainer:
                 # Adjust layout to accommodate legend to the right
                 plt.tight_layout()
                 plt.subplots_adjust(right=0.75)  # Make room for legend on the right
-                plt.show()
+                
+                # Save the figure
+                os.makedirs('images', exist_ok=True)
+                plt.savefig(f'images/priority_function_feature_{idx}.png', dpi=300, bbox_inches='tight')
+                plt.close()
             else:
                 print(f'Feature {idx} is unactionable with fixed value: {constraint}')
 
@@ -385,31 +411,125 @@ class RandomSearchExplainer:
             style_categorical_plot(ax, num_categories)
             
             plt.tight_layout()
-            plt.show()
+            
+            # Save the figure
+            os.makedirs('images', exist_ok=True)
+            group_str = '_'.join(map(str, group_indices))
+            plt.savefig(f'images/priority_weights_categorical_{group_str}.png', dpi=300, bbox_inches='tight')
+            plt.close()
 
+    def calculate_preference_score(self, sample):
+        """
+        Calculate overall preference score for a sample.
+        
+        Args:
+            sample: List of feature values
+        
+        Returns:
+            preference_score: Float value representing overall preference
+        """
+        scores = []
+        
+        # Calculate scores for numerical features
+        for idx, constraint in self.priorities['numerical'].items():
+            if isinstance(constraint, dict) and 'function' in constraint:
+                # Get weight from preference function
+                weight = float(np.asarray(constraint['function'](sample[idx])).squeeze())
+                scores.append(weight)
+        
+        # Calculate scores for categorical features
+        for group_indices, possible_values in self.priorities['categorical'].items():
+            # Get current sample combination
+            current_combo = tuple(sample[idx] for idx in group_indices)
+            # Get weight for this combination (default to 0 if not found)
+            weight = possible_values.get(current_combo, 0)
+            scores.append(float(weight))
+        
+        # Overall score is the product of all weights (geometric mean approach)
+        # This ensures that low preference in any feature significantly reduces overall score
+        if len(scores) == 0:
+            return 1.0
+        return float(np.sum(scores))
+    
+    def get_preference_breakdown(self, sample):
+        """
+        Get detailed breakdown of preference scores for each feature.
+        
+        Args:
+            sample: List of feature values
+        
+        Returns:
+            breakdown: Dictionary with 'numerical' and 'categorical' contributions
+        """
+        breakdown = {
+            'numerical': {},
+            'categorical': {},
+            'overall': 0.0
+        }
+        
+        all_scores = []
+        
+        # Calculate scores for numerical features
+        for idx, constraint in self.priorities['numerical'].items():
+            if isinstance(constraint, dict) and 'function' in constraint:
+                # Get weight from preference function
+                weight = float(np.asarray(constraint['function'](sample[idx])).squeeze())
+                breakdown['numerical'][idx] = {
+                    'value': sample[idx],
+                    'weight': weight,
+                    'actionable': True
+                }
+                all_scores.append(weight)
+            elif constraint is None or (isinstance(constraint, (int, float)) and constraint == 0):
+                # Unactionable feature - fixed at sample value, doesn't affect preference score
+                breakdown['numerical'][idx] = {
+                    'value': sample[idx],
+                    'weight': None,
+                    'actionable': False
+                }
+                # Don't add to all_scores - unactionable features don't contribute to preference
+        
+        # Calculate scores for categorical features
+        for group_indices, possible_values in self.priorities['categorical'].items():
+            # Get current sample combination
+            current_combo = tuple(sample[idx] for idx in group_indices)
+            # Get weight for this combination (default to 0 if not found)
+            weight = possible_values.get(current_combo, 0)
+            breakdown['categorical'][group_indices] = {
+                'combination': current_combo,
+                'weight': float(weight)
+            }
+            all_scores.append(float(weight))
+        
+        # Calculate overall score
+        breakdown['overall'] = float(np.sum(all_scores)) if len(all_scores) > 0 else 0.0
+        
+        return breakdown
 
-    def generate_random_samples(self, n_samples=1000, epsilon=0.05, random_seed=None, use_monte_carlo=True, max_tries=100):
+    def generate_random_samples(self, n_samples=1000, epsilon=0.05, random_seed=None, use_monte_carlo=True, max_tries=100, return_top_n=None):
         """
         Generate random samples based on filtered priorities.
         Only keep samples whose prediction is within epsilon of the target.
-        n_samples: number of samples to generate
-        epsilon: acceptable deviation from target prediction
-        random_seed: seed for reproducibility
-        use_monte_carlo: if True, use Monte Carlo sampling for numerical features; otherwise use uniform sampling
-        max_tries: maximum number of tries for rejection sampling in numerical features (only if use_monte_carlo is True)
-        Returns: list of samples and their corresponding predictions
+        
+        Args:
+            n_samples: number of samples to generate
+            epsilon: acceptable deviation from target prediction
+            random_seed: seed for reproducibility
+            use_monte_carlo: if True, use Monte Carlo sampling for numerical features; otherwise use uniform sampling
+            max_tries: maximum number of tries for rejection sampling in numerical features (only if use_monte_carlo is True)
+            return_top_n: if specified, return only the top N most preferable samples (default: return all)
+        
+        Returns:
+            list of samples and their corresponding predictions
         """
-
         # Only set seed if random_seed is provided
         if random_seed is not None:
             np.random.seed(random_seed)
             random.seed(random_seed)
-
-        np.random.seed(random_seed)
-        random.seed(random_seed)
         
         samples = []
         predictions = []
+        preference_scores = []
         n_features = 29
         
         for _ in range(n_samples):
@@ -457,7 +577,28 @@ class RandomSearchExplainer:
                 if abs(pred - self.target) <= epsilon:
                     samples.append(sample.copy())
                     predictions.append(pred)
+                    # Calculate preference score
+                    pref_score = self.calculate_preference_score(sample)
+                    preference_scores.append(pref_score)
             except Exception as e:
                 logger.warning(f"Could not get prediction for sample: {e}")
-        return samples, predictions
+        
+        # Sort by preference score (descending) and optionally return only top N
+        if len(samples) > 0 and return_top_n is not None:
+            # Create indices sorted by preference score
+            sorted_indices = np.argsort(preference_scores)[::-1]  # Descending order
+            
+            # Select top N
+            top_n = min(return_top_n, len(samples))
+            top_indices = sorted_indices[:top_n]
+            
+            # Filter samples, predictions, and scores
+            samples = [samples[i] for i in top_indices]
+            predictions = [predictions[i] for i in top_indices]
+            preference_scores = [preference_scores[i] for i in top_indices]
+            
+            logger.info(f"Selected top {top_n} most preferable counterfactuals")
+            logger.info(f"Preference score range: [{min(preference_scores):.6f}, {max(preference_scores):.6f}]")
+        
+        return samples, predictions, preference_scores
 

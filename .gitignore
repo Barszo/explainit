@@ -1,9 +1,15 @@
 # Dev
 dev/
 data/
+binary_classifiers/
 binary_classifiers_results/
 linear_regression_results/
 ML_regression_results/
+ML_models_for_tests/
+binary_classifiers/
+trash/
+experiment_parameters.csv
+experiment_results.csv
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
