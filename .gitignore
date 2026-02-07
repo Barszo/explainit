@@ -14,7 +14,8 @@ experiment_results.csv
 __pycache__/
 *.py[codz]
 *$py.class
-
+*.csv
+*.png
 # C extensions
 *.so
 

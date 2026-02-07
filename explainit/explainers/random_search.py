@@ -530,9 +530,18 @@ class RandomSearchExplainer:
         samples = []
         predictions = []
         preference_scores = []
-        n_features = 29
         
-        for _ in range(n_samples):
+        # Get number of features from the sample
+        n_features = len(self.sample)
+        
+        # Progress tracking
+        progress_step = max(1, n_samples // 10)  # Report every 10%
+        
+        for i in range(n_samples):
+            # Log progress every 10%
+            if i > 0 and i % progress_step == 0:
+                progress_pct = int(100 * i / n_samples)
+                logger.info(f"    Progress: {progress_pct}% ({i}/{n_samples} samples, {len(samples)} counterfactuals found)")
             sample = np.zeros(n_features)
             # Numerical features
             for idx, constraint in self.filtered_priorities['numerical'].items():
@@ -582,6 +591,9 @@ class RandomSearchExplainer:
                     preference_scores.append(pref_score)
             except Exception as e:
                 logger.warning(f"Could not get prediction for sample: {e}")
+        
+        # Final progress update
+        logger.info(f"    Progress: 100% ({n_samples}/{n_samples} samples, {len(samples)} counterfactuals found)")
         
         # Sort by preference score (descending) and optionally return only top N
         if len(samples) > 0 and return_top_n is not None:

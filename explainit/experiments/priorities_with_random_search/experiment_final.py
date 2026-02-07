@@ -18,6 +18,7 @@ import tensorflow as tf
 
 from explainit.priorities.nonlinear import exponential
 from explainit.explainers.random_search import RandomSearchExplainer
+from explainit.experiments.priorities_with_random_search.standard_methods import run_all_methods
 
 # Configure logging
 logging.basicConfig(
@@ -295,7 +296,7 @@ class AutoMPGExperiment:
 # EXPERIMENT RUNNER
 # ============================================================================
 
-def run_counterfactual_experiment(model, X_train, X_test, config, experiment):
+def run_counterfactual_experiment(model, X_train, X_test, y_train, config, experiment):
     """
     Run a comprehensive counterfactual experiment with multiple samples and targets.
     
@@ -303,6 +304,7 @@ def run_counterfactual_experiment(model, X_train, X_test, config, experiment):
         model: Trained model
         X_train: Training dataset
         X_test: Test dataset
+        y_train: Training predictions
         config: Dictionary with experiment parameters
         experiment: Experiment instance (e.g., AutoMPGExperiment)
     
@@ -407,24 +409,44 @@ def run_counterfactual_experiment(model, X_train, X_test, config, experiment):
                 target=target_pred
             )
             logger.info(f"  Generating counterfactuals...")
-            cf_samples, cf_predictions, cf_scores = explainer.generate_random_samples(
+            # Time the generation
+            method_start_time = time.time()
+            # First get all counterfactuals to track statistics
+            all_cf_samples, all_cf_predictions, all_cf_scores = explainer.generate_random_samples(
                 n_samples=config['n_samples'],
                 epsilon=config['epsilon'],
                 use_monte_carlo=config['use_monte_carlo'],
                 random_seed=42,
                 max_tries=100,
-                return_top_n=None
+                return_top_n=None  # Get all first
             )
-            logger.info(f"  Generation complete: {len(cf_samples)} counterfactuals found")
+            method_elapsed = time.time() - method_start_time
             
-            # Sort by preference score descending
-            if len(cf_samples) > 0:
-                sorted_indices = np.argsort(cf_scores)[::-1]
-                cf_samples = [cf_samples[i] for i in sorted_indices]
-                cf_predictions = [cf_predictions[i] for i in sorted_indices]
-                cf_scores = [cf_scores[i] for i in sorted_indices]
+            # Track statistics before filtering
+            total_cf_found = len(all_cf_samples)
+            max_preference_score = max(all_cf_scores) if all_cf_scores else 0.0
+            n_cf_with_max_score = sum(1 for score in all_cf_scores if score == max_preference_score) if all_cf_scores else 0
             
-            # Store results
+            logger.info(f"  Generation complete: {total_cf_found} counterfactuals found")
+            logger.info(f"  Max preference score: {max_preference_score:.4f} ({n_cf_with_max_score} CFs with this score)")
+            
+            # Sort by preference score descending and filter to top N
+            if total_cf_found > 0:
+                sorted_indices = np.argsort(all_cf_scores)[::-1]
+                
+                # Keep only top N if specified
+                if config.get('return_top_n') and config['return_top_n'] > 0:
+                    top_n = min(config['return_top_n'], total_cf_found)
+                    sorted_indices = sorted_indices[:top_n]
+                    logger.info(f"  Keeping top {top_n} counterfactuals (out of {total_cf_found})")
+                
+                cf_samples = [all_cf_samples[i] for i in sorted_indices]
+                cf_predictions = [all_cf_predictions[i] for i in sorted_indices]
+                cf_scores = [all_cf_scores[i] for i in sorted_indices]
+            else:
+                cf_samples, cf_predictions, cf_scores = [], [], []
+            
+            # Store results with statistics
             result = {
                 'sample_idx': sample_idx + 1,
                 'target_idx': target_idx + 1,
@@ -432,16 +454,30 @@ def run_counterfactual_experiment(model, X_train, X_test, config, experiment):
                 'target_prediction': target_pred,
                 'sample_values': sample,
                 'exemplar_values': exemplar,
-                'n_counterfactuals': len(cf_samples),
+                'n_counterfactuals': len(cf_samples),  # Number saved (top N)
+                'total_cf_found': total_cf_found,  # Total found before filtering
+                'max_preference_score': max_preference_score,
+                'n_cf_with_max_score': n_cf_with_max_score,
+                'computation_time': method_elapsed,
                 'counterfactuals': []
             }
             
+            # Calculate L2 distances for each counterfactual
+            sample_array = np.array(sample)
             for i, (cf_sample, cf_pred, cf_score) in enumerate(zip(cf_samples, cf_predictions, cf_scores)):
+                cf_array = np.array(cf_sample)
+                l1_distance = np.sum(np.abs(cf_array - sample_array))
+                l2_distance = np.sqrt(np.sum((cf_array - sample_array) ** 2))
+                sparsity = np.sum(np.abs(cf_array - sample_array) > 1e-6)
+                
                 result['counterfactuals'].append({
                     'rank': i + 1,
                     'prediction': cf_pred,
                     'preference_score': cf_score,
-                    'sample': cf_sample
+                    'sample': cf_sample,
+                    'l1_distance': l1_distance,
+                    'l2_distance': l2_distance,
+                    'sparsity': int(sparsity)
                 })
             
             results.append(result)
@@ -456,6 +492,158 @@ def run_counterfactual_experiment(model, X_train, X_test, config, experiment):
                 logger.info(f"  Preference score range: [{min(cf_scores):.2f}, {max(cf_scores):.2f}]")
             else:
                 logger.info(f"  No counterfactuals found")
+            logger.info("")
+    
+    return results
+
+
+def run_standard_methods_experiment(model, X_train, X_test, y_train, config, experiment):
+    """
+    Run experiment using standard counterfactual methods for comparison.
+    
+    Args:
+        model: Trained model
+        X_train: Training dataset
+        X_test: Test dataset
+        y_train: Training predictions
+        config: Dictionary with experiment parameters
+        experiment: Experiment instance (e.g., AutoMPGExperiment)
+    
+    Returns:
+        results: List of experiment results from standard methods
+    """
+    # Get methods to run from config
+    methods_to_run = config.get('standard_methods', ['wachter', 'growing_spheres', 'prototype', 'gradient_based'])
+    
+    logger.info("\n" + "=" * 80)
+    logger.info("STARTING STANDARD METHODS EXPERIMENT")
+    logger.info("=" * 80)
+    logger.info(f"Configuration:")
+    for key, value in config.items():
+        logger.info(f"  {key}: {value}")
+    logger.info("=" * 80 + "\n")
+    
+    # Get predictions for all test samples
+    logger.info("Getting predictions for test samples...")
+    logger.info(f"X_test shape: {X_test.shape}, dtype: {X_test.dtype}")
+    sys.stderr.flush()
+    
+    import tensorflow as tf
+    predictions = model(tf.constant(X_test.astype(np.float32)), training=False).numpy().ravel()
+    logger.info(f"Predictions computed for {len(predictions)} samples")
+    logger.info(f"Prediction range: [{predictions.min():.2f}, {predictions.max():.2f}]")
+    sys.stderr.flush()
+    
+    # Select equally distributed prediction quantiles
+    logger.info(f"Selecting {config['n_quantiles']} quantile points...")
+    quantiles = np.linspace(0, 1, config['n_quantiles'])
+    quantile_values = np.quantile(predictions, quantiles)
+    
+    # Find samples closest to each quantile
+    sample_points = []
+    for q_val in quantile_values:
+        distances = np.abs(predictions - q_val)
+        idx = np.argmin(distances)
+        sample_points.append({
+            'index': idx,
+            'sample': X_test[idx],
+            'prediction': predictions[idx]
+        })
+    
+    logger.info(f"Selected {len(sample_points)} sample points with predictions:")
+    for i, sp in enumerate(sample_points):
+        logger.info(f"  Sample {i+1}: prediction = {sp['prediction']:.2f} {experiment.target_name}")
+    logger.info("\n")
+    
+    # Define feature ranges for optimization methods
+    feature_ranges = []
+    for idx in range(X_train.shape[1]):
+        min_val = X_train[:, idx].min()
+        max_val = X_train[:, idx].max()
+        feature_ranges.append((float(min_val), float(max_val)))
+    
+    # Model prediction wrapper
+    def model_predict(X):
+        import tensorflow as tf
+        return model(tf.constant(np.array(X).astype(np.float32)), training=False).numpy().ravel()
+    
+    # Run experiment for each sample-target pair
+    results = []
+    total_combinations = len(sample_points) * (len(sample_points) - 1)
+    current_combination = 0
+    
+    # For time estimation
+    start_time = time.time()
+    pair_times = []
+    
+    for sample_idx, sample_point in enumerate(sample_points):
+        sample = sample_point['sample']
+        sample_pred = sample_point['prediction']
+        
+        for target_idx, target_point in enumerate(sample_points):
+            if sample_idx == target_idx:
+                continue  # Skip same point
+            
+            current_combination += 1
+            target_pred = target_point['prediction']
+            
+            # Time estimation
+            if pair_times:
+                avg_time = np.mean(pair_times)
+                remaining_pairs = total_combinations - current_combination + 1
+                est_remaining_sec = avg_time * remaining_pairs
+                est_remaining_min = est_remaining_sec / 60
+                logger.info(f"[{current_combination}/{total_combinations}] Sample {sample_idx+1} → Target {target_idx+1} (Est. {est_remaining_min:.1f} min remaining)")
+            else:
+                logger.info(f"[{current_combination}/{total_combinations}] Sample {sample_idx+1} → Target {target_idx+1}")
+            
+            logger.info(f"  Sample prediction: {sample_pred:.2f}, Target prediction: {target_pred:.2f}")
+            
+            pair_start_time = time.time()
+            
+            # Run selected standard methods
+            logger.info(f"  Running standard methods: {', '.join(methods_to_run)}")
+            method_start_time = time.time()
+            method_results = run_all_methods(
+                X_original=sample,
+                model=model,
+                model_predict=model_predict,
+                target_value=target_pred,
+                X_train=X_train,
+                y_train=y_train,
+                epsilon=config['epsilon'],
+                feature_ranges=feature_ranges,
+                methods_to_run=methods_to_run
+            )
+            total_standard_time = time.time() - method_start_time
+            
+            # Store results
+            result = {
+                'sample_idx': sample_idx + 1,
+                'target_idx': target_idx + 1,
+                'sample_prediction': sample_pred,
+                'target_prediction': target_pred,
+                'sample_values': sample.tolist(),
+                'computation_time': total_standard_time,
+                'methods': method_results
+            }
+            
+            results.append(result)
+            
+            # Track time for this pair
+            pair_elapsed = time.time() - pair_start_time
+            pair_times.append(pair_elapsed)
+            
+            # Log summary
+            for method_name, method_result in method_results.items():
+                if method_result['counterfactual'] is not None:
+                    metrics = method_result['metrics']
+                    logger.info(f"    {method_name}: VALID - "
+                               f"L2={metrics['l2_distance']:.4f}, "
+                               f"Sparsity={metrics['sparsity']}, "
+                               f"Pred={method_result['prediction']:.2f}")
+                else:
+                    logger.info(f"    {method_name}: FAILED")
             logger.info("")
     
     return results
@@ -533,8 +721,11 @@ def save_results_csv(results, config, experiment, filename='experiment_results_f
             'dataset', 'model',
             'sample_idx', 'sample_prediction', 'sample_values',
             'target_idx', 'target_prediction', 'exemplar_values',
+            'total_cf_found', 'max_preference_score', 'n_cf_with_max_score',
+            'computation_time',
             'cf_rank', 'cf_prediction', 'cf_distance_from_target',
-            'cf_preference_score', 'cf_values'
+            'cf_preference_score', 'cf_l1_distance', 'cf_l2_distance', 'cf_sparsity',
+            'cf_values'
         ] + config_keys)
         
         # Config values
@@ -550,11 +741,15 @@ def save_results_csv(results, config, experiment, filename='experiment_results_f
                 str(result['sample_values']),
                 result['target_idx'],
                 result['target_prediction'],
-                str(result['exemplar_values'])
+                str(result['exemplar_values']),
+                result['total_cf_found'],
+                result['max_preference_score'],
+                result['n_cf_with_max_score'],
+                result['computation_time']
             ]
             
             if result['n_counterfactuals'] == 0:
-                writer.writerow(base_row + ['', '', '', '', ''] + config_values)
+                writer.writerow(base_row + ['', '', '', '', '', '', '', ''] + config_values)
             else:
                 for cf in result['counterfactuals']:
                     cf_row = base_row + [
@@ -562,11 +757,78 @@ def save_results_csv(results, config, experiment, filename='experiment_results_f
                         cf['prediction'],
                         abs(cf['prediction'] - result['target_prediction']),
                         cf['preference_score'],
+                        cf['l1_distance'],
+                        cf['l2_distance'],
+                        cf['sparsity'],
                         str(cf['sample'])
                     ] + config_values
                     writer.writerow(cf_row)
     
     logger.info(f"Results saved to {filename}")
+
+
+def save_standard_methods_results_csv(results, config, experiment, filename='experiment_results_standard_methods.csv'):
+    """Save standard methods experiment results to CSV."""
+    logger.info(f"Saving standard methods results to {filename}...")
+    
+    with open(filename, 'w', newline='') as f:
+        writer = csv.writer(f)
+        
+        # Header
+        config_keys = list(config.keys())
+        writer.writerow([
+            'dataset', 'model',
+            'sample_idx', 'sample_prediction', 'sample_values',
+            'target_idx', 'target_prediction',
+            'computation_time',
+            'method', 'valid', 'cf_prediction', 'cf_values',
+            'l1_distance', 'l2_distance', 'sparsity',
+            'prediction_error', 'additional_info'
+        ] + config_keys)
+        
+        # Config values
+        config_values = [config[key] for key in config_keys]
+        
+        # Data rows
+        for result in results:
+            base_row = [
+                experiment.dataset_name,
+                experiment.model_name,
+                result['sample_idx'],
+                result['sample_prediction'],
+                str(result['sample_values']),
+                result['target_idx'],
+                result['target_prediction'],
+                result['computation_time']
+            ]
+            
+            # Write one row per method
+            for method_name, method_result in result['methods'].items():
+                if method_result['counterfactual'] is not None:
+                    metrics = method_result['metrics']
+                    method_row = base_row + [
+                        method_name,
+                        metrics['validity'],
+                        method_result['prediction'],
+                        str(method_result['counterfactual'].tolist()),
+                        metrics['l1_distance'],
+                        metrics['l2_distance'],
+                        metrics['sparsity'],
+                        metrics['prediction_error'],
+                        str(method_result['info'])
+                    ] + config_values
+                else:
+                    method_row = base_row + [
+                        method_name,
+                        False,
+                        '', '',
+                        '', '', '', '',
+                        str(method_result['info'])
+                    ] + config_values
+                
+                writer.writerow(method_row)
+    
+    logger.info(f"Standard methods results saved to {filename}")
 
 
 def main():
@@ -579,11 +841,24 @@ def main():
     # CONFIGURATION
     # ============================================================================
     config = {
+        # Dataset and model
         'dataset': 'Auto_MPG',          # Dataset to use
         'model': 'NN_Residual',         # Model to use
+        
+        # Experiment settings
         'n_quantiles': 3,               # Number of equally distributed prediction points
-        'return_top_n': 5,              # Number of top counterfactuals to return per experiment
         'epsilon': 2.0,                 # Target prediction tolerance (±2 MPG)
+        
+        # Method selection - Set to True/False to enable/disable methods
+        'run_preference_method': True,  # Run preference-based random search method
+        'run_standard_methods': True,   # Run standard methods
+        
+        # Standard methods to run (only used if run_standard_methods=True)
+        # Options: 'wachter', 'growing_spheres', 'prototype', 'gradient_based'
+        'standard_methods': ['wachter', 'growing_spheres', 'prototype', 'gradient_based'],
+        
+        # Preference-based method settings (only used if run_preference_method=True)
+        'return_top_n': 5,              # Number of top counterfactuals to return per experiment
         'exemplar_weight': 0.01,        # Weight assigned to exemplar value
         'n_samples': 10000,             # Number of samples to generate per experiment
         'use_monte_carlo': True,        # Use Monte Carlo sampling
@@ -610,34 +885,67 @@ def main():
     X_train, X_test, y_train, y_test, scaler, model, X_full, y_full = experiment.load_data()
     
     # ============================================================================
-    # RUN EXPERIMENT
+    # RUN PREFERENCE-BASED RANDOM SEARCH EXPERIMENT
     # ============================================================================
-    results = run_counterfactual_experiment(model, X_train, X_test, config, experiment)
+    if config.get('run_preference_method', True):
+        logger.info("\n" + "=" * 80)
+        logger.info("PART 1: PREFERENCE-BASED RANDOM SEARCH METHOD")
+        logger.info("=" * 80)
+        
+        results_random_search = run_counterfactual_experiment(model, X_train, X_test, y_train, config, experiment)
+        
+        # ============================================================================
+        # SAVE PREFERENCE-BASED RESULTS
+        # ============================================================================
+        logger.info("\n" + "=" * 80)
+        logger.info("SAVING PREFERENCE-BASED RESULTS TO CSV")
+        logger.info("=" * 80)
+        
+        save_results_csv(results_random_search, config, experiment, filename='experiment_results_preference_based.csv')
+        logger.info("Preference-based CSV file saved successfully.")
+        
+        # ============================================================================
+        # PRINT PREFERENCE-BASED SUMMARY
+        # ============================================================================
+        logger.info("\n" + "=" * 80)
+        logger.info("GENERATING PREFERENCE-BASED EXPERIMENT SUMMARY")
+        logger.info("=" * 80)
+        
+        try:
+            print_experiment_results(results_random_search, config, experiment)
+        except Exception as e:
+            logger.error(f"Error printing preference-based results: {e}")
+            import traceback
+            traceback.print_exc()
+    else:
+        logger.info("\n" + "=" * 80)
+        logger.info("SKIPPING PREFERENCE-BASED METHOD (disabled in config)")
+        logger.info("=" * 80)
     
     # ============================================================================
-    # SAVE RESULTS
+    # RUN STANDARD METHODS EXPERIMENT
     # ============================================================================
-    logger.info("\n" + "=" * 80)
-    logger.info("SAVING RESULTS TO CSV")
-    logger.info("=" * 80)
-    
-    save_results_csv(results, config, experiment)
-    
-    logger.info("CSV file saved successfully.")
-    
-    # ============================================================================
-    # PRINT SUMMARY
-    # ============================================================================
-    logger.info("\n" + "=" * 80)
-    logger.info("GENERATING EXPERIMENT SUMMARY")
-    logger.info("=" * 80)
-    
-    try:
-        print_experiment_results(results, config, experiment)
-    except Exception as e:
-        logger.error(f"Error printing results: {e}")
-        import traceback
-        traceback.print_exc()
+    if config.get('run_standard_methods', True):
+        logger.info("\n" + "=" * 80)
+        logger.info("PART 2: STANDARD COUNTERFACTUAL METHODS")
+        logger.info(f"Methods to run: {', '.join(config.get('standard_methods', []))}")
+        logger.info("=" * 80)
+        
+        results_standard = run_standard_methods_experiment(model, X_train, X_test, y_train, config, experiment)
+        
+        # ============================================================================
+        # SAVE STANDARD METHODS RESULTS
+        # ============================================================================
+        logger.info("\n" + "=" * 80)
+        logger.info("SAVING STANDARD METHODS RESULTS TO CSV")
+        logger.info("=" * 80)
+        
+        save_standard_methods_results_csv(results_standard, config, experiment, filename='experiment_results_standard_methods.csv')
+        logger.info("Standard methods CSV file saved successfully.")
+    else:
+        logger.info("\n" + "=" * 80)
+        logger.info("SKIPPING STANDARD METHODS (disabled in config)")
+        logger.info("=" * 80)
     
     logger.info("\n" + "=" * 80)
     logger.info("Analysis complete!")
