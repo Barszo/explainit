@@ -1,6 +1,9 @@
 # Dev
 dev/
 data/
+binary_classifiers_results/
+linear_regression_results/
+ML_regression_results/
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
