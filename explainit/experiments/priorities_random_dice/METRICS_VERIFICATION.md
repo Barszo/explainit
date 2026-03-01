@@ -1,279 +1,245 @@
-# Article Metrics Implementation Verification
+# Metrics Implementation Documentation
 
-This document verifies that all metrics from **Mothilal et al. (2020)** are correctly implemented.
+This document describes the metrics calculated in `experiment_random_search.py` for evaluating counterfactual explanations.
 
-## ✅ Article Metrics Checklist
+## Dataset Context
 
-| Article Metric | Implemented Name | Formula Verified | Notes |
-|----------------|------------------|------------------|-------|
-| % Valid CFs | `pct_valid_cfs` | ✅ | Adapted for regression (epsilon tolerance) |
-| Continuous-Diversity | `continuous_diversity` | ✅ | Uses only continuous features |
-| Categorical-Diversity | `categorical_diversity` | ✅ | Uses only categorical features |
-| Cont-Count-Diversity | `cont_count_diversity` | ✅ | **FIXED**: Now uses only continuous features |
-| Continuous-Proximity | `continuous_proximity` | ✅ | Uses only continuous features |
-| Categorical-Proximity | `categorical_proximity` | ✅ | Uses only categorical features |
-| Continuous-Sparsity | `continuous_sparsity` | ✅ | **FIXED**: Now uses only continuous features |
+**Auto MPG Dataset**: 4 continuous features (no categorical features)
+- Cylinders
+- Displacement  
+- Horsepower
+- Weight
+
+All metrics treat these features as continuous and use MAD (Median Absolute Deviation) normalization.
 
 ---
 
-## Detailed Formula Verification
+## Metrics Calculated Per Experiment
+
+Each experiment generates k counterfactuals for a single (original, target) pair. The following metrics are calculated:
 
 ### 1️⃣ % Valid CFs
 
-**Article Formula:**
-```
-% Valid CFs = |{c ∈ C : f(c) > 0.5}| / k
-```
-
-**Implementation (Regression Adaptation):**
+**Formula:**
 ```python
-valid_mask = np.abs(all_predictions - target_value) <= epsilon
-n_valid = np.sum(valid_mask)
-pct_valid_cfs = float(n_valid) / k
+valid_mask = |predictions - target| <= epsilon
+pct_valid_cfs = n_valid / k_requested
 ```
 
-**Notes:**
-- Article: Binary classification (f(c) > 0.5)
-- Implementation: Regression with epsilon tolerance
-- ✅ **Correct adaptation for regression tasks**
+**Interpretation:**
+- Percentage of generated samples that achieve the target prediction within epsilon tolerance
+- Example: 0.18% (18/10000) means 18 out of 10,000 samples were valid CFs
 
 ---
 
-### 2️⃣ Continuous-Diversity
+### 2️⃣ % Valid CFs after eps
 
-**Article Formula:**
-```
-Continuous-Diversity = (1/C(k,2)) * Σ_(i<j) dist_cont(c_i, c_j)
-
-where:
-dist_cont(a, b) = (1/d_cont) * Σ_(p=1 to d_cont) |a_p - b_p| / MAD_p
-```
-
-**Implementation:**
+**Formula:**
 ```python
-if d_cont > 0:
-    cont_diff = np.abs(all_cfs[i][continuous_features] - all_cfs[j][continuous_features]) / mad_values[continuous_features]
-    dist_cont = np.mean(cont_diff)  # Averages over d_cont
-    pairwise_distances_cont.append(dist_cont)
-
-continuous_diversity = np.mean(pairwise_distances_cont)  # Averages over C(k,2) pairs
+n_valid_after_eps = sum(1 for pred in cf_predictions if |pred - target| <= epsilon)
+pct_valid_after_eps = (n_valid_after_eps / total_generated) * 100
 ```
 
-**Verification:**
-- ✅ Uses **only continuous features**
-- ✅ MAD-normalized: `|a_p - b_p| / MAD_p`
-- ✅ Divides by `d_cont` (via `np.mean`)
-- ✅ Divides by `C(k,2)` (via `np.mean` of pairs)
+**Interpretation:**
+- Same as "% Valid CFs" - both count CFs within epsilon threshold
+- Displayed for consistency with expected output format
 
 ---
 
-### 3️⃣ Categorical-Diversity
+### 3️⃣ Continuous-Proximity (Mothilal et al. 2020)
 
-**Article Formula:**
-```
-Categorical-Diversity = (1/C(k,2)) * Σ_(i<j) dist_cat(c_i, c_j)
-
-where:
-dist_cat(a, b) = (1/d_cat) * Σ_(p=1 to d_cat) 1(a_p ≠ b_p)
-```
-
-**Implementation:**
-```python
-if d_cat > 0:
-    n_cat_diff = np.sum(np.abs(all_cfs[i][categorical_features] - all_cfs[j][categorical_features]) > 1e-6)
-    dist_cat = n_cat_diff / d_cat  # Divides by d_cat
-    pairwise_distances_cat.append(dist_cat)
-
-categorical_diversity = np.mean(pairwise_distances_cat)  # Averages over C(k,2) pairs
-```
-
-**Verification:**
-- ✅ Uses **only categorical features**
-- ✅ Binary indicator: `1(a_p ≠ b_p)` implemented as `> 1e-6`
-- ✅ Divides by `d_cat`
-- ✅ Divides by `C(k,2)` (via `np.mean` of pairs)
-
----
-
-### 4️⃣ Cont-Count-Diversity
-
-**Article Formula:**
-```
-Cont-Count-Diversity = (1/(C(k,2) * d_cont)) * Σ_(i<j) Σ_(p=1 to d_cont) 1(c_i,p ≠ c_j,p)
-```
-
-**Implementation:**
-```python
-if d_cont > 0:
-    n_cont_diff = np.sum(np.abs(all_cfs[i][continuous_features] - all_cfs[j][continuous_features]) > 1e-6)
-    cont_count_differences.append(n_cont_diff)
-
-cont_count_diversity = np.mean(cont_count_differences) / d_cont
-```
-
-**Verification:**
-- ✅ Uses **only continuous features** (FIXED!)
-- ✅ Binary indicator: `1(c_i,p ≠ c_j,p)`
-- ✅ Divides by `C(k,2)` (via `np.mean`)
-- ✅ Divides by `d_cont`
-
-**Previous Bug:** Was using ALL features instead of only continuous
-**Status:** ✅ **FIXED**
-
----
-
-### 5️⃣ Continuous-Proximity
-
-**Article Formula:**
+**Formula:**
 ```
 Continuous-Proximity = -(1/k) * Σ_(i=1 to k) dist_cont(c_i, x)
 
 where:
-dist_cont(c, x) = (1/d_cont) * Σ_(p=1 to d_cont) |c_p - x_p| / MAD_p
+dist_cont(c, x) = (1/d) * Σ_p |c_p - x_p| / MAD_p
 ```
 
 **Implementation:**
 ```python
-if d_cont > 0:
-    cont_diff = np.abs(cf[continuous_features] - X_original[continuous_features]) / mad_values[continuous_features]
-    dist = np.mean(cont_diff)  # Averages over d_cont
-    distances_cont.append(dist)
-
-continuous_proximity = -np.mean(distances_cont)  # Negative average over k CFs
+for cf in all_cf_samples:
+    dist = np.mean(np.abs(np.array(cf) - np.array(sample)) / mad_values)
+    proximities.append(dist)
+continuous_proximity = -np.mean(proximities)
 ```
 
-**Verification:**
-- ✅ Uses **only continuous features**
-- ✅ MAD-normalized: `|c_p - x_p| / MAD_p`
-- ✅ Divides by `d_cont` (via `np.mean`)
-- ✅ Divides by `k` and applies negative sign
+**Interpretation:**
+- Negative average MAD-normalized distance from original
+- More negative = CFs are farther from original
+- Less negative (closer to 0) = CFs are closer to original
 
 ---
 
-### 6️⃣ Categorical-Proximity
+### 4️⃣ Categorical-Proximity
 
-**Article Formula:**
+**Value:** Hardcoded to 1.0
+
+**Reason:** Auto MPG has no categorical features
+
+---
+
+### 5️⃣ Continuous-Sparsity (Mothilal et al. 2020)
+
+**Formula:**
 ```
-Categorical-Proximity = 1 - (1/k) * Σ_(i=1 to k) dist_cat(c_i, x)
+Continuous-Sparsity = 1 - (1/(k*d)) * Σ_i Σ_p 1[c_i,p ≠ x_p]
+```
+
+**Implementation:**
+```python
+total_changes = 0
+for cf in all_cf_samples:
+    n_changes = np.sum(np.abs(np.array(cf) - np.array(sample)) > 1e-6)
+    total_changes += n_changes
+continuous_sparsity = 1.0 - (total_changes / (n_generated * d))
+```
+
+**Interpretation:**
+- 1.0 = sparse (no features changed)
+- 0.0 = all features changed
+- Measures how few features are modified on average
+
+---
+
+### 6️⃣ Continuous-Diversity (Mothilal et al. 2020)
+
+**Formula:**
+```
+Continuous-Diversity = (1/C(k,2)) * Σ_(i<j) dist_cont(c_i, c_j)
 
 where:
-dist_cat(c, x) = (1/d_cat) * Σ_(p=1 to d_cat) 1(c_p ≠ x_p)
+dist_cont(a, b) = (1/d) * Σ_p |a_p - b_p| / MAD_p
 ```
 
 **Implementation:**
 ```python
-if d_cat > 0:
-    n_changed = np.sum(np.abs(cf[categorical_features] - X_original[categorical_features]) > 1e-6)
-    dist = n_changed / d_cat  # Divides by d_cat
-    distances_cat.append(dist)
-
-categorical_proximity = 1.0 - np.mean(distances_cat)  # 1 - (1/k) * Σ dist_cat
+if n_generated > 1:
+    pairwise_distances = []
+    for i in range(n_generated):
+        for j in range(i+1, n_generated):
+            dist = np.mean(np.abs(np.array(cf_i) - np.array(cf_j)) / mad_values)
+            pairwise_distances.append(dist)
+    continuous_diversity = np.mean(pairwise_distances)
 ```
 
-**Verification:**
-- ✅ Uses **only categorical features**
-- ✅ Binary indicator: `1(c_p ≠ x_p)`
-- ✅ Divides by `d_cat`
-- ✅ Divides by `k` (via `np.mean`)
-- ✅ Subtracts from 1.0
+**Interpretation:**
+- Average MAD-normalized distance between all CF pairs
+- Higher = more diverse counterfactuals
+- Lower = more similar counterfactuals
 
 ---
 
-### 7️⃣ Continuous-Sparsity
+### 7️⃣ Categorical-Diversity
 
-**Article Formula:**
+**Value:** Hardcoded to 0.0
+
+**Reason:** Auto MPG has no categorical features
+
+---
+
+### 8️⃣ Cont-Count-Diversity (Mothilal et al. 2020)
+
+**Formula:**
 ```
-Continuous-Sparsity = 1 - (1/(k * d_cont)) * Σ_(i=1 to k) Σ_(p=1 to d_cont) 1(c_i,p ≠ x_p)
+Cont-Count-Diversity = (1/(C(k,2) * d)) * Σ_(i<j) Σ_p 1[c_i,p ≠ c_j,p]
 ```
 
 **Implementation:**
 ```python
-if d_cont > 0:
-    total_changes = 0
-    for cf in all_cfs:
-        n_changes = np.sum(np.abs(cf[continuous_features] - X_original[continuous_features]) > 1e-6)
-        total_changes += n_changes
-    
-    continuous_sparsity = 1.0 - (total_changes / (n_generated * d_cont))
+if n_generated > 1:
+    count_diffs = []
+    for i in range(n_generated):
+        for j in range(i+1, n_generated):
+            n_diff = np.sum(np.abs(np.array(cf_i) - np.array(cf_j)) > 1e-6)
+            count_diffs.append(n_diff)
+    cont_count_diversity = np.mean(count_diffs) / d
 ```
 
-**Verification:**
-- ✅ Uses **only continuous features** (FIXED!)
-- ✅ Binary indicator: `1(c_i,p ≠ x_p)`
-- ✅ Divides by `k * d_cont`
-- ✅ Subtracts from 1.0
-
-**Previous Bug:** Was using ALL features instead of only continuous
-**Status:** ✅ **FIXED**
+**Interpretation:**
+- Average number of different features between CF pairs, normalized by d
+- 1.0 = all features differ between CFs
+- 0.0 = all CFs are identical
 
 ---
 
-## Test Results
+### 9️⃣ Highest Priority Value (NEW)
 
-All tests pass with the corrected implementation:
+**Formula:**
+```python
+valid_cf_scores = [score for i, score in enumerate(all_cf_scores) 
+                   if |all_cf_predictions[i] - target| <= epsilon]
+highest_priority = max(valid_cf_scores)
+```
 
-```
-✓ Test 1: All metrics present
-✓ Test 2: Metric ranges correct
-  - pct_valid_cfs: 0.6 (3/5 = 0.6) ✓
-  - continuous_sparsity: 0.083 (in [0,1]) ✓
-  - cont_count_diversity: 1.0 (in [0,1]) ✓
-  - categorical_diversity: 0.0 (no categorical features) ✓
-✓ Test 3: Categorical proximity works correctly
-```
+**Interpretation:**
+- Maximum priority/preference score among valid CFs
+- Shows the best priority value achieved by valid counterfactuals
 
 ---
 
-## Bugs Fixed
+### 🔟 Number of Highest CFs (NEW)
 
-### 🐛 Bug 1: Continuous-Sparsity used ALL features
-**Before:**
+**Formula:**
 ```python
-n_changes = np.sum(np.abs(cf - X_original) > 1e-6)  # ALL features
-sparsity = 1.0 - (total_changes / (n_generated * d))  # Divided by ALL features
+n_highest = sum(1 for score in valid_cf_scores if score == highest_priority)
+pct_highest = (n_highest / len(valid_cf_scores)) * 100
 ```
 
-**After:**
-```python
-n_changes = np.sum(np.abs(cf[continuous_features] - X_original[continuous_features]) > 1e-6)
-continuous_sparsity = 1.0 - (total_changes / (n_generated * d_cont))
-```
+**Interpretation:**
+- How many valid CFs achieved the highest priority value
+- Example: "30.0% (300/1000)" means 300 out of 1000 valid CFs have the max priority
+- Indicates how concentrated valid solutions are at the top priority level
 
-### 🐛 Bug 2: Cont-Count-Diversity used ALL features
-**Before:**
-```python
-n_diff = np.sum(np.abs(all_cfs[i] - all_cfs[j]) > 1e-6)  # ALL features
-count_diversity = np.mean(count_differences) / d  # Divided by ALL features
-```
+---
 
-**After:**
-```python
-n_cont_diff = np.sum(np.abs(all_cfs[i][continuous_features] - all_cfs[j][continuous_features]) > 1e-6)
-cont_count_diversity = np.mean(cont_count_differences) / d_cont
-```
+## Aggregated Metrics (Across All Experiments)
 
-### 🐛 Bug 3: Single "diversity" metric instead of separate continuous/categorical
-**Before:**
-```python
-return {'diversity': ..., 'count_diversity': ...}
-```
+After running all experiments, metrics are aggregated:
 
-**After:**
-```python
-return {
-    'continuous_diversity': ...,
-    'categorical_diversity': ...,
-    'cont_count_diversity': ...
-}
+- **% Valid CFs**: Total valid / Total requested (across all experiments)
+- **% Valid CFs after eps**: Total valid / Total generated (across all experiments)
+- **Highest priority value**: Maximum priority among ALL valid CFs
+- **Number of highest CFs**: Count and % of valid CFs with max priority
+- **Other metrics**: Averaged across experiments
+
+---
+
+## Example Output
+
+```
+ARTICLE-BASED METRICS (Mothilal et al. 2020):
+  % Valid CFs: 0.18% (18/10000)
+  Continuous-Proximity: -1.6261
+  Categorical-Proximity: 1.0000
+  Continuous-Sparsity: 0.0000 (1.0 = sparse)
+  Continuous-Diversity: 1.1740
+  Categorical-Diversity: 0.0000
+  Cont-Count-Diversity: 1.0000
+  % Valid CFs after eps: 100.00% (18/18)
+  Highest priority value: 3.0000
+  Number of highest CFs: 100.00% (18/18)
 ```
 
 ---
 
-## Summary
+## Key Implementation Details
 
-✅ **All 7 metrics now match the article formulas exactly**
-✅ **Separate continuous and categorical metrics computed correctly**
-✅ **Metric names match article terminology**
-✅ **All tests pass**
+1. **Per-experiment calculation**: Metrics are calculated for k CFs generated for the same original point, then averaged across experiments
 
-The implementation is now ready for comparing your priorities-based method with DiCE using the exact evaluation framework from Mothilal et al. (2020).
+2. **MAD normalization**: All distance calculations use Median Absolute Deviation for scale-invariant comparison
+
+3. **Epsilon threshold**: Used to determine validity (|prediction - target| <= epsilon)
+
+4. **No filtering**: ALL generated counterfactuals are kept (no top-N filtering)
+
+5. **Priority scores**: Based on exponential preference functions that reward proximity to exemplars
+
+---
+
+## Reference
+
+Metrics 1-8 are based on:
+**Mothilal, R. K., Sharma, A., & Tan, C. (2020).** Explaining machine learning classifiers through diverse counterfactual explanations. *Proceedings of the 2020 Conference on Fairness, Accountability, and Transparency*, 607-617.
+
+Metrics 9-10 are custom additions for evaluating priority-based counterfactual generation.
