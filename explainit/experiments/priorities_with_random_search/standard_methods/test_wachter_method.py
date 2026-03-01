@@ -12,7 +12,18 @@ import os
 from pathlib import Path
 import tensorflow as tf
 
-from explainit.experiments.priorities_with_random_search.standard_methods import wachter_counterfactual, compute_metrics
+# Compute metrics function
+def compute_metrics(X_original, X_cf, prediction, target, epsilon):
+    """Compute counterfactual quality metrics."""
+    l2_distance = float(np.linalg.norm(X_cf - X_original))
+    l1_distance = float(np.sum(np.abs(X_cf - X_original)))
+    sparsity = int(np.sum(np.abs(X_cf - X_original) > 0.001))
+    
+    return {
+        'l2_distance': l2_distance,
+        'l1_distance': l1_distance,
+        'sparsity': sparsity
+    }
 
 # Configure logging
 logging.basicConfig(
@@ -87,6 +98,124 @@ def get_test_samples(model, X_test, y_test):
         logger.info(f"  Sample {i+1}: Prediction={s['prediction']:.2f} MPG, Actual={s['actual']:.2f} MPG")
     
     return samples
+
+
+def wachter_always_return(X_original, model_predict, target_value, epsilon, lambda_param, feature_ranges, max_iter):
+    """Wrapper that returns counterfactual even if not valid."""
+    from scipy.optimize import minimize
+    
+    # Track function evaluations for debugging
+    eval_count = [0]
+    
+    def loss_function(X_cf):
+        pred = model_predict([X_cf])[0]
+        pred_loss = (pred - target_value) ** 2
+        distance_loss = np.sum((X_cf - X_original) ** 2)
+        total_loss = lambda_param * pred_loss + distance_loss
+        eval_count[0] += 1
+        return total_loss
+    
+    # Test initial loss
+    initial_loss = loss_function(X_original)
+    eval_count[0] = 0  # Reset counter
+    
+    # Try multiple optimization methods
+    methods_to_try = [
+        ('L-BFGS-B', {
+            'maxiter': max_iter,
+            'ftol': 1e-15,  # Much tighter convergence tolerance
+            'gtol': 1e-10,  # Much tighter gradient tolerance  
+            'eps': 1e-4,    # Larger step for gradient approximation
+            'maxfun': 15000,
+            'maxls': 50,
+            'disp': False
+        }),
+        ('SLSQP', {
+            'maxiter': max_iter,
+            'ftol': 1e-15,
+            'eps': 1e-4,
+            'disp': False
+        }),
+        ('Powell', {  # Derivative-free method
+            'maxiter': max_iter,
+            'ftol': 1e-10,
+            'disp': False
+        })
+    ]
+    
+    best_result = None
+    best_method = None
+    best_pred_error = float('inf')
+    
+    for method_name, options in methods_to_try:
+        try:
+            if method_name == 'Powell':
+                # Powell doesn't support bounds directly, so we skip it if bounds are tight
+                result = minimize(
+                    loss_function,
+                    X_original,
+                    method=method_name,
+                    options=options
+                )
+            else:
+                result = minimize(
+                    loss_function,
+                    X_original,
+                    method=method_name,
+                    bounds=feature_ranges,
+                    options=options
+                )
+            
+            # Check if this result is better
+            X_cf_test = result.x
+            pred_test = model_predict([X_cf_test])[0]
+            pred_error = abs(pred_test - target_value)
+            
+            if best_result is None or pred_error < best_pred_error:
+                best_result = result
+                best_method = method_name
+                best_pred_error = pred_error
+            
+            # If we found a valid solution, stop trying other methods
+            if pred_error <= epsilon:
+                break
+                
+        except Exception as e:
+            continue
+    
+    # Use best result
+    if best_result is None:
+        # Fallback to L-BFGS-B if all failed
+        result = minimize(
+            loss_function,
+            X_original,
+            method='L-BFGS-B',
+            bounds=feature_ranges,
+            options=methods_to_try[0][1]
+        )
+        best_method = 'L-BFGS-B (fallback)'
+    else:
+        result = best_result
+    
+    X_cf = result.x
+    prediction = model_predict([X_cf])[0]
+    is_valid = abs(prediction - target_value) <= epsilon
+    
+    info = {
+        'method': f'Wachter ({best_method})',
+        'valid': is_valid,
+        'distance': np.linalg.norm(X_cf - X_original),
+        'iterations': result.nit,
+        'success': result.success,
+        'final_loss': result.fun,
+        'function_evals': eval_count[0],
+        'initial_loss': initial_loss,
+        'message': result.message,
+        'optimizer_used': best_method
+    }
+    
+    # ALWAYS return counterfactual, even if not valid
+    return X_cf, prediction, info
 
 
 def test_wachter_parameters(model, X_train, sample, target_value, feature_names):
@@ -164,125 +293,6 @@ def test_wachter_parameters(model, X_train, sample, target_value, feature_names)
         print(f"✗ Loss function NOT sensitive - gradients effectively zero")
         print(f"  This explains why optimizer cannot move!")
     print(f"{'=' * 100}\n")
-    
-    # Modified Wachter wrapper that ALWAYS returns the counterfactual
-    def wachter_always_return(X_original, model_predict, target_value, epsilon, lambda_param, feature_ranges, max_iter):
-        """Wrapper that returns counterfactual even if not valid."""
-        from scipy.optimize import minimize
-        
-        # Track function evaluations for debugging
-        eval_count = [0]
-        
-        def loss_function(X_cf):
-            pred = model_predict([X_cf])[0]
-            pred_loss = (pred - target_value) ** 2
-            distance_loss = np.sum((X_cf - X_original) ** 2)
-            total_loss = lambda_param * pred_loss + distance_loss
-            eval_count[0] += 1
-            return total_loss
-        
-        # Test initial loss
-        initial_loss = loss_function(X_original)
-        eval_count[0] = 0  # Reset counter
-        
-        # Try multiple optimization methods
-        methods_to_try = [
-            ('L-BFGS-B', {
-                'maxiter': max_iter,
-                'ftol': 1e-15,  # Much tighter convergence tolerance
-                'gtol': 1e-10,  # Much tighter gradient tolerance  
-                'eps': 1e-4,    # Larger step for gradient approximation
-                'maxfun': 15000,
-                'maxls': 50,
-                'disp': False
-            }),
-            ('SLSQP', {
-                'maxiter': max_iter,
-                'ftol': 1e-15,
-                'eps': 1e-4,
-                'disp': False
-            }),
-            ('Powell', {  # Derivative-free method
-                'maxiter': max_iter,
-                'ftol': 1e-10,
-                'disp': False
-            })
-        ]
-        
-        best_result = None
-        best_method = None
-        best_pred_error = float('inf')
-        
-        for method_name, options in methods_to_try:
-            try:
-                if method_name == 'Powell':
-                    # Powell doesn't support bounds directly, so we skip it if bounds are tight
-                    result = minimize(
-                        loss_function,
-                        X_original,
-                        method=method_name,
-                        options=options
-                    )
-                else:
-                    result = minimize(
-                        loss_function,
-                        X_original,
-                        method=method_name,
-                        bounds=feature_ranges,
-                        options=options
-                    )
-                
-                # Check if this result is better
-                X_cf_test = result.x
-                pred_test = model_predict([X_cf_test])[0]
-                pred_error = abs(pred_test - target_value)
-                
-                if best_result is None or pred_error < best_pred_error:
-                    best_result = result
-                    best_method = method_name
-                    best_pred_error = pred_error
-                
-                # If we found a valid solution, stop trying other methods
-                if pred_error <= epsilon:
-                    break
-                    
-            except Exception as e:
-                continue
-        
-        # Use best result
-        if best_result is None:
-            # Fallback to L-BFGS-B if all failed
-            result = minimize(
-                loss_function,
-                X_original,
-                method='L-BFGS-B',
-                bounds=feature_ranges,
-                options=methods_to_try[0][1]
-            )
-            best_method = 'L-BFGS-B (fallback)'
-        else:
-            result = best_result
-        
-        X_cf = result.x
-        prediction = model_predict([X_cf])[0]
-        is_valid = abs(prediction - target_value) <= epsilon
-        
-        info = {
-            'method': f'Wachter ({best_method})',
-            'valid': is_valid,
-            'distance': np.linalg.norm(X_cf - X_original),
-            'iterations': result.nit,
-            'success': result.success,
-            'final_loss': result.fun,
-            'function_evals': eval_count[0],
-            'initial_loss': initial_loss,
-            'message': result.message,
-            'optimizer_used': best_method
-        }
-        
-        # ALWAYS return counterfactual, even if not valid
-        return X_cf, prediction, info
-    
     
     print("\n" + "=" * 100)
     print("WACHTER'S METHOD - PARAMETER SENSITIVITY ANALYSIS")

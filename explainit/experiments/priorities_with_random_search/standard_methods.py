@@ -339,6 +339,148 @@ def gradient_based_counterfactual(
 
 
 # ============================================================================
+# DiCE METHOD (Diverse Counterfactual Explanations)
+# ============================================================================
+
+def dice_counterfactual(
+    X_original: np.ndarray,
+    model,
+    target_value: float,
+    X_train: np.ndarray,
+    epsilon: float = 1.0,
+    total_CFs: int = 5,
+    feature_names: Optional[List[str]] = None
+) -> Tuple[Optional[np.ndarray], Optional[float], dict]:
+    """
+    DiCE (Diverse Counterfactual Explanations) method.
+    
+    Generates diverse counterfactual explanations using gradient-based optimization.
+    Reference: https://interpret.ml/DiCE/
+    
+    Args:
+        X_original: Original instance to explain
+        model: TensorFlow/Keras model
+        target_value: Target prediction value
+        X_train: Training dataset (used for feature ranges)
+        epsilon: Tolerance for target prediction
+        total_CFs: Number of diverse counterfactuals to generate
+        feature_names: List of feature names (optional)
+    
+    Returns:
+        counterfactual: Best counterfactual (or None if failed)
+        prediction: Prediction for counterfactual
+        info: Dictionary with additional information
+    """
+    try:
+        import dice_ml
+        from dice_ml import Dice
+        import pandas as pd
+    except ImportError:
+        logger.warning("DiCE library not installed. Install with: pip install dice-ml")
+        return None, None, {'method': 'DiCE', 'valid': False, 'error': 'DiCE not installed'}
+    
+    try:
+        import tensorflow as tf
+        
+        # Generate feature names if not provided
+        if feature_names is None:
+            feature_names = [f'feature_{i}' for i in range(X_original.shape[0])]
+        
+        # Convert to DataFrames (required by DiCE)
+        # DiCE requires the outcome column to be present
+        X_train_df = pd.DataFrame(X_train, columns=feature_names)
+        # Add a dummy outcome column for DiCE (we'll override predictions anyway)
+        X_train_df['outcome'] = np.zeros(len(X_train))  # Dummy values
+        
+        X_original_df = pd.DataFrame([X_original], columns=feature_names)
+        
+        # Prepare data for DiCE
+        d = dice_ml.Data(
+            dataframe=X_train_df,
+            continuous_features=feature_names,
+            outcome_name='outcome'
+        )
+        
+        # Create model wrapper for DiCE
+        # Pass the Keras model directly for TF2 backend
+        m = dice_ml.Model(model=model, backend='TF2', model_type='regressor')
+        
+        # Initialize DiCE with random method (faster and more reliable than gradient)
+        dice_exp = Dice(d, m, method='random')
+        
+        # Set desired range
+        desired_range = [target_value - epsilon, target_value + epsilon]
+        
+        # Generate counterfactuals
+        dice_result = dice_exp.generate_counterfactuals(
+            query_instances=X_original_df,
+            total_CFs=total_CFs,
+            desired_range=desired_range,
+            features_to_vary=feature_names,
+            verbose=False
+        )
+        
+        # Extract counterfactuals
+        cf_examples = dice_result.cf_examples_list[0]
+        
+        if cf_examples.final_cfs_df is None or len(cf_examples.final_cfs_df) == 0:
+            return None, None, {'method': 'DiCE', 'valid': False, 'reason': 'no_cfs_generated'}
+        
+        # Get predictions for all generated CFs
+        cfs_array = cf_examples.final_cfs_df[feature_names].values
+        preds_result = model(tf.constant(cfs_array.astype(np.float32)), training=False)
+        # Handle both tensor and numpy array returns
+        if hasattr(preds_result, 'numpy'):
+            predictions = preds_result.numpy().ravel()
+        else:
+            predictions = np.array(preds_result).ravel()
+        
+        # Find the best CF (closest to target and within epsilon)
+        best_cf = None
+        best_pred = None
+        best_distance = float('inf')
+        valid_cfs = []
+        
+        for cf, pred in zip(cfs_array, predictions):
+            is_valid = abs(pred - target_value) <= epsilon
+            distance = np.linalg.norm(cf - X_original)
+            
+            if is_valid:
+                valid_cfs.append((cf, pred, distance))
+                if distance < best_distance:
+                    best_cf = cf
+                    best_pred = pred
+                    best_distance = distance
+        
+        # If no valid CF found, return the closest one anyway
+        if best_cf is None:
+            distances = np.linalg.norm(cfs_array - X_original, axis=1)
+            pred_errors = np.abs(predictions - target_value)
+            
+            # Choose CF with smallest prediction error
+            best_idx = np.argmin(pred_errors)
+            best_cf = cfs_array[best_idx]
+            best_pred = predictions[best_idx]
+            best_distance = distances[best_idx]
+        
+        is_valid = abs(best_pred - target_value) <= epsilon
+        
+        info = {
+            'method': 'DiCE',
+            'valid': is_valid,
+            'distance': float(best_distance),
+            'n_generated': len(cfs_array),
+            'n_valid': len(valid_cfs)
+        }
+        
+        return best_cf, best_pred, info
+        
+    except Exception as e:
+        logger.warning(f"DiCE method failed with error: {e}")
+        return None, None, {'method': 'DiCE', 'valid': False, 'error': str(e)}
+
+
+# ============================================================================
 # UTILITY FUNCTIONS
 # ============================================================================
 
@@ -407,7 +549,7 @@ def run_all_methods(
         y_train: Training predictions
         epsilon: Tolerance for target prediction
         feature_ranges: List of (min, max) tuples for each feature
-        methods_to_run: List of method names to run. Options: ['wachter', 'growing_spheres', 'prototype', 'gradient_based']
+        methods_to_run: List of method names to run. Options: ['wachter', 'growing_spheres', 'prototype', 'gradient_based', 'dice']
                        If None, runs all methods.
     
     Returns:
@@ -415,7 +557,7 @@ def run_all_methods(
     """
     # Default to all methods if not specified
     if methods_to_run is None:
-        methods_to_run = ['wachter', 'growing_spheres', 'prototype', 'gradient_based']
+        methods_to_run = ['wachter', 'growing_spheres', 'prototype', 'gradient_based', 'dice']
     
     results = {}
     
@@ -492,5 +634,27 @@ def run_all_methods(
         except Exception as e:
             logger.warning(f"  Gradient-based method failed: {e}")
             results['gradient_based'] = {'counterfactual': None, 'info': {'error': str(e)}}
+    
+    # DiCE method
+    if 'dice' in methods_to_run:
+        try:
+            logger.info("  Running DiCE method...")
+            cf_dice, pred_dice, info_dice = dice_counterfactual(
+                X_original, model, target_value, X_train, epsilon,
+                total_CFs=5
+            )
+            if cf_dice is not None:
+                metrics_dice = compute_metrics(X_original, cf_dice, pred_dice, target_value, epsilon)
+                results['dice'] = {
+                    'counterfactual': cf_dice,
+                    'prediction': pred_dice,
+                    'metrics': metrics_dice,
+                    'info': info_dice
+                }
+            else:
+                results['dice'] = {'counterfactual': None, 'info': info_dice}
+        except Exception as e:
+            logger.warning(f"  DiCE method failed: {e}")
+            results['dice'] = {'counterfactual': None, 'info': {'error': str(e)}}
     
     return results

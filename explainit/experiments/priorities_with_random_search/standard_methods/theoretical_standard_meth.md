@@ -424,6 +424,11 @@ OUTPUT: Best counterfactual, its prediction, distance
 
 **But**: If the nearest prototype is already optimal, increasing n_top_candidates won't help!
 
+### **Measure**
+
+- Find sample form those that meet the target that is the most wanted or create it and check which one in turn it is indicated by the method. In other words: how many other samples is indicated before returning the one that is the most expected
+- 
+
 ---
 
 ## **3. PROTOTYPE-BASED**
@@ -432,6 +437,7 @@ OUTPUT: Best counterfactual, its prediction, distance
 The simplest and most interpretable method. Prototype-based counterfactuals are **real instances from the training data** that achieve the target prediction and are closest to the original instance. This guarantees realistic, actionable explanations since they represent actual observed cases.
 
 **Philosophy:** "Show me someone like me who achieved the desired outcome"
+
 
 ### **Workflow**
 ```

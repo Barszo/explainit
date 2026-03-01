@@ -12,7 +12,18 @@ import os
 from pathlib import Path
 import tensorflow as tf
 
-from explainit.experiments.priorities_with_random_search.standard_methods import compute_metrics
+# Compute metrics function
+def compute_metrics(X_original, X_cf, prediction, target, epsilon):
+    """Compute counterfactual quality metrics."""
+    l2_distance = float(np.linalg.norm(X_cf - X_original))
+    l1_distance = float(np.sum(np.abs(X_cf - X_original)))
+    sparsity = int(np.sum(np.abs(X_cf - X_original) > 0.001))
+    
+    return {
+        'l2_distance': l2_distance,
+        'l1_distance': l1_distance,
+        'sparsity': sparsity
+    }
 
 # Configure logging
 logging.basicConfig(

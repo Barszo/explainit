@@ -10,6 +10,7 @@ binary_classifiers/
 trash/
 experiment_parameters.csv
 experiment_results.csv
+.DS_Store
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]

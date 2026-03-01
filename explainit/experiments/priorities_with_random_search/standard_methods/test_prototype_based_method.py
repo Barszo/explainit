@@ -1,6 +1,6 @@
 """
-Growing Spheres Method Testing Script
-Test different epsilon and n_search_samples values to understand their impact on counterfactual generation.
+Prototype-Based Method Testing Script
+Test different epsilon and top_k values to understand their impact on counterfactual generation.
 """
 
 import numpy as np
@@ -12,7 +12,18 @@ import os
 from pathlib import Path
 import tensorflow as tf
 
-from explainit.experiments.priorities_with_random_search.standard_methods import compute_metrics
+# Compute metrics function
+def compute_metrics(X_original, X_cf, prediction, target, epsilon):
+    """Compute counterfactual quality metrics."""
+    l2_distance = float(np.linalg.norm(X_cf - X_original))
+    l1_distance = float(np.sum(np.abs(X_cf - X_original)))
+    sparsity = int(np.sum(np.abs(X_cf - X_original) > 0.001))
+    
+    return {
+        'l2_distance': l2_distance,
+        'l1_distance': l1_distance,
+        'sparsity': sparsity
+    }
 
 # Configure logging
 logging.basicConfig(
@@ -92,18 +103,17 @@ def get_test_samples(model, X_test, y_test):
     return samples
 
 
-def growing_spheres_modified(
+def prototype_based_modified(
     X_original: np.ndarray,
     model_predict,
     target_value: float,
     X_train: np.ndarray,
     y_train: np.ndarray,
     epsilon: float = 1.0,
-    n_search_samples: int = 20,
-    n_top_candidates: int = 10
+    top_k: int = 1
 ):
     """
-    Modified Growing Spheres with additional diagnostics and configurable parameters.
+    Modified Prototype-Based method with additional diagnostics and configurable parameters.
     
     Args:
         X_original: Original instance to explain
@@ -112,22 +122,22 @@ def growing_spheres_modified(
         X_train: Training dataset
         y_train: Training predictions
         epsilon: Tolerance for target prediction
-        n_search_samples: Number of interpolation samples for binary search
-        n_top_candidates: Number of closest prototypes to try
+        top_k: Which k-th nearest prototype to return (1=closest, 2=2nd closest, etc.)
     
     Returns:
-        counterfactual: Generated counterfactual (or None if failed)
+        counterfactual: Generated counterfactual (real training instance or None if failed)
         prediction: Prediction for counterfactual
         info: Dictionary with additional information
     """
     # Find training instances within epsilon of target
     target_mask = np.abs(y_train - target_value) <= epsilon
     target_instances = X_train[target_mask]
+    target_predictions = y_train[target_mask]
     
     if len(target_instances) == 0:
         logger.warning("No training instances found within epsilon of target")
         return None, None, {
-            'method': 'Growing Spheres',
+            'method': 'Prototype-Based',
             'valid': False,
             'reason': 'no_target_instances',
             'n_candidates_found': 0
@@ -137,57 +147,44 @@ def growing_spheres_modified(
     distances = np.linalg.norm(target_instances - X_original, axis=1)
     sorted_indices = np.argsort(distances)
     
-    # Try closest instances with binary search
-    best_cf = None
-    best_pred = None
-    best_distance = float('inf')
-    candidates_tried = 0
-    valid_found = 0
-    
-    for idx in sorted_indices[:n_top_candidates]:
-        candidates_tried += 1
-        candidate = target_instances[idx]
-        
-        # Binary search along the line from original to candidate
-        alphas = np.linspace(0, 1, n_search_samples)
-        for alpha in alphas:
-            interpolated = (1 - alpha) * X_original + alpha * candidate
-            pred = model_predict([interpolated])[0]
-            
-            # Check if valid
-            if abs(pred - target_value) <= epsilon:
-                dist = np.linalg.norm(interpolated - X_original)
-                if dist < best_distance:
-                    best_cf = interpolated
-                    best_pred = pred
-                    best_distance = dist
-                    valid_found += 1
-                break
-    
-    if best_cf is not None:
-        info = {
-            'method': 'Growing Spheres',
-            'valid': True,
-            'distance': best_distance,
-            'n_candidates_found': len(target_instances),
-            'n_candidates_tried': candidates_tried,
-            'n_valid_found': valid_found
-        }
-        return best_cf, best_pred, info
-    else:
+    # Check if we have enough prototypes
+    if top_k > len(sorted_indices):
+        logger.warning(f"Requested top_k={top_k} but only {len(sorted_indices)} prototypes available")
         return None, None, {
-            'method': 'Growing Spheres',
+            'method': 'Prototype-Based',
             'valid': False,
-            'reason': 'no_valid_cf_found',
+            'reason': 'insufficient_prototypes',
             'n_candidates_found': len(target_instances),
-            'n_candidates_tried': candidates_tried,
-            'n_valid_found': 0
+            'top_k_requested': top_k
         }
+    
+    # Select the k-th closest prototype (k-1 because 0-indexed)
+    selected_idx = sorted_indices[top_k - 1]
+    prototype = target_instances[selected_idx]
+    prototype_pred = target_predictions[selected_idx]
+    prototype_distance = distances[selected_idx]
+    
+    # Verify prediction is still within epsilon
+    actual_pred = model_predict([prototype])[0]
+    is_valid = abs(actual_pred - target_value) <= epsilon
+    
+    info = {
+        'method': 'Prototype-Based',
+        'valid': is_valid,
+        'distance': prototype_distance,
+        'n_candidates_found': len(target_instances),
+        'top_k_used': top_k,
+        'prototype_training_pred': prototype_pred,
+        'prototype_actual_pred': actual_pred,
+        'is_real_instance': True
+    }
+    
+    return prototype, actual_pred, info
 
 
-def test_growing_spheres_parameters(model, X_train, y_train, sample, target_value, feature_names):
+def test_prototype_parameters(model, X_train, y_train, sample, target_value, feature_names):
     """
-    Test Growing Spheres method with different epsilon and n_search_samples values.
+    Test Prototype-Based method with different epsilon and top_k values.
     
     Args:
         model: Trained model
@@ -203,11 +200,10 @@ def test_growing_spheres_parameters(model, X_train, y_train, sample, target_valu
     
     # Test different parameter combinations
     epsilon_values = [0.5, 1.0, 2.0, 3.0, 5.0, 10.0]
-    n_search_samples_values = [5, 10, 20, 50, 100]
-    n_top_candidates_values = [5, 10, 20]
+    top_k_values = [1, 2, 3, 5, 10]
     
     print("\n" + "=" * 100)
-    print("GROWING SPHERES METHOD - PARAMETER SENSITIVITY ANALYSIS")
+    print("PROTOTYPE-BASED METHOD - PARAMETER SENSITIVITY ANALYSIS")
     print("=" * 100)
     print(f"\nOriginal Sample Prediction: {model_predict([sample])[0]:.2f} MPG")
     print(f"Target Prediction: {target_value:.2f} MPG")
@@ -228,39 +224,37 @@ def test_growing_spheres_parameters(model, X_train, y_train, sample, target_valu
             min_dist = distances.min()
             max_dist = distances.max()
             mean_dist = distances.mean()
-            print(f"Epsilon={eps:5.1f}: {n_instances:4d} training instances found | "
+            print(f"Epsilon={eps:5.1f}: {n_instances:4d} prototypes available | "
                   f"Distance range: [{min_dist:.4f}, {max_dist:.4f}], mean={mean_dist:.4f}")
         else:
-            print(f"Epsilon={eps:5.1f}: {n_instances:4d} training instances found")
+            print(f"Epsilon={eps:5.1f}: {n_instances:4d} prototypes available")
     
     print("\n" + "=" * 100)
     
     # Store results for summary
     all_results = []
     
-    # Test 1: Effect of epsilon (with fixed n_search_samples and n_top_candidates)
+    # Test 1: Effect of epsilon (with fixed top_k=1)
     print("\n" + "=" * 100)
-    print("TEST 1: EPSILON SENSITIVITY (n_search_samples=20, n_top_candidates=10)")
+    print("TEST 1: EPSILON SENSITIVITY (top_k=1, returns closest prototype)")
     print("=" * 100)
     
     for epsilon in epsilon_values:
-        # Run Growing Spheres
-        cf, pred, info = growing_spheres_modified(
+        # Run Prototype-Based
+        cf, pred, info = prototype_based_modified(
             X_original=sample,
             model_predict=model_predict,
             target_value=target_value,
             X_train=X_train,
             y_train=y_train,
             epsilon=epsilon,
-            n_search_samples=20,
-            n_top_candidates=10
+            top_k=1
         )
         
         # Prepare result
         result = {
             'epsilon': epsilon,
-            'n_search_samples': 20,
-            'n_top_candidates': 10,
+            'top_k': 1,
             'valid': info['valid'],
             'prediction': pred,
             'counterfactual': cf,
@@ -278,28 +272,26 @@ def test_growing_spheres_parameters(model, X_train, y_train, sample, target_valu
         print(f"{'─' * 90}")
         
         if cf is not None and info['valid']:
-            print(f"✓ VALID counterfactual found")
+            print(f"✓ VALID prototype found")
             print(f"  Prediction: {pred:.2f} MPG (target: {target_value:.2f}, error: {abs(pred - target_value):.2f})")
             print(f"  Distance: L2={metrics['l2_distance']:.4f}, L1={metrics['l1_distance']:.4f}")
             print(f"  Sparsity: {metrics['sparsity']} features changed")
-            print(f"  Training instances available: {info['n_candidates_found']}")
-            print(f"  Candidates tried: {info['n_candidates_tried']}, Valid found: {info['n_valid_found']}")
+            print(f"  Available prototypes: {info['n_candidates_found']}")
+            print(f"  Prototype rank: {info['top_k_used']} (closest)")
+            print(f"  Real training instance: Yes")
             
             # Show feature changes
-            print(f"  Feature Changes:")
+            print(f"  Feature Changes (original → prototype):")
             for idx, (orig, new) in enumerate(zip(sample, cf)):
                 if abs(orig - new) > 0.001:
                     change_pct = ((new - orig) / (orig + 1e-10)) * 100
                     print(f"    {feature_names[idx]:15s}: {orig:.4f} → {new:.4f} (Δ={new-orig:+.4f}, {change_pct:+.1f}%)")
         else:
-            print(f"✗ FAILED - No valid counterfactual found")
+            print(f"✗ FAILED - No valid prototype found")
             print(f"  Reason: {info.get('reason', 'unknown')}")
-            print(f"  Training instances available: {info.get('n_candidates_found', 0)}")
-            if info.get('n_candidates_tried', 0) > 0:
-                print(f"  Candidates tried: {info['n_candidates_tried']}")
+            print(f"  Available prototypes: {info.get('n_candidates_found', 0)}")
     
-    # Test 2: Effect of n_search_samples (with fixed epsilon and n_top_candidates)
-    # Use an epsilon that found results in Test 1
+    # Test 2: Effect of top_k (with fixed epsilon that found results)
     valid_epsilon = None
     for r in all_results:
         if r['valid']:
@@ -308,25 +300,23 @@ def test_growing_spheres_parameters(model, X_train, y_train, sample, target_valu
     
     if valid_epsilon is not None:
         print("\n" + "=" * 100)
-        print(f"TEST 2: N_SEARCH_SAMPLES SENSITIVITY (epsilon={valid_epsilon}, n_top_candidates=10)")
+        print(f"TEST 2: TOP_K SENSITIVITY (epsilon={valid_epsilon}, returns k-th closest)")
         print("=" * 100)
         
-        for n_samples in n_search_samples_values:
-            cf, pred, info = growing_spheres_modified(
+        for k in top_k_values:
+            cf, pred, info = prototype_based_modified(
                 X_original=sample,
                 model_predict=model_predict,
                 target_value=target_value,
                 X_train=X_train,
                 y_train=y_train,
                 epsilon=valid_epsilon,
-                n_search_samples=n_samples,
-                n_top_candidates=10
+                top_k=k
             )
             
             result = {
                 'epsilon': valid_epsilon,
-                'n_search_samples': n_samples,
-                'n_top_candidates': 10,
+                'top_k': k,
                 'valid': info['valid'],
                 'prediction': pred,
                 'counterfactual': cf,
@@ -339,71 +329,29 @@ def test_growing_spheres_parameters(model, X_train, y_train, sample, target_valu
             
             all_results.append(result)
             
-            print(f"\nn_search_samples = {n_samples:3d} (interpolation points)")
+            print(f"\ntop_k = {k:2d} (select {k}{'st' if k==1 else 'nd' if k==2 else 'rd' if k==3 else 'th'} closest prototype)")
             print(f"{'─' * 90}")
             
             if cf is not None and info['valid']:
-                print(f"✓ VALID counterfactual found")
+                print(f"✓ VALID prototype found")
                 print(f"  Prediction: {pred:.2f} MPG (error: {abs(pred - target_value):.2f})")
                 print(f"  Distance: L2={metrics['l2_distance']:.4f}")
                 print(f"  Sparsity: {metrics['sparsity']} features changed")
+                print(f"  Prototype rank: {k} out of {info['n_candidates_found']} available")
             else:
-                print(f"✗ FAILED")
-    
-    # Test 3: Effect of n_top_candidates (with fixed epsilon and n_search_samples)
-    if valid_epsilon is not None:
-        print("\n" + "=" * 100)
-        print(f"TEST 3: N_TOP_CANDIDATES SENSITIVITY (epsilon={valid_epsilon}, n_search_samples=20)")
-        print("=" * 100)
-        
-        for n_candidates in n_top_candidates_values:
-            cf, pred, info = growing_spheres_modified(
-                X_original=sample,
-                model_predict=model_predict,
-                target_value=target_value,
-                X_train=X_train,
-                y_train=y_train,
-                epsilon=valid_epsilon,
-                n_search_samples=20,
-                n_top_candidates=n_candidates
-            )
-            
-            result = {
-                'epsilon': valid_epsilon,
-                'n_search_samples': 20,
-                'n_top_candidates': n_candidates,
-                'valid': info['valid'],
-                'prediction': pred,
-                'counterfactual': cf,
-                'info': info
-            }
-            
-            if cf is not None:
-                metrics = compute_metrics(sample, cf, pred, target_value, valid_epsilon)
-                result['metrics'] = metrics
-            
-            all_results.append(result)
-            
-            print(f"\nn_top_candidates = {n_candidates:2d} (prototypes to try)")
-            print(f"{'─' * 90}")
-            
-            if cf is not None and info['valid']:
-                print(f"✓ VALID counterfactual found")
-                print(f"  Prediction: {pred:.2f} MPG (error: {abs(pred - target_value):.2f})")
-                print(f"  Distance: L2={metrics['l2_distance']:.4f}")
-                print(f"  Sparsity: {metrics['sparsity']} features changed")
-            else:
-                print(f"✗ FAILED")
+                print(f"✗ FAILED - {info.get('reason', 'unknown')}")
+                if 'n_candidates_found' in info:
+                    print(f"  Available prototypes: {info['n_candidates_found']} (requested top_k={k})")
     
     # Print summary table
     print("\n" + "=" * 100)
     print("SUMMARY TABLE - TEST 1 (EPSILON SENSITIVITY)")
     print("=" * 100)
-    print(f"\n{'Epsilon':<10}{'Valid':<10}{'Prediction':<12}{'Pred Error':<12}{'L2 Distance':<15}{'Sparsity':<12}{'Candidates':<12}")
+    print(f"\n{'Epsilon':<10}{'Valid':<10}{'Prediction':<12}{'Pred Error':<12}{'L2 Distance':<15}{'Sparsity':<12}{'Prototypes':<12}")
     print("─" * 100)
     
     for result in all_results:
-        if result['n_search_samples'] == 20 and result['n_top_candidates'] == 10:
+        if result['top_k'] == 1:
             eps = result['epsilon']
             valid = "✓" if result['valid'] else "✗"
             
@@ -426,14 +374,14 @@ def test_growing_spheres_parameters(model, X_train, y_train, sample, target_valu
     print("─" * 100)
     
     # Count valid results from Test 1
-    test1_results = [r for r in all_results if r['n_search_samples'] == 20 and r['n_top_candidates'] == 10]
+    test1_results = [r for r in all_results if r['top_k'] == 1]
     valid_results = [r for r in test1_results if r['valid']]
-    print(f"• Valid counterfactuals found: {len(valid_results)}/{len(test1_results)} epsilon values")
+    print(f"• Valid prototypes found: {len(valid_results)}/{len(test1_results)} epsilon values")
     
     if valid_results:
         # Best by distance
         best_by_distance = min(valid_results, key=lambda r: r['metrics']['l2_distance'])
-        print(f"\n• Closest counterfactual:")
+        print(f"\n• Closest prototype:")
         print(f"    Epsilon={best_by_distance['epsilon']:.1f}")
         print(f"    L2 Distance={best_by_distance['metrics']['l2_distance']:.4f}")
         print(f"    Prediction={best_by_distance['prediction']:.2f} MPG")
@@ -441,7 +389,7 @@ def test_growing_spheres_parameters(model, X_train, y_train, sample, target_valu
         
         # Best by sparsity
         best_by_sparsity = min(valid_results, key=lambda r: r['metrics']['sparsity'])
-        print(f"\n• Most sparse counterfactual:")
+        print(f"\n• Most sparse prototype:")
         print(f"    Epsilon={best_by_sparsity['epsilon']:.1f}")
         print(f"    Sparsity={best_by_sparsity['metrics']['sparsity']} features changed")
         print(f"    L2 Distance={best_by_sparsity['metrics']['l2_distance']:.4f}")
@@ -449,22 +397,21 @@ def test_growing_spheres_parameters(model, X_train, y_train, sample, target_valu
         
         # Epsilon effect
         print(f"\n• Epsilon parameter effect:")
-        print(f"    Smaller epsilon → Fewer training instances available → May fail")
-        print(f"    Larger epsilon → More training instances → Higher success rate, but less precise")
+        print(f"    Smaller epsilon → Fewer prototypes available → May fail")
+        print(f"    Larger epsilon → More prototypes → Higher success rate, but less precise")
+        print(f"    Prototypes are REAL training instances (not synthetic)")
         
-        # n_search_samples effect (if tested)
-        test2_results = [r for r in all_results if r['epsilon'] == valid_epsilon and r['n_top_candidates'] == 10 and r['n_search_samples'] != 20]
+        # top_k effect (if tested)
+        test2_results = [r for r in all_results if r['epsilon'] == valid_epsilon and r['top_k'] != 1]
         if test2_results:
-            print(f"\n• n_search_samples parameter effect:")
-            print(f"    More interpolation points → Finer search granularity")
-            print(f"    But results are similar (distance varies by < 1% typically)")
-        
-        # n_top_candidates effect (if tested)
-        test3_results = [r for r in all_results if r['epsilon'] == valid_epsilon and r['n_search_samples'] == 20 and r['n_top_candidates'] != 10]
-        if test3_results:
-            print(f"\n• n_top_candidates parameter effect:")
-            print(f"    More candidates → More options to find closer counterfactual")
-            print(f"    But usually first few candidates are sufficient")
+            valid_test2 = [r for r in test2_results if r['valid']]
+            print(f"\n• top_k parameter effect:")
+            print(f"    top_k=1 → Returns closest prototype (smallest distance)")
+            print(f"    top_k>1 → Returns more distant prototypes (may offer diversity)")
+            if valid_test2:
+                distances_by_k = [(r['top_k'], r['metrics']['l2_distance']) for r in valid_test2]
+                distances_by_k.sort()
+                print(f"    Distance increases with k: {', '.join([f'k={k}: {d:.4f}' for k, d in distances_by_k[:3]])}")
     
     print("\n" + "=" * 100)
     
@@ -474,7 +421,7 @@ def test_growing_spheres_parameters(model, X_train, y_train, sample, target_valu
 def main():
     """Main execution."""
     logger.info("=" * 80)
-    logger.info("GROWING SPHERES METHOD - PARAMETER TESTING")
+    logger.info("PROTOTYPE-BASED METHOD - PARAMETER TESTING")
     logger.info("=" * 80)
     
     # Load data
@@ -507,7 +454,7 @@ def main():
             print(f"Change needed: {target_point['prediction'] - sample_point['prediction']:+.2f} MPG")
             
             # Run parameter testing
-            results = test_growing_spheres_parameters(
+            results = test_prototype_parameters(
                 model=model,
                 X_train=X_train,
                 y_train=y_train_pred,
@@ -534,8 +481,8 @@ def main():
     print("─" * 100)
     
     for exp in all_experiment_results:
-        # Count valid results from Test 1 (epsilon sensitivity with standard params)
-        test1_results = [r for r in exp['results'] if r['n_search_samples'] == 20 and r['n_top_candidates'] == 10]
+        # Count valid results from Test 1 (epsilon sensitivity with top_k=1)
+        test1_results = [r for r in exp['results'] if r['top_k'] == 1]
         valid_count = sum(1 for r in test1_results if r['valid'])
         
         print(f"\nSample {exp['sample_idx']} → Target {exp['target_idx']}: "
@@ -549,21 +496,21 @@ def main():
             print(f"  Best: epsilon={best['epsilon']:.1f}, distance={best['metrics']['l2_distance']:.4f}, "
                   f"sparsity={best['metrics']['sparsity']}")
         else:
-            print(f"  No valid counterfactuals found (try larger epsilon or different method)")
+            print(f"  No valid prototypes found (try larger epsilon)")
     
     # Detailed results table
     print("\n" + "─" * 100)
     print("DETAILED RESULTS TABLE - ALL SCENARIOS")
     print("─" * 100)
-    print(f"\n{'Scenario':<15}{'Epsilon':<10}{'Valid':<8}{'Prediction':<12}{'Error':<10}{'L2 Dist':<12}{'Sparsity':<10}{'Candidates':<12}")
+    print(f"\n{'Scenario':<15}{'Epsilon':<10}{'Valid':<8}{'Prediction':<12}{'Error':<10}{'L2 Dist':<12}{'Sparsity':<10}{'Prototypes':<12}")
     print("─" * 100)
     
     for exp in all_experiment_results:
         scenario = f"S{exp['sample_idx']}→T{exp['target_idx']}"
         target = exp['target_prediction']
         
-        # Show Test 1 results (epsilon sensitivity)
-        test1_results = [r for r in exp['results'] if r['n_search_samples'] == 20 and r['n_top_candidates'] == 10]
+        # Show Test 1 results (epsilon sensitivity with top_k=1)
+        test1_results = [r for r in exp['results'] if r['top_k'] == 1]
         
         for result in test1_results:
             eps = result['epsilon']
@@ -599,15 +546,15 @@ def main():
             best_sparse = min(all_valid, key=lambda r: r['metrics']['sparsity'])
             
             print(f"\n{scenario}: {exp['sample_prediction']:.2f} → {exp['target_prediction']:.2f} MPG")
-            print(f"  Best distance: eps={best_dist['epsilon']:.1f}, n_search={best_dist['n_search_samples']}, "
-                  f"n_cand={best_dist['n_top_candidates']} → L2={best_dist['metrics']['l2_distance']:.4f}, "
+            print(f"  Best distance: eps={best_dist['epsilon']:.1f}, top_k={best_dist['top_k']} "
+                  f"→ L2={best_dist['metrics']['l2_distance']:.4f}, "
                   f"sparsity={best_dist['metrics']['sparsity']}")
-            print(f"  Best sparsity: eps={best_sparse['epsilon']:.1f}, n_search={best_sparse['n_search_samples']}, "
-                  f"n_cand={best_sparse['n_top_candidates']} → L2={best_sparse['metrics']['l2_distance']:.4f}, "
+            print(f"  Best sparsity: eps={best_sparse['epsilon']:.1f}, top_k={best_sparse['top_k']} "
+                  f"→ L2={best_sparse['metrics']['l2_distance']:.4f}, "
                   f"sparsity={best_sparse['metrics']['sparsity']}")
         else:
             print(f"\n{scenario}: {exp['sample_prediction']:.2f} → {exp['target_prediction']:.2f} MPG")
-            print(f"  ✗ No valid counterfactuals found")
+            print(f"  ✗ No valid prototypes found")
     
     # Overall statistics
     print("\n" + "─" * 100)
@@ -618,7 +565,7 @@ def main():
     scenarios_with_solution = sum(1 for exp in all_experiment_results if any(r['valid'] for r in exp['results']))
     
     print(f"\nTotal scenarios tested: {total_scenarios}")
-    print(f"Scenarios with valid counterfactuals: {scenarios_with_solution}/{total_scenarios} "
+    print(f"Scenarios with valid prototypes: {scenarios_with_solution}/{total_scenarios} "
           f"({100*scenarios_with_solution/total_scenarios:.1f}%)")
     
     if scenarios_with_solution > 0:
@@ -637,6 +584,13 @@ def main():
             print(f"\nAverage metrics (best solutions):")
             print(f"  Average L2 distance: {avg_dist:.4f}")
             print(f"  Average sparsity: {avg_sparse:.1f} features")
+            
+            # Compare with Growing Spheres if available
+            print(f"\n• Method characteristics:")
+            print(f"    Returns REAL training instances (not synthetic)")
+            print(f"    Guarantees realistic/observed combinations")
+            print(f"    Distance typically LARGER than Growing Spheres")
+            print(f"    (Growing Spheres interpolates, finding closer points)")
     
     print("\n" + "=" * 100)
     
