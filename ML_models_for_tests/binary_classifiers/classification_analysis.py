@@ -56,6 +56,17 @@ except ImportError:
     NEURAL_NET_AVAILABLE = False
     print("⚠ Neural Networks not available")
 
+# Check for TensorFlow
+try:
+    import tensorflow as tf
+    from tensorflow.keras import Sequential
+    from tensorflow.keras.layers import Dense, Dropout
+    from tensorflow.keras.callbacks import EarlyStopping
+    TENSORFLOW_AVAILABLE = True
+except ImportError:
+    TENSORFLOW_AVAILABLE = False
+    print("⚠ TensorFlow not available")
+
 
 def grade_model(accuracy, f1_score):
     """
@@ -156,6 +167,79 @@ def train_single_model(X_train, X_test, y_train, y_test, model_type, model_name,
             validation_fraction=0.1
         )
         needs_scaling = True
+    elif model_type == 'tensorflow_nn' and TENSORFLOW_AVAILABLE:
+        # TensorFlow neural network for DiCE gradient compatibility
+        scaler = StandardScaler()
+        X_train_processed = scaler.fit_transform(X_train)
+        X_test_processed = scaler.transform(X_test)
+        
+        # Build TensorFlow model
+        input_dim = X_train.shape[1]
+        model = Sequential([
+            Dense(64, activation='relu', input_dim=input_dim),
+            Dropout(0.3),
+            Dense(32, activation='relu'),
+            Dropout(0.2),
+            Dense(16, activation='relu'),
+            Dense(1, activation='sigmoid')
+        ])
+        
+        model.compile(
+            optimizer=tf.keras.optimizers.Adam(learning_rate=0.001),
+            loss='binary_crossentropy',
+            metrics=['accuracy', tf.keras.metrics.AUC(name='auc')]
+        )
+        
+        # Train model with early stopping
+        early_stop = EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True)
+        
+        print(f"    Training TensorFlow model...")
+        model.fit(
+            X_train_processed, y_train,
+            epochs=100,
+            batch_size=32,
+            validation_split=0.1,
+            callbacks=[early_stop],
+            verbose=0
+        )
+        
+        # Make predictions
+        y_pred_train = (model.predict(X_train_processed, verbose=0) > 0.5).astype(int).flatten()
+        y_pred_test = (model.predict(X_test_processed, verbose=0) > 0.5).astype(int).flatten()
+        
+        # Get probability predictions
+        y_prob_train = model.predict(X_train_processed, verbose=0).flatten()
+        y_prob_test = model.predict(X_test_processed, verbose=0).flatten()
+        
+        # Calculate metrics
+        results = {
+            'model_name': model_name,
+            'model_type': model_type,
+            'model': model,
+            'scaler': scaler,
+            'train_accuracy': accuracy_score(y_train, y_pred_train),
+            'train_precision': precision_score(y_train, y_pred_train, zero_division=0),
+            'train_recall': recall_score(y_train, y_pred_train, zero_division=0),
+            'train_f1': f1_score(y_train, y_pred_train, zero_division=0),
+            'train_roc_auc': roc_auc_score(y_train, y_prob_train),
+            'test_accuracy': accuracy_score(y_test, y_pred_test),
+            'test_precision': precision_score(y_test, y_pred_test, zero_division=0),
+            'test_recall': recall_score(y_test, y_pred_test, zero_division=0),
+            'test_f1': f1_score(y_test, y_pred_test, zero_division=0),
+            'test_roc_auc': roc_auc_score(y_test, y_prob_test),
+            'confusion_matrix': confusion_matrix(y_test, y_pred_test)
+        }
+        
+        # Calculate overfitting measure
+        results['overfit_accuracy'] = results['train_accuracy'] - results['test_accuracy']
+        results['overfit_f1'] = results['train_f1'] - results['test_f1']
+        
+        # Grade the model
+        results['grade'] = grade_model(results['test_accuracy'], results['test_f1'])
+        
+        print(f"    Test Accuracy: {results['test_accuracy']:.4f} | F1: {results['test_f1']:.4f} | Grade: {results['grade']}")
+        
+        return results
     else:
         return None
     
@@ -273,6 +357,10 @@ def analyze_and_save_dataset(example_class, dataset_name, base_dir="binary_class
             ('nn_large', 'Neural Network (Large)')
         ])
     
+    # Add TensorFlow if available
+    if TENSORFLOW_AVAILABLE:
+        models_to_train.append(('tensorflow_nn', 'TensorFlow Neural Network'))
+    
     # Train all models
     print(f"\n🤖 Training {len(models_to_train)} models...")
     results = {}
@@ -294,11 +382,17 @@ def analyze_and_save_dataset(example_class, dataset_name, base_dir="binary_class
     # Save all models
     print(f"\n💾 Saving models...")
     for model_name, result in results.items():
-        model_filename = f"{model_name.replace(' ', '_')}_model.pkl"
-        model_path = os.path.join(dataset_dir, model_filename)
-        
-        with open(model_path, 'wb') as f:
-            pickle.dump(result['model'], f)
+        # Check if TensorFlow model
+        if result['model_type'] == 'tensorflow_nn':
+            model_filename = f"{model_name.replace(' ', '_')}_model.keras"
+            model_path = os.path.join(dataset_dir, model_filename)
+            result['model'].save(model_path, save_format='keras')
+        else:
+            model_filename = f"{model_name.replace(' ', '_')}_model.pkl"
+            model_path = os.path.join(dataset_dir, model_filename)
+            
+            with open(model_path, 'wb') as f:
+                pickle.dump(result['model'], f)
         
         # Save scaler if exists
         if result['scaler'] is not None:
@@ -434,7 +528,11 @@ def analyze_and_save_dataset(example_class, dataset_name, base_dir="binary_class
         
         f.write(f"\nModel Files:\n")
         for model_name in results.keys():
-            model_filename = f"{model_name.replace(' ', '_')}_model.pkl"
+            # Check model type for correct extension
+            if results[model_name]['model_type'] == 'tensorflow_nn':
+                model_filename = f"{model_name.replace(' ', '_')}_model.keras"
+            else:
+                model_filename = f"{model_name.replace(' ', '_')}_model.pkl"
             f.write(f"  - {model_filename}: Trained {model_name} model\n")
             if results[model_name]['scaler'] is not None:
                 scaler_filename = f"{model_name.replace(' ', '_')}_scaler.pkl"

@@ -7,6 +7,7 @@ from explainit.utils.plot_styles import (apply_style, style_numerical_plot, styl
 # logger.warning("This is a warning message")
 # logger.error("This is an error message")
 
+import os
 import numpy as np
 import random
 import matplotlib.pyplot as plt
@@ -506,14 +507,95 @@ class RandomSearchExplainer:
         
         return breakdown
 
-    def generate_random_samples(self, n_samples=1000, epsilon=0.05, random_seed=None, use_monte_carlo=True, max_tries=100, return_top_n=None):
+    def generate_random_samples(self, expected_counterfactuals=5, max_iterations=10000, epsilon=0.05, random_seed=None, use_monte_carlo=True, max_tries=100, return_top_n=None):
         """
         Generate random samples based on filtered priorities.
         Only keep samples whose prediction is within epsilon of the target.
         
         Args:
-            n_samples: number of samples to generate
+            expected_counterfactuals: desired number of counterfactuals to find
+            max_iterations: maximum number of iterations to try
             epsilon: acceptable deviation from target prediction
+            random_seed: seed for reproducibility
+            use_monte_carlo: if True, use Monte Carlo sampling for numerical features; otherwise use uniform sampling
+            max_tries: maximum number of tries for rejection sampling in numerical features (only if use_monte_carlo is True)
+            return_top_n: if specified, return only the top N most preferable samples (default: return all)
+        
+        Returns:
+            list of samples and their corresponding predictions
+        """
+        # Only set seed if random_seed is provided
+        if random_seed is not None:
+            np.random.seed(random_seed)
+            random.seed(random_seed)
+        
+        n_features = len(self.sample)
+        best_samples = []
+        best_predictions = []
+        best_scores = []
+        best_iteration_found = []
+        n_candidates_per_cf = getattr(self, 'n_candidates_per_cf', 1)
+        for cf_idx in range(expected_counterfactuals):
+            candidates = []
+            candidate_preds = []
+            candidate_scores = []
+            candidate_iters = []
+            found = 0
+            for i in range(max_iterations):
+                sample = np.zeros(n_features)
+                for idx, constraint in self.filtered_priorities['numerical'].items():
+                    if isinstance(constraint, dict) and 'function' in constraint:
+                        sample[idx] = self.sample_numeric_value(constraint, max_tries) if use_monte_carlo else np.random.uniform(constraint['min'], constraint['max'])
+                    else:
+                        sample[idx] = constraint
+                for group_indices, possible_values in self.filtered_priorities['categorical'].items():
+                    combos = list(possible_values.keys())
+                    weights = np.array(list(possible_values.values()), dtype=float)
+                    allowed_mask = weights > 0
+                    if not np.any(allowed_mask):
+                        raise ValueError(f"All combinations for categorical group {group_indices} are forbidden (weight = 0). At least one combination must have weight > 0.")
+                    if use_monte_carlo:
+                        allowed_combos = [combos[j] for j in range(len(combos)) if allowed_mask[j]]
+                        allowed_weights = weights[allowed_mask]
+                        allowed_weights = allowed_weights / allowed_weights.sum()
+                        sel = allowed_combos[np.random.choice(len(allowed_combos), p=allowed_weights)]
+                    else:
+                        allowed_combos = [combos[j] for j in range(len(combos)) if allowed_mask[j]]
+                        sel = random.choice(allowed_combos)
+                    for j, idx in enumerate(group_indices):
+                        sample[idx] = sel[j]
+                try:
+                    pred = self.model_pred(sample.reshape(1, -1))[0]
+                    if abs(pred - self.target) <= epsilon:
+                        candidates.append(sample.copy())
+                        candidate_preds.append(pred)
+                        candidate_scores.append(self.calculate_preference_score(sample))
+                        candidate_iters.append(i + 1)
+                        found += 1
+                        if found >= n_candidates_per_cf:
+                            break
+                except Exception as e:
+                    logger.warning(f"Could not get prediction for sample: {e}")
+            if candidates:
+                best_idx = int(np.argmax(candidate_scores))
+                best_samples.append(candidates[best_idx])
+                best_predictions.append(candidate_preds[best_idx])
+                best_scores.append(candidate_scores[best_idx])
+                best_iteration_found.append(candidate_iters[best_idx])
+            else:
+                logger.info(f"No valid candidates found for CF {cf_idx+1}")
+        return best_samples, best_predictions, best_scores, best_iteration_found
+
+    def generate_for_binary(self, expected_counterfactuals=100, max_iterations=10000, target_class=1, threshold=0.5, random_seed=None, use_monte_carlo=True, max_tries=100, return_top_n=None):
+        """
+        Generate random samples for binary classification.
+        Only keep samples whose prediction crosses the threshold in the desired direction.
+        
+        Args:
+            expected_counterfactuals: desired number of counterfactuals to find
+            max_iterations: maximum number of iterations to try
+            target_class: desired class (0 or 1)
+            threshold: decision threshold for binary classification
             random_seed: seed for reproducibility
             use_monte_carlo: if True, use Monte Carlo sampling for numerical features; otherwise use uniform sampling
             max_tries: maximum number of tries for rejection sampling in numerical features (only if use_monte_carlo is True)
@@ -530,87 +612,65 @@ class RandomSearchExplainer:
         samples = []
         predictions = []
         preference_scores = []
+        iteration_found = []  # Track iteration number when each CF was found
         
-        # Get number of features from the sample
         n_features = len(self.sample)
-        
-        # Progress tracking
-        progress_step = max(1, n_samples // 10)  # Report every 10%
-        
-        for i in range(n_samples):
-            # Log progress every 10%
-            if i > 0 and i % progress_step == 0:
-                progress_pct = int(100 * i / n_samples)
-                logger.info(f"    Progress: {progress_pct}% ({i}/{n_samples} samples, {len(samples)} counterfactuals found)")
-            sample = np.zeros(n_features)
-            # Numerical features
-            for idx, constraint in self.filtered_priorities['numerical'].items():
-                if isinstance(constraint, dict) and 'function' in constraint:
-                    sample[idx] = self.sample_numeric_value(constraint, max_tries) if use_monte_carlo else np.random.uniform(constraint['min'], constraint['max'])
-                else:
-                    sample[idx] = constraint
-
-            # Categorical features: sample combos with probability proportional to their weights
-            for group_indices, possible_values in self.filtered_priorities['categorical'].items():
-                combos = list(possible_values.keys())
-                weights = np.array(list(possible_values.values()), dtype=float)
-                
-                # Filter out forbidden combinations (weight = 0)
-                allowed_mask = weights > 0
-                
-                if not np.any(allowed_mask):
-                    raise ValueError(f"All combinations for categorical group {group_indices} are forbidden (weight = 0). At least one combination must have weight > 0.")
-                
-                if use_monte_carlo:
-                    # Monte Carlo sampling: sample according to probabilities (weights)
-                    # Keep only allowed combinations
-                    allowed_combos = [combos[i] for i in range(len(combos)) if allowed_mask[i]]
-                    allowed_weights = weights[allowed_mask]
-
-                    # Normalize weights to probabilities
-                    allowed_weights = allowed_weights / allowed_weights.sum()
-                    
-                    # Sample from allowed combinations according to probabilities
-                    sel = allowed_combos[np.random.choice(len(allowed_combos), p=allowed_weights)]
-                else:
-                    # Uniform sampling: sample uniformly from allowed combinations
-                    allowed_combos = [combos[i] for i in range(len(combos)) if allowed_mask[i]]
-                    sel = random.choice(allowed_combos)
-                
-                for i, idx in enumerate(group_indices):
-                    sample[idx] = sel[i]
-
-            # Get prediction
-            try:
-                pred = self.model_pred(sample.reshape(1, -1))[0]
-                if abs(pred - self.target) <= epsilon:
-                    samples.append(sample.copy())
-                    predictions.append(pred)
-                    # Calculate preference score
-                    pref_score = self.calculate_preference_score(sample)
-                    preference_scores.append(pref_score)
-            except Exception as e:
-                logger.warning(f"Could not get prediction for sample: {e}")
-        
-        # Final progress update
-        logger.info(f"    Progress: 100% ({n_samples}/{n_samples} samples, {len(samples)} counterfactuals found)")
-        
-        # Sort by preference score (descending) and optionally return only top N
-        if len(samples) > 0 and return_top_n is not None:
-            # Create indices sorted by preference score
-            sorted_indices = np.argsort(preference_scores)[::-1]  # Descending order
-            
-            # Select top N
-            top_n = min(return_top_n, len(samples))
-            top_indices = sorted_indices[:top_n]
-            
-            # Filter samples, predictions, and scores
-            samples = [samples[i] for i in top_indices]
-            predictions = [predictions[i] for i in top_indices]
-            preference_scores = [preference_scores[i] for i in top_indices]
-            
-            logger.info(f"Selected top {top_n} most preferable counterfactuals")
-            logger.info(f"Preference score range: [{min(preference_scores):.6f}, {max(preference_scores):.6f}]")
-        
-        return samples, predictions, preference_scores
-
+        best_samples = []
+        best_predictions = []
+        best_scores = []
+        best_iteration_found = []
+        n_candidates_per_cf = getattr(self, 'n_candidates_per_cf', 1)
+        for cf_idx in range(expected_counterfactuals):
+            candidates = []
+            candidate_preds = []
+            candidate_scores = []
+            candidate_iters = []
+            found = 0
+            for i in range(max_iterations):
+                sample = np.zeros(n_features)
+                for idx, constraint in self.filtered_priorities['numerical'].items():
+                    if isinstance(constraint, dict) and 'function' in constraint:
+                        sample[idx] = self.sample_numeric_value(constraint, max_tries) if use_monte_carlo else np.random.uniform(constraint['min'], constraint['max'])
+                    else:
+                        sample[idx] = constraint
+                for group_indices, possible_values in self.filtered_priorities['categorical'].items():
+                    combos = list(possible_values.keys())
+                    weights = np.array(list(possible_values.values()), dtype=float)
+                    allowed_mask = weights > 0
+                    if not np.any(allowed_mask):
+                        raise ValueError(f"All combinations for categorical group {group_indices} are forbidden (weight = 0). At least one combination must have weight > 0.")
+                    if use_monte_carlo:
+                        allowed_combos = [combos[j] for j in range(len(combos)) if allowed_mask[j]]
+                        allowed_weights = weights[allowed_mask]
+                        allowed_weights = allowed_weights / allowed_weights.sum()
+                        sel = allowed_combos[np.random.choice(len(allowed_combos), p=allowed_weights)]
+                    else:
+                        allowed_combos = [combos[j] for j in range(len(combos)) if allowed_mask[j]]
+                        sel = random.choice(allowed_combos)
+                    for j, idx in enumerate(group_indices):
+                        sample[idx] = sel[j]
+                try:
+                    pred = self.model_pred(sample.reshape(1, -1))[0]
+                    if target_class == 1:
+                        is_valid = pred > threshold
+                    else:
+                        is_valid = pred < threshold
+                    if is_valid:
+                        candidates.append(sample.copy())
+                        candidate_preds.append(pred)
+                        candidate_scores.append(self.calculate_preference_score(sample))
+                        candidate_iters.append(i + 1)
+                        found += 1
+                        if found >= n_candidates_per_cf:
+                            break
+                except Exception as e:
+                    logger.warning(f"Could not get prediction for sample: {e}")
+            if candidates:
+                best_idx = int(np.argmax(candidate_scores))
+                best_samples.append(candidates[best_idx])
+                best_predictions.append(candidate_preds[best_idx])
+                best_scores.append(candidate_scores[best_idx])
+                best_iteration_found.append(candidate_iters[best_idx])
+            else:
+                logger.info(f"No valid candidates found for CF {cf_idx+1}")
+        return best_samples, best_predictions, best_scores, best_iteration_found

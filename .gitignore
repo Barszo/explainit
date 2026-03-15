@@ -11,15 +11,25 @@ trash/
 experiment_parameters.csv
 experiment_results.csv
 .DS_Store
+priorities_random_dice/
+priorities_random_dice_2/
+priorities_with_random_search/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
 *$py.class
 *.csv
 *.png
+*.json
+*.txt
+*.csv
+*.keras
+*.pkl
+
 # C extensions
 *.so
-
+DiCE/
 # Distribution / packaging
 .Python
 build/

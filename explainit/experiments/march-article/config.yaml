@@ -1,0 +1,111 @@
+# ============================================================================
+# Test Configuration for Counterfactual Methods Comparison
+# ============================================================================
+
+# Dataset settings
+datasets:
+  # Options: 'all' or list like ['communities_crime', 'german_credit']
+  selection: 'all'
+  # Which class to generate counterfactuals from
+  source_class: 0
+  # Which class to generate counterfactuals to
+  target_class: 1
+
+# Model training settings
+model:
+  epochs: 50
+  batch_size: 32
+  learning_rate: 0.001
+  # Set true to retrain even if saved model exists
+  force_retrain: false
+
+# Sample selection
+samples:
+  # Number of test samples per dataset
+  n_samples: 5
+  # Decision boundary for binary classification
+  threshold: 0.5
+  # Fallback when unique source-class test samples are insufficient.
+  synthetic_fallback:
+    # If true, generate only the missing samples via bounded perturbations.
+    enabled: true
+    # Gaussian noise scale as fraction of per-feature std in source-class test samples.
+    # Smaller values stay closer to real data.
+    noise_std_fraction: 0.05
+    # Upper cap for perturbation size as fraction of full test-set feature range.
+    max_noise_as_range_fraction: 0.10
+    # Max retries to generate a new unique bounded synthetic sample.
+    max_attempts_per_sample: 100
+
+# Standard counterfactual methods to test
+standard_methods:
+  # Options: 'all', a single method name, or list like ['wachter', 'dice', 'dice_official']
+  # Available: wachter, sparse_wachter, dice, prototype, dice_official
+  # Example below runs only official DiCE (custom gradient DiCE is disabled)
+  selection: ['dice_official'] # 'wachter', 'sparse_wachter', 'prototype', 
+  
+  # General settings for standard methods
+  max_iterations: 5000
+  
+  # Number of CFs per sample (for methods that support multiple CFs)
+  num_cfs: 2
+  
+  # Prototype-guided method settings
+  prototype:
+    n_prototypes: 5
+  
+  # DiCE custom implementation settings
+  dice:
+    learning_rate: 0.05
+    diversity_weight: 0.1
+    lambda: 0.1
+  
+  # Official DiCE library settings
+  dice_official:
+    learning_rate: 0.05
+    min_iter: 50
+    max_iter: 5000
+    proximity_weight: 0.5 # default=0.5 0.05
+    diversity_weight: 1.0 # defult=1.0 0.5
+    categorical_penalty: 0.0
+    loss_diff_thres: 0.001
+    loss_converge_maxiter: 10
+    yloss_type: 'log_loss'  # Options: hinge_loss, log_loss, l2_loss
+
+# Preference-based method settings
+preference_method:
+  # Options: 'binary', 'continuous', or 'both'
+  mode: 'binary'
+  # Enable/disable each mode
+  binary_enabled: true
+  continuous_enabled: false
+  # Weight assigned to boundary values (0.01=strict, 0.5=balanced, 0.9=permissive)
+  exemplar_weight: 0.50
+  # Steepness of the exponential preference function (default: 5)
+  preference_steepness: 5
+  # Target probability for continuous mode
+  target_probability: 0.75
+  # Acceptable deviation from target probability (continuous mode only)
+  epsilon: 0.25
+  # Number of counterfactuals to find
+  expected_counterfactuals: 2
+  # Number of candidates to generate for each requested CF (new logic)
+  n_candidates_per_cf: 20
+  # Maximum iterations for CF generation
+  max_iterations: 5000
+  # Use Monte Carlo sampling
+  use_monte_carlo: true
+  # Return top N counterfactuals by preference score
+  return_top_n: 5
+  # Max tries for sampling
+  max_tries: 5000
+
+# Output settings
+output:
+  # Report format: 'json', 'text', or 'both'
+  report_format: 'both'
+  # Print detailed progress
+  verbose: true
+
+# Reproducibility
+random_seed: 42
