@@ -637,17 +637,17 @@ class OfficialDiceCounterfactual:
     - Diversity enforcement across multiple counterfactuals
     """
     
-    def __init__(self, model, X_train, y_train, feature_names, 
+    def __init__(self, model, X_train, y_train, feature_names,
                  num_cfs=4, max_iterations=1000, min_iterations=100,
-                 target_class=1, learning_rate=0.05, 
+                 target_class=1, learning_rate=0.05,
                  proximity_weight=0.5, diversity_weight=1.0,
                  categorical_penalty=0.1, loss_diff_thres=1e-5,
                  loss_converge_maxiter=1, yloss_type='hinge_loss',
-                 feature_bounds=None):
+                 feature_bounds=None, categorical_feature_names=None):
         """
         Args:
             model: Trained model (TensorFlow/Keras)
-            X_train: Training data (numpy array or DataFrame) 
+            X_train: Training data (numpy array or DataFrame)
             y_train: Training labels (numpy array)
             feature_names: List of feature names
             num_cfs: Number of counterfactuals to generate
@@ -662,6 +662,10 @@ class OfficialDiceCounterfactual:
             loss_converge_maxiter: Iterations to hold convergence before stopping
             yloss_type: Loss function - 'hinge_loss', 'log_loss', or 'l2_loss'
             feature_bounds: Optional list of (min, max) tuples for each feature
+            categorical_feature_names: Ignored. Kept for API compatibility only.
+                DiCE gradient method only works with continuous features.
+                Features with zero MAD in training data are automatically excluded
+                from features_to_vary to prevent DiCE from wasting iterations on them.
         """
         self.model = model
         self.num_cfs = num_cfs
@@ -699,23 +703,23 @@ class OfficialDiceCounterfactual:
         else:
             X_train_df['outcome'] = y_train
         
-        # Create DiCE Data object
+        # Create DiCE Data object — all features are continuous (gradient method requirement).
         self.dice_data = dice_ml.Data(
             dataframe=X_train_df,
             continuous_features=list(feature_names),
             outcome_name='outcome'
         )
-        
+
         # Create DiCE Model object
         self.dice_model = dice_ml.Model(model=model, backend='TF2')
-        
+
         # Create DiCE explainer with gradient method
         self.dice_explainer = dice_ml.Dice(
-            self.dice_data, 
-            self.dice_model, 
+            self.dice_data,
+            self.dice_model,
             method='gradient'
         )
-    
+
     def generate(self, x_original, verbose=False):
         """
         Generate counterfactual for a single instance.
@@ -772,8 +776,10 @@ class OfficialDiceCounterfactual:
             # Generate counterfactuals
             cf_result = self.dice_explainer.generate_counterfactuals(**cf_params)
 
-            # Record actual iterations used from DiCE explainer
-            actual_iterations = int(getattr(self.dice_explainer, 'max_iterations_run', self.max_iterations))
+            # Record actual iterations used from DiCE explainer.
+            # max_iterations_run may exist but be None when no CFs were found.
+            _raw_iters = getattr(self.dice_explainer, 'max_iterations_run', None)
+            actual_iterations = int(_raw_iters if _raw_iters is not None else self.max_iterations)
             self.last_run_iterations = actual_iterations
             self.last_run_iterations_list = [actual_iterations]
             

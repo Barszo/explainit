@@ -1,3 +1,121 @@
+# --- Lending Club Preprocessing ---
+def preprocess_lending_club_data(csv_path):
+    """
+    Preprocess Lending Club dataset into 8 continuous features and a binary target.
+
+    Features (columns 1-8):
+        annual_inc, open_acc, emp_length_years, credit_history_years,
+        grade_score, home_score, purpose_score, state_score
+    Target (column 9):
+        0 = Fully Paid, 1 = Charged Off / Default
+
+    Categorical features (grade, home_ownership, purpose, addr_state) are
+    converted to continuous risk scores via target encoding.
+
+    Args:
+        csv_path: Path to LoanStats3a.csv (first row is a notes row; skiprows=1 is applied)
+
+    Returns:
+        X: DataFrame with 8 continuous features
+        y: Series with binary target
+    """
+    df = pd.read_csv(csv_path, low_memory=False)
+
+    cols = [
+        "emp_length",
+        "annual_inc",
+        "open_acc",
+        "earliest_cr_line",
+        "grade",
+        "home_ownership",
+        "purpose",
+        "addr_state",
+        "loan_status",
+    ]
+    df = df[cols]
+
+    # Keep only loans with a final outcome
+    valid_status = ["Fully Paid", "Charged Off", "Default"]
+    df = df[df["loan_status"].isin(valid_status)].copy()
+
+    # Binary target: 0 = repaid, 1 = defaulted
+    df["target"] = df["loan_status"].apply(lambda x: 0 if x == "Fully Paid" else 1)
+
+    # Convert emp_length to numeric years
+    def emp_to_years(emp):
+        if pd.isna(emp):
+            return np.nan
+        emp = str(emp)
+        if "<" in emp:
+            return 0
+        if "+" in emp:
+            return 10
+        return int(emp.split()[0])
+
+    df["emp_length_years"] = df["emp_length"].apply(emp_to_years)
+
+    # Convert earliest_cr_line to credit history in years (reference: end of dataset 2011)
+    df["earliest_cr_line"] = pd.to_datetime(df["earliest_cr_line"], format="%b-%Y")
+    df["credit_history_years"] = 2011 - df["earliest_cr_line"].dt.year
+
+    # Remove unrealistic credit histories
+    df = df[df["credit_history_years"] <= 50]
+
+    # Drop rows with any remaining missing values
+    df = df.dropna()
+
+    # Target-encode categorical features into continuous risk scores
+    def target_encode(data, col, target):
+        mapping = data.groupby(col)[target].mean()
+        return data[col].map(mapping)
+
+    df["grade_score"] = target_encode(df, "grade", "target")
+    df["home_score"] = target_encode(df, "home_ownership", "target")
+    df["purpose_score"] = target_encode(df, "purpose", "target")
+    df["state_score"] = target_encode(df, "addr_state", "target")
+
+    features = [
+        "annual_inc",
+        "open_acc",
+        "emp_length_years",
+        "credit_history_years",
+        "grade_score",
+        "home_score",
+        "purpose_score",
+        "state_score",
+    ]
+
+    X = df[features]
+    y = df["target"]
+
+    return X, y
+
+
+# --- Lending Club Model Training ---
+def train_lending_club_model(X_train, y_train, X_val, y_val, steps=50, batch_size=32, verbose=1):
+    """
+    Train baseline model for Lending Club dataset.
+    Args:
+        X_train, y_train: Training data
+        X_val, y_val: Validation data
+        steps: Number of training steps (default: 50)
+        batch_size: Batch size
+        verbose: Verbosity level
+    Returns:
+        Trained model, training history
+    """
+    input_dim = X_train.shape[1]
+    model = create_baseline_model(input_dim)
+    num_samples = len(X_train)
+    epochs = max(1, int(steps * batch_size / num_samples))
+    history = model.fit(
+        X_train, y_train,
+        validation_data=(X_val, y_val),
+        batch_size=batch_size,
+        epochs=epochs,
+        verbose=verbose
+    )
+    return model, history
 """
 Model Builder for Adversarial Counterfactual Experiments
 
@@ -9,10 +127,11 @@ Implements the neural network architecture as specified in the paper:
 - Binary cross-entropy loss
 """
 
+import pandas as pd
+import numpy as np
 import tensorflow as tf
 from tensorflow import keras
 from tensorflow.keras import layers, models
-import numpy as np
 
 
 def create_adversarial_model(input_dim, hidden_layers=4, hidden_units=200, 

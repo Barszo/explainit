@@ -4,8 +4,8 @@
 
 # Dataset settings
 datasets:
-  # Options: 'all' or list like ['communities_crime', 'german_credit']
-  selection: 'all'
+  # Options: 'all' or list like ['credit_card_default', 'communities_crime', 'german_credit']
+  selection: ['credit_card_default'] #'all' #['german_credit'] #'credit_card_default'] #'all'
   # Which class to generate counterfactuals from
   source_class: 0
   # Which class to generate counterfactuals to
@@ -15,6 +15,7 @@ datasets:
 model:
   epochs: 50
   batch_size: 32
+  lending_club_batch_size: 1024
   learning_rate: 0.001
   # Set true to retrain even if saved model exists
   force_retrain: false
@@ -45,7 +46,7 @@ standard_methods:
   selection: ['dice_official'] # 'wachter', 'sparse_wachter', 'prototype', 
   
   # General settings for standard methods
-  max_iterations: 5000
+  max_iterations: 5000 #5000
   
   # Number of CFs per sample (for methods that support multiple CFs)
   num_cfs: 2
@@ -92,7 +93,7 @@ preference_method:
   # Number of candidates to generate for each requested CF (new logic)
   n_candidates_per_cf: 20
   # Maximum iterations for CF generation
-  max_iterations: 5000
+  max_iterations: 5000 #5000
   # Use Monte Carlo sampling
   use_monte_carlo: true
   # Return top N counterfactuals by preference score

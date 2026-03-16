@@ -38,7 +38,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 # Import local modules
-from data_downloader import load_communities_and_crime, load_german_credit
+from data_downloader import load_communities_and_crime, load_german_credit, load_lending_club_selected_features, load_credit_card_default
 from model_builder import create_baseline_model
 from counterfactual_methods import (
     WachterCounterfactual,
@@ -91,8 +91,10 @@ for dir_path in [DATA_DIR, MODELS_DIR, REPORTS_DIR, RESULTS_DIR]:
 
 # Dataset name mapping
 DATASET_NAMES = {
+    'lending_club': 'Lending Club',
     'communities_crime': 'Communities and Crime',
-    'german_credit': 'German Credit'
+    'german_credit': 'German Credit',
+    'credit_card_default': 'Credit Card Default',
 }
 
 # CF Method name mapping
@@ -230,28 +232,25 @@ def train_simple_model(X_train, y_train, X_test, y_test, dataset_name, config):
     # Try to load existing model
     if model_path.exists() and not config['model']['force_retrain']:
         try:
+            # Ensure tf is always available
+            import tensorflow as tf
             model = tf.keras.models.load_model(model_path)
             with open(history_path, 'rb') as f:
                 history = pickle.load(f)
-            
             train_loss, train_acc = model.evaluate(X_train, y_train, verbose=0)
             test_loss, test_acc = model.evaluate(X_test, y_test, verbose=0)
-            
             logger.info(f"\n{'='*60}")
             logger.info(f"Model Loaded from Disk: {dataset_name}")
             logger.info(f"{'='*60}")
             logger.info(f"Training Accuracy:   {train_acc:.4f}")
             logger.info(f"Test Accuracy:       {test_acc:.4f}")
             logger.info(f"✓ Model loaded from: {model_path}")
-            
             model_info = {
                 'loaded_from_disk': True,
                 'model_path': str(model_path),
                 'epochs_trained': len(history['loss']) if history else 'N/A'
             }
-            
             return model, history, model_info
-            
         except Exception as e:
             logger.warning(f"Failed to load model: {e}. Training new model...")
     
@@ -263,13 +262,46 @@ def train_simple_model(X_train, y_train, X_test, y_test, dataset_name, config):
     input_dim = X_train.shape[1]
     model = create_baseline_model(input_dim)
     
-    # Train model
+    # Add Keras callback for progress logging
+    import tensorflow as tf
+    class ProgressLogger(tf.keras.callbacks.Callback):
+        def on_epoch_begin(self, epoch, logs=None):
+            logger.info(f"Epoch {epoch+1}/{config['model']['epochs']} started.")
+        def on_epoch_end(self, epoch, logs=None):
+            logger.info(f"Epoch {epoch+1} ended. Loss: {logs.get('loss'):.4f}, Val Loss: {logs.get('val_loss'):.4f}")
+        def on_batch_end(self, batch, logs=None):
+            if batch % 100 == 0:
+                logger.info(f"  Batch {batch} ended. Loss: {logs.get('loss'):.4f}")
+
+    # Speed up training for Lending Club
+    epochs = config['model']['epochs']
+    # Debug: print dataset_name and batch size selection
+    logger.info(f"Dataset name received: {dataset_name}")
+    if dataset_name.lower().replace(' ', '_') == 'lending_club':
+        batch_size = config['model'].get('lending_club_batch_size', config['model']['batch_size'])
+        logger.info(f"Lending Club detected, using batch_size={batch_size}")
+    else:
+        batch_size = config['model']['batch_size']
+        logger.info(f"Non-Lending Club, using batch_size={batch_size}")
+    logger.info(f"Training parameters: epochs={epochs}, batch_size={batch_size}")
+    # Add EarlyStopping callback for Lending Club
+    import tensorflow as tf
+    callbacks = [ProgressLogger()]
+    if dataset_name.lower() == 'lending_club':
+        early_stop = tf.keras.callbacks.EarlyStopping(
+            monitor='val_loss',
+            patience=2,
+            restore_best_weights=True,
+            min_delta=0.001
+        )
+        callbacks.append(early_stop)
     history = model.fit(
         X_train, y_train,
         validation_data=(X_test, y_test),
-        epochs=config['model']['epochs'],
-        batch_size=config['model']['batch_size'],
-        verbose=0
+        epochs=epochs,
+        batch_size=batch_size,
+        verbose=0,
+        callbacks=callbacks
     )
     
     # Evaluate
@@ -890,10 +922,11 @@ def compute_preference_score_from_preferences(cf_array, preferences):
 # STANDARD COUNTERFACTUAL METHODS
 # ============================================================================
 
-def get_standard_cf_methods(config, model, X_train, y_train, feature_names, feature_bounds=None):
+def get_standard_cf_methods(config, model, X_train, y_train, feature_names, feature_bounds=None,
+                            categorical_feature_names=None):
     """
     Initialize all standard counterfactual methods based on configuration.
-    
+
     Args:
         config: Configuration dictionary
         model: Trained model
@@ -901,7 +934,9 @@ def get_standard_cf_methods(config, model, X_train, y_train, feature_names, feat
         y_train: Training labels
         feature_names: List of feature names
         feature_bounds: Optional list of (min, max) tuples for each feature
-    
+        categorical_feature_names: Feature names to treat as categorical by DiCE (finite-valued
+            target-encoded columns). If None all features are treated as continuous.
+
     Returns:
         Dictionary mapping method display names to method instances
     """
@@ -991,7 +1026,8 @@ def get_standard_cf_methods(config, model, X_train, y_train, feature_names, feat
                 loss_diff_thres=config['standard_methods']['dice_official']['loss_diff_thres'],
                 loss_converge_maxiter=config['standard_methods']['dice_official']['loss_converge_maxiter'],
                 yloss_type=config['standard_methods']['dice_official']['yloss_type'],
-                feature_bounds=feature_bounds
+                feature_bounds=feature_bounds,
+                categorical_feature_names=categorical_feature_names
             )
 
     logger.info("Selected standard methods: %s", ", ".join(methods.keys()))
@@ -1079,10 +1115,11 @@ def save_standard_cf_results(method_name, dataset_name, sample_id, x_original,
 
 def test_standard_methods(model, X_train, y_train, test_indices, X_test_samples,
                          dataset_name, feature_names, config, feature_bounds=None,
-                         status_tracker=None, target_sample=None):
+                         status_tracker=None, target_sample=None,
+                         categorical_feature_names=None):
     """
     Test all standard counterfactual methods on selected samples.
-    
+
     Args:
         model: Trained model
         X_train: Training data
@@ -1093,7 +1130,8 @@ def test_standard_methods(model, X_train, y_train, test_indices, X_test_samples,
         feature_names: List of feature names
         config: Configuration dictionary
         feature_bounds: Optional list of (min, max) tuples for constraining features
-    
+        categorical_feature_names: Feature names that DiCE should treat as categorical.
+
     Returns:
         Dictionary with results summary
     """
@@ -1104,7 +1142,8 @@ def test_standard_methods(model, X_train, y_train, test_indices, X_test_samples,
     if feature_bounds is not None:
         logger.info(f"✓ Using {len(feature_bounds)} feature bounds to constrain CF generation")
     
-    methods = get_standard_cf_methods(config, model, X_train, y_train, feature_names, feature_bounds)
+    methods = get_standard_cf_methods(config, model, X_train, y_train, feature_names, feature_bounds,
+                                      categorical_feature_names=categorical_feature_names)
     
     if not methods:
         logger.warning("No standard methods to test")
@@ -1177,9 +1216,11 @@ def test_standard_methods(model, X_train, y_train, test_indices, X_test_samples,
                 if run_iter_list:
                     run_iterations = float(np.mean(run_iter_list))
                 else:
-                    run_iterations = float(
-                        getattr(cf_method, 'last_run_iterations', getattr(cf_method, 'max_iterations', 0))
-                    )
+                    # last_run_iterations may be None if generate() threw before setting it
+                    _iters = getattr(cf_method, 'last_run_iterations', None)
+                    if _iters is None:
+                        _iters = getattr(cf_method, 'max_iterations', 0)
+                    run_iterations = float(_iters)
                 
                 # Handle multiple CFs (e.g., from DiCE)
                 if isinstance(result, list):
@@ -1324,11 +1365,25 @@ def compute_and_save_method_metrics(dataset_name, all_method_cfs, X_train, targe
     # Compute metrics for each method
     metrics_results = []
     all_method_run_stats = all_method_run_stats or {}
+
+    # Mothilal et al. define k as the requested number of CFs to generate.
+    # We use method-specific requested counts from config.
+    requested_k_standard = int(config.get('standard_methods', {}).get('num_cfs', 1))
+    requested_k_preference = int(
+        config.get('preference_method', {}).get('expected_counterfactuals', requested_k_standard)
+    )
+    requested_k_standard = max(1, requested_k_standard)
+    requested_k_preference = max(1, requested_k_preference)
     
     for method_name, cf_data_list in all_method_cfs.items():
         if not cf_data_list:
             logger.warning(f"  No CFs generated for {method_name}, skipping metrics")
             continue
+
+        if method_name.startswith('Preference ('):
+            requested_k = requested_k_preference
+        else:
+            requested_k = requested_k_standard
         
         logger.info(f"\n  Computing metrics for: {method_name}")
         
@@ -1355,8 +1410,8 @@ def compute_and_save_method_metrics(dataset_name, all_method_cfs, X_train, targe
             all_preds = np.array(data['predictions'])
             all_classes = np.array(data['classes'])
             
-            # Number of CFs requested per sample (use actual number generated as k)
-            k = len(all_cfs)
+            # Number of CFs requested per sample (Mothilal et al. denominator)
+            k = requested_k
             
             metrics = compute_binary_cf_metrics(
                 X_original=x_original,
@@ -1695,7 +1750,8 @@ def generate_preference_cfs_for_sample(sample, sample_id, model, X_train, y_trai
                 random_seed=config['random_seed'],
                 use_monte_carlo=config['preference_method']['use_monte_carlo'],
                 max_tries=config['preference_method']['max_tries'],
-                return_top_n=config['preference_method']['return_top_n']
+                return_top_n=config['preference_method']['return_top_n'],
+                n_candidates_per_cf=n_candidates_per_cf
             )
         else:  # continuous
             cf_samples, cf_predictions, cf_scores, cf_iterations = explainer.generate_random_samples(
@@ -2050,20 +2106,24 @@ def process_dataset(dataset_key, config, status_tracker=None):
     
     if data is None:
         logger.info("Dataset not cached, loading from source...")
-        
         if dataset_key == 'communities_crime':
-            X_train, X_test, y_train, y_test, feature_names, scaler = \
-                load_communities_and_crime()
+            X_train, X_test, y_train, y_test, feature_names, scaler = load_communities_and_crime()
         elif dataset_key == 'german_credit':
-            X_train, X_test, y_train, y_test, feature_names, scaler = \
-                load_german_credit()
+            X_train, X_test, y_train, y_test, feature_names, scaler = load_german_credit()
+        elif dataset_key == 'lending_club':
+            X_train, X_test, y_train, y_test, feature_names, scaler = load_lending_club_selected_features(str(DATA_DIR / "LoanStats3a.csv"))
+            logger.info(f"Lending Club: Number of features loaded: {X_train.shape[1]}")
+            if X_train.shape[1] != 8:
+                logger.error(f"Lending Club dataset should have 8 features, but got {X_train.shape[1]}.")
+                raise ValueError("Lending Club dataset feature count mismatch.")
+        elif dataset_key == 'credit_card_default':
+            X_train, X_test, y_train, y_test, feature_names, scaler = load_credit_card_default()
+            logger.info(f"Credit Card Default: {X_train.shape[0]} train samples, {X_train.shape[1]} features")
         else:
             logger.error(f"Unknown dataset: {dataset_key}")
             return None
-        
         # Save for future use
         save_dataset(X_train, X_test, y_train, y_test, feature_names, scaler, dataset_key)
-        
         data = {
             'X_train': X_train,
             'X_test': X_test,
@@ -2111,6 +2171,8 @@ def process_dataset(dataset_key, config, status_tracker=None):
     save_feature_bounds_statistics(dataset_name, X_train, feature_names, feature_bounds)
     
     # Test standard methods (using feature bounds)
+    # For Lending Club the 4 target-encoded score columns may have zero MAD;
+    # OfficialDiceCounterfactual will automatically exclude them from features_to_vary.
     standard_results = test_standard_methods(
         model, X_train, y_train, test_indices, X_test_samples,
         dataset_name, feature_names, config, feature_bounds, status_tracker,
@@ -2176,7 +2238,7 @@ def main():
     # Determine datasets to process
     dataset_selection = config['datasets']['selection']
     if dataset_selection == 'all':
-        datasets = ['communities_crime', 'german_credit']
+        datasets = ['credit_card_default', 'communities_crime', 'german_credit']
     elif isinstance(dataset_selection, list):
         datasets = dataset_selection
     else:

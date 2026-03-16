@@ -577,7 +577,16 @@ class RandomSearchExplainer:
                 except Exception as e:
                     logger.warning(f"Could not get prediction for sample: {e}")
             if candidates:
-                best_idx = int(np.argmax(candidate_scores))
+                logger.info(f"CF {cf_idx+1}: Found {len(candidates)} valid candidates (requested: {n_candidates_per_cf})")
+                # Log top 5 candidates by preference score
+                top_n = min(5, len(candidate_scores))
+                sorted_indices = np.argsort(candidate_scores)[::-1]
+                logger.info(f"CF {cf_idx+1}: Top {top_n} candidates by preference score:")
+                for rank in range(top_n):
+                    idx = sorted_indices[rank]
+                    logger.info(f"  Rank {rank+1}: Score={candidate_scores[idx]:.4f}, Iter={candidate_iters[idx]}, Pred={candidate_preds[idx]:.4f}, Sample={candidates[idx]}")
+                best_idx = sorted_indices[0]
+                logger.info(f"CF {cf_idx+1}: Selected candidate Rank 1 with Score={candidate_scores[best_idx]:.4f}, Iter={candidate_iters[best_idx]}, Pred={candidate_preds[best_idx]:.4f}, Sample={candidates[best_idx]}")
                 best_samples.append(candidates[best_idx])
                 best_predictions.append(candidate_preds[best_idx])
                 best_scores.append(candidate_scores[best_idx])
@@ -586,7 +595,7 @@ class RandomSearchExplainer:
                 logger.info(f"No valid candidates found for CF {cf_idx+1}")
         return best_samples, best_predictions, best_scores, best_iteration_found
 
-    def generate_for_binary(self, expected_counterfactuals=100, max_iterations=10000, target_class=1, threshold=0.5, random_seed=None, use_monte_carlo=True, max_tries=100, return_top_n=None):
+    def generate_for_binary(self, expected_counterfactuals=100, max_iterations=10000, target_class=1, threshold=0.5, random_seed=None, use_monte_carlo=True, max_tries=100, return_top_n=None, n_candidates_per_cf=1):
         """
         Generate random samples for binary classification.
         Only keep samples whose prediction crosses the threshold in the desired direction.
@@ -619,7 +628,7 @@ class RandomSearchExplainer:
         best_predictions = []
         best_scores = []
         best_iteration_found = []
-        n_candidates_per_cf = getattr(self, 'n_candidates_per_cf', 1)
+        # Use n_candidates_per_cf argument directly
         for cf_idx in range(expected_counterfactuals):
             candidates = []
             candidate_preds = []
@@ -666,7 +675,16 @@ class RandomSearchExplainer:
                 except Exception as e:
                     logger.warning(f"Could not get prediction for sample: {e}")
             if candidates:
-                best_idx = int(np.argmax(candidate_scores))
+                logger.info(f"CF {cf_idx+1}: Found {len(candidates)} valid candidates (requested: {n_candidates_per_cf})")
+                # Log top 5 candidates by preference score
+                top_n = min(5, len(candidate_scores))
+                sorted_indices = np.argsort(candidate_scores)[::-1]
+                logger.info(f"CF {cf_idx+1}: Top {top_n} candidates by preference score:")
+                for rank in range(top_n):
+                    idx = sorted_indices[rank]
+                    logger.info(f"  Rank {rank+1}: Score={candidate_scores[idx]:.4f}, Iter={candidate_iters[idx]}, Pred={candidate_preds[idx]:.4f}, Sample={candidates[idx]}")
+                best_idx = sorted_indices[0]
+                logger.info(f"CF {cf_idx+1}: Selected candidate Rank 1 with Score={candidate_scores[best_idx]:.4f}, Iter={candidate_iters[best_idx]}, Pred={candidate_preds[best_idx]:.4f}, Sample={candidates[best_idx]}")
                 best_samples.append(candidates[best_idx])
                 best_predictions.append(candidate_preds[best_idx])
                 best_scores.append(candidate_scores[best_idx])
