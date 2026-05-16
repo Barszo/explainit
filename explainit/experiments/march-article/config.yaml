@@ -5,7 +5,7 @@
 # Dataset settings
 datasets:
   # Options: 'all' or list like ['credit_card_default', 'communities_crime', 'german_credit']
-  selection: ['credit_card_default'] #'all' #['german_credit'] #'credit_card_default'] #'all'
+  selection: ['credit_card_default', 'communities_crime', 'german_credit'] #'all' #['german_credit'] #'credit_card_default'] #'all'
   # Which class to generate counterfactuals from
   source_class: 0
   # Which class to generate counterfactuals to
@@ -23,7 +23,7 @@ model:
 # Sample selection
 samples:
   # Number of test samples per dataset
-  n_samples: 5
+  n_samples: 100
   # Decision boundary for binary classification
   threshold: 0.5
   # Fallback when unique source-class test samples are insufficient.
@@ -43,12 +43,12 @@ standard_methods:
   # Options: 'all', a single method name, or list like ['wachter', 'dice', 'dice_official']
   # Available: wachter, sparse_wachter, dice, prototype, dice_official
   # Example below runs only official DiCE (custom gradient DiCE is disabled)
-  selection: ['dice_official'] # 'wachter', 'sparse_wachter', 'prototype', 
+  selection: ['dice_official', 'wachter', 'sparse_wachter', 'prototype']
   
   # General settings for standard methods
   max_iterations: 5000 #5000
-  
-  # Number of CFs per sample (for methods that support multiple CFs)
+  #100: 1, 7, 10, [5], 3
+  # Number of CFs per sample for all methods, including preference-based ones.
   num_cfs: 2
   
   # Prototype-guided method settings
@@ -81,23 +81,21 @@ preference_method:
   binary_enabled: true
   continuous_enabled: false
   # Weight assigned to boundary values (0.01=strict, 0.5=balanced, 0.9=permissive)
-  exemplar_weight: 0.50
+  exemplar_weight: 0.85
   # Steepness of the exponential preference function (default: 5)
   preference_steepness: 5
   # Target probability for continuous mode
   target_probability: 0.75
   # Acceptable deviation from target probability (continuous mode only)
   epsilon: 0.25
-  # Number of counterfactuals to find
-  expected_counterfactuals: 2
   # Number of candidates to generate for each requested CF (new logic)
-  n_candidates_per_cf: 20
+  n_candidates_per_cf: 5
   # Maximum iterations for CF generation
   max_iterations: 5000 #5000
   # Use Monte Carlo sampling
   use_monte_carlo: true
-  # Return top N counterfactuals by preference score
-  return_top_n: 5
+  # Return top N counterfactuals by preference score; values above standard_methods.num_cfs are ignored.
+  return_top_n: 1
   # Max tries for sampling
   max_tries: 5000
 

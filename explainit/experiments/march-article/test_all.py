@@ -23,10 +23,12 @@ All methods save results with consistent metrics:
 
 import os
 import sys
+import csv
 import yaml
 import pickle
 import logging
 import time
+import concurrent.futures
 import numpy as np
 import pandas as pd
 import tensorflow as tf
@@ -83,7 +85,6 @@ DATA_DIR = SCRIPT_DIR / "data"
 MODELS_DIR = SCRIPT_DIR / "models"
 REPORTS_DIR = SCRIPT_DIR / "reports"
 RESULTS_DIR = SCRIPT_DIR / "results"
-STATUS_FILE = SCRIPT_DIR / "status.txt"
 
 # Create directories
 for dir_path in [DATA_DIR, MODELS_DIR, REPORTS_DIR, RESULTS_DIR]:
@@ -105,6 +106,20 @@ CF_METHOD_NAMES = {
     'prototype': 'Prototype-Guided',
     'dice_official': 'DiCE (official library)'
 }
+
+
+def setup_dataset_logging(dataset_key):
+    """
+    Add a FileHandler to the root logger so all log messages produced in the
+    current process for this dataset are also written to log_{dataset_key}.log.
+    Returns the path of the log file.
+    """
+    log_path = SCRIPT_DIR / f"log_{dataset_key}.log"
+    fh = logging.FileHandler(log_path, mode='a', encoding='utf-8')
+    fh.setLevel(logging.INFO)
+    fh.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+    logging.getLogger().addHandler(fh)
+    return log_path
 
 
 class RunStatusTracker:
@@ -708,19 +723,10 @@ def save_feature_bounds_statistics(dataset_name, X_train, feature_names, feature
         'max_feature_coverage_pct': float(np.max([stat['feature_coverage_pct'] for stat in feature_stats]))
     }
     
-    # Save or append overall statistics
-    overall_path = RESULTS_DIR / 'feature_bounds_summary.csv'
+    # Save overall statistics to a per-dataset file (safe for parallel runs)
+    overall_path = RESULTS_DIR / f'feature_bounds_summary_{clean_name}.csv'
     overall_df = pd.DataFrame([overall_stats])
-    
-    if overall_path.exists():
-        # Append to existing file
-        existing_df = pd.read_csv(overall_path)
-        # Remove old entry for this dataset if exists
-        existing_df = existing_df[existing_df['dataset'] != dataset_name]
-        combined_df = pd.concat([existing_df, overall_df], ignore_index=True)
-        combined_df.to_csv(overall_path, index=False)
-    else:
-        overall_df.to_csv(overall_path, index=False)
+    overall_df.to_csv(overall_path, index=False)
     
     logger.info(f"  ✓ Saved overall bounds summary to: {overall_path}")
     logger.info(f"    - {n_restricted_features}/{n_features} features restricted ({n_restricted_features/n_features*100:.1f}%)")
@@ -792,7 +798,19 @@ def compute_binary_cf_metrics(
         - categorical_diversity: Average categorical difference between CFs
         - cont_count_diversity: Average number of differing features
     """
+    # Consider only unique CF examples for metric computation.
+    # This follows the paper's evaluation protocol to avoid counting duplicates.
     n_generated = len(all_cfs)
+    if n_generated > 0:
+        duplicate_eps = 1e-6
+        quantized_cfs = np.round(all_cfs / duplicate_eps).astype(np.int64)
+        _, unique_indices = np.unique(quantized_cfs, axis=0, return_index=True)
+        unique_indices = np.sort(unique_indices)
+        all_cfs = all_cfs[unique_indices]
+        all_predictions = all_predictions[unique_indices]
+        all_predicted_classes = all_predicted_classes[unique_indices]
+        n_generated = len(all_cfs)
+
     d = len(X_original)  # Total number of features
     
     # Separate continuous and categorical features
@@ -812,40 +830,40 @@ def compute_binary_cf_metrics(
     pct_valid_cfs = float(n_valid) / k if k > 0 else 0.0
     
     # 2. CONTINUOUS PROXIMITY
-    # Negative average MAD-normalized distance (higher = closer)
+    # Negative requested-k-normalized MAD distance (higher = closer)
     continuous_proximity = 0.0
-    if n_generated > 0 and d_cont > 0:
+    if n_generated > 0 and d_cont > 0 and k > 0:
         distances_cont = []
         for cf in all_cfs:
             cont_diff = np.abs(cf[continuous_features] - X_original[continuous_features]) / mad_values[continuous_features]
             dist = np.mean(cont_diff)
             distances_cont.append(dist)
-        continuous_proximity = -np.mean(distances_cont)
+        continuous_proximity = -np.sum(distances_cont) / k
     
     # 3. CATEGORICAL PROXIMITY
     categorical_proximity = 1.0
-    if n_generated > 0 and d_cat > 0:
+    if n_generated > 0 and d_cat > 0 and k > 0:
         distances_cat = []
         for cf in all_cfs:
             n_changed = np.sum(np.abs(cf[categorical_features] - X_original[categorical_features]) > 1e-6)
             dist = n_changed / d_cat
             distances_cat.append(dist)
-        categorical_proximity = 1.0 - np.mean(distances_cat)
+        categorical_proximity = 1.0 - (np.sum(distances_cat) / k)
     
     # 4. CONTINUOUS-SPARSITY
-    # Fraction of features that remain unchanged
+    # Fraction of features that remain unchanged (requested-k normalized)
     continuous_sparsity = 1.0
-    if n_generated > 0 and d_cont > 0:
+    if n_generated > 0 and d_cont > 0 and k > 0:
         total_changes = 0
         for cf in all_cfs:
             n_changes = np.sum(np.abs(cf[continuous_features] - X_original[continuous_features]) > 1e-6)
             total_changes += n_changes
-        continuous_sparsity = 1.0 - (total_changes / (n_generated * d_cont))
+        continuous_sparsity = 1.0 - (total_changes / (k * d_cont))
     
     # 5. CONTINUOUS-DIVERSITY
-    # Average pairwise MAD-normalized distance
+    # Requested-k pair-normalized average MAD distance
     continuous_diversity = 0.0
-    if n_generated > 1 and d_cont > 0:
+    if n_generated > 1 and d_cont > 0 and k > 1:
         pairwise_distances_cont = []
         for i in range(n_generated):
             for j in range(i + 1, n_generated):
@@ -853,11 +871,12 @@ def compute_binary_cf_metrics(
                 dist_cont = np.mean(cont_diff)
                 pairwise_distances_cont.append(dist_cont)
         if pairwise_distances_cont:
-            continuous_diversity = np.mean(pairwise_distances_cont)
+            n_requested_pairs = k * (k - 1) / 2
+            continuous_diversity = np.sum(pairwise_distances_cont) / n_requested_pairs
     
     # 6. CATEGORICAL-DIVERSITY
     categorical_diversity = 0.0
-    if n_generated > 1 and d_cat > 0:
+    if n_generated > 1 and d_cat > 0 and k > 1:
         pairwise_distances_cat = []
         for i in range(n_generated):
             for j in range(i + 1, n_generated):
@@ -865,19 +884,21 @@ def compute_binary_cf_metrics(
                 dist_cat = n_cat_diff / d_cat
                 pairwise_distances_cat.append(dist_cat)
         if pairwise_distances_cat:
-            categorical_diversity = np.mean(pairwise_distances_cat)
+            n_requested_pairs = k * (k - 1) / 2
+            categorical_diversity = np.sum(pairwise_distances_cat) / n_requested_pairs
     
     # 7. CONT-COUNT-DIVERSITY
-    # Average number of differing continuous features (normalized)
+    # Requested-k pair-normalized count diversity for continuous features
     cont_count_diversity = 0.0
-    if n_generated > 1 and d_cont > 0:
+    if n_generated > 1 and d_cont > 0 and k > 1:
         cont_count_differences = []
         for i in range(n_generated):
             for j in range(i + 1, n_generated):
                 n_cont_diff = np.sum(np.abs(all_cfs[i][continuous_features] - all_cfs[j][continuous_features]) > 1e-6)
                 cont_count_differences.append(n_cont_diff)
         if cont_count_differences:
-            cont_count_diversity = np.mean(cont_count_differences) / d_cont
+            n_requested_pairs = k * (k - 1) / 2
+            cont_count_diversity = np.sum(cont_count_differences) / (n_requested_pairs * d_cont)
     
     return {
         'pct_valid_cfs': pct_valid_cfs,
@@ -918,6 +939,46 @@ def compute_preference_score_from_preferences(cf_array, preferences):
     return float(np.sum(scores)) if scores else 0.0
 
 
+def get_configured_num_cfs(config):
+    """Return the single configured CF count used by all methods."""
+    num_cfs = int(config.get('standard_methods', {}).get('num_cfs', 1))
+    return max(1, num_cfs)
+
+
+def enforce_expected_cf_count(items, expected_count, method_name, sample_id):
+    """
+    Enforce that the returned CF list does not exceed expected_count.
+
+    If fewer than expected are returned, keep them and log a warning.
+    If more than expected are returned, truncate to expected_count and log a warning.
+    """
+    expected_count = max(int(expected_count), 0)
+    if items is None:
+        items = []
+
+    current_count = len(items)
+    if current_count > expected_count:
+        logger.warning(
+            "  %s sample %s: generated %d CFs, expected %d. Truncating extras.",
+            method_name,
+            sample_id,
+            current_count,
+            expected_count
+        )
+        return items[:expected_count]
+
+    if current_count < expected_count:
+        logger.warning(
+            "  %s sample %s: generated %d CFs, expected %d.",
+            method_name,
+            sample_id,
+            current_count,
+            expected_count
+        )
+
+    return items
+
+
 # ============================================================================
 # STANDARD COUNTERFACTUAL METHODS
 # ============================================================================
@@ -942,7 +1003,7 @@ def get_standard_cf_methods(config, model, X_train, y_train, feature_names, feat
     """
     target_class = config['datasets']['target_class']
     max_iter = config['standard_methods']['max_iterations']
-    num_cfs = config['standard_methods']['num_cfs']
+    num_cfs = get_configured_num_cfs(config)
 
     # Select method keys first so only enabled methods are initialized.
     selected = config['standard_methods']['selection']
@@ -1184,7 +1245,7 @@ def test_standard_methods(model, X_train, y_train, test_indices, X_test_samples,
         # Collect data for this method
         method_cf_data = []
         method_run_stats = []
-        expected_cfs = config['standard_methods']['num_cfs']
+        expected_cfs = get_configured_num_cfs(config)
         
         for i, (idx, x_original) in enumerate(zip(test_indices, X_test_samples)):
             sample_id = int(idx)
@@ -1235,6 +1296,8 @@ def test_standard_methods(model, X_train, y_train, test_indices, X_test_samples,
                         cfs = [result]
                 else:
                     cfs = [result]
+
+                cfs = enforce_expected_cf_count(cfs, expected_cfs, method_name, sample_id)
                 
                 # Save each CF and compute per-calculation validity
                 sample_total_cfs = 0
@@ -1368,12 +1431,8 @@ def compute_and_save_method_metrics(dataset_name, all_method_cfs, X_train, targe
 
     # Mothilal et al. define k as the requested number of CFs to generate.
     # We use method-specific requested counts from config.
-    requested_k_standard = int(config.get('standard_methods', {}).get('num_cfs', 1))
-    requested_k_preference = int(
-        config.get('preference_method', {}).get('expected_counterfactuals', requested_k_standard)
-    )
-    requested_k_standard = max(1, requested_k_standard)
-    requested_k_preference = max(1, requested_k_preference)
+    requested_k_standard = get_configured_num_cfs(config)
+    requested_k_preference = requested_k_standard
     
     for method_name, cf_data_list in all_method_cfs.items():
         if not cf_data_list:
@@ -1480,21 +1539,12 @@ def compute_and_save_method_metrics(dataset_name, all_method_cfs, X_train, targe
             
             metrics_results.append(avg_metrics)
     
-    # Save to CSV
+    # Save to a per-dataset CSV (safe for parallel runs)
     if metrics_results:
-        metrics_path = RESULTS_DIR / 'mothilal_2020_metrics.csv'
+        dataset_clean = dataset_name.lower().replace(' ', '_').replace('&', 'and')
+        metrics_path = RESULTS_DIR / f'metrics_{dataset_clean}.csv'
         metrics_df = pd.DataFrame(metrics_results)
-        
-        # Append if exists, otherwise  create
-        if metrics_path.exists():
-            existing_df = pd.read_csv(metrics_path)
-            # Remove old entries for this dataset
-            existing_df = existing_df[existing_df['dataset'] != dataset_name]
-            combined_df = pd.concat([existing_df, metrics_df], ignore_index=True)
-            combined_df.to_csv(metrics_path, index=False)
-        else:
-            metrics_df.to_csv(metrics_path, index=False)
-        
+        metrics_df.to_csv(metrics_path, index=False)
         logger.info(f"\n  ✓ Metrics saved to: {metrics_path}")
     else:
         logger.warning("  No metrics to save")
@@ -1522,47 +1572,99 @@ def create_numerical_preference_function(sample_value, target_value,
         Tuple of (preference_function, acceptable_min, acceptable_max, info_dict)
     """
     a = steepness  # Use configurable steepness parameter
-    
-    # Calculate t value where function equals exemplar_weight
-    t_target = np.log(1 + exemplar_weight * (np.exp(a) - 1)) / a
-    
-    # Determine direction
+
+    # Piecewise shape:
+    #   - Linear 0.5 → 1.0 from sample to midpoint  (halfway to target)
+    #   - Exponential drop 1.0 → 0 from midpoint onward
+    # f(target) = exemplar_weight (controls x1 position).
+    midpoint = (sample_value + target_value) / 2.0
+
+    # t values: position in [0,1] within [x0,x1] where the exponential equals exemplar_weight
+    # For increasing: t_inc = log(1 + ew*(e^a-1)) / a
+    # For decreasing: t_dec = log(1 + (1-ew)*(e^a-1)) / a
+    t_inc = np.log(1 + exemplar_weight * (np.exp(a) - 1)) / a
+    t_dec = np.log(1 + (1 - exemplar_weight) * (np.exp(a) - 1)) / a
+
     if sample_value < target_value:
-        # Moving towards higher values - prefer lower (decreasing)
-        x1 = (target_value - t_target * sample_value) / (1 - t_target)
-        x0 = sample_value
+        # Search rightward: linear 0.5→1.0 from sample to midpoint,
+        # then exponential drop from midpoint; f(target) = exemplar_weight.
+        x0 = midpoint
+        x1 = x0 + (target_value - x0) / t_dec
         increasing = False
         direction = "decreasing"
+        acceptable_min = sample_value
+        acceptable_max = dataset_max
+
+        # Capture as locals to avoid closure issues
+        _sv, _mp = float(sample_value), float(midpoint)
+        _x0, _x1, _a = float(x0), float(x1), a
+
+        def preference_func(x):
+            x_arr = np.asarray(x, dtype=float)
+            scalar_input = x_arr.ndim == 0
+            x_arr = np.atleast_1d(x_arr)
+            result = np.zeros(x_arr.shape)
+            # Linear ramp: [sample, midpoint] → weight [0.5, 1.0]
+            mask_lin = (x_arr >= _sv) & (x_arr <= _mp)
+            if np.any(mask_lin):
+                denom = _mp - _sv
+                if abs(denom) >= 1e-12:
+                    t = (x_arr[mask_lin] - _sv) / denom
+                    result[mask_lin] = 0.5 + 0.5 * t
+                else:
+                    result[mask_lin] = 1.0
+            # Exponential drop: (midpoint, ∞)
+            mask_exp = x_arr > _mp
+            if np.any(mask_exp):
+                result[mask_exp] = exponential(x_arr[mask_exp], x0=_x0, x1=_x1, increasing=False, a=_a)
+            return float(result.item()) if scalar_input else result
+
     else:
-        # Moving towards lower values - prefer lower (increasing from low)
-        x0 = (target_value - t_target * sample_value) / (1 - t_target)
-        x1 = sample_value
+        # Search leftward: exponential rise to 1.0 at midpoint (for x < midpoint),
+        # then linear 1.0→0.5 from midpoint to sample; f(target) = exemplar_weight.
+        x1 = midpoint
+        x0 = (target_value - t_inc * x1) / (1 - t_inc)
         increasing = True
         direction = "increasing"
-    
-    # Determine acceptable range
-    if increasing:
-        acceptable_min = max(dataset_min, x0)
-        acceptable_max = dataset_max
-    else:
         acceptable_min = dataset_min
-        acceptable_max = min(dataset_max, x0)
-    
+        acceptable_max = sample_value
+
+        _sv, _mp = float(sample_value), float(midpoint)
+        _x0, _x1, _a = float(x0), float(x1), a
+
+        def preference_func(x):
+            x_arr = np.asarray(x, dtype=float)
+            scalar_input = x_arr.ndim == 0
+            x_arr = np.atleast_1d(x_arr)
+            result = np.zeros(x_arr.shape)
+            # Exponential rise: (-∞, midpoint)
+            mask_exp = x_arr < _mp
+            if np.any(mask_exp):
+                result[mask_exp] = exponential(x_arr[mask_exp], x0=_x0, x1=_x1, increasing=True, a=_a)
+            # Linear ramp: [midpoint, sample] → weight [1.0, 0.5]
+            mask_lin = (x_arr >= _mp) & (x_arr <= _sv)
+            if np.any(mask_lin):
+                denom = _sv - _mp
+                if abs(denom) >= 1e-12:
+                    t = (x_arr[mask_lin] - _mp) / denom
+                    result[mask_lin] = 1.0 - 0.5 * t
+                else:
+                    result[mask_lin] = 1.0
+            return float(result.item()) if scalar_input else result
+
     # Ensure bounds are within dataset limits and valid (min <= max)
     acceptable_min = max(dataset_min, min(acceptable_min, dataset_max))
     acceptable_max = max(dataset_min, min(acceptable_max, dataset_max))
-    
+
     # If range is invalid (min > max), constrain to dataset range
     if acceptable_min > acceptable_max:
         acceptable_min = dataset_min
         acceptable_max = dataset_max
-    
-    def preference_func(x):
-        return exponential(x, x0=x0, x1=x1, increasing=increasing, a=a)
-    
+
     info = {
         'sample_value': float(sample_value),
         'target_value': float(target_value),
+        'midpoint': float(midpoint),
         'x0': float(x0),
         'x1': float(x1),
         'direction': direction,
@@ -1574,7 +1676,7 @@ def create_numerical_preference_function(sample_value, target_value,
         'dataset_min': float(dataset_min),
         'dataset_max': float(dataset_max)
     }
-    
+
     return preference_func, acceptable_min, acceptable_max, info
 
 
@@ -1738,30 +1840,32 @@ def generate_preference_cfs_for_sample(sample, sample_id, model, X_train, y_trai
 
     # Get n_candidates_per_cf from config if present, else default to 1
     n_candidates_per_cf = config['preference_method'].get('n_candidates_per_cf', 1)
+    num_cfs = get_configured_num_cfs(config)
+    return_top_n = min(config['preference_method'].get('return_top_n', num_cfs), num_cfs)
     
     # Generate counterfactuals
     try:
         if method == 'binary':
             cf_samples, cf_predictions, cf_scores, cf_iterations = explainer.generate_for_binary(
-                expected_counterfactuals=config['preference_method']['expected_counterfactuals'],
+                expected_counterfactuals=num_cfs,
                 max_iterations=config['preference_method']['max_iterations'],
                 target_class=config['datasets']['target_class'],
                 threshold=config['samples']['threshold'],
                 random_seed=config['random_seed'],
                 use_monte_carlo=config['preference_method']['use_monte_carlo'],
                 max_tries=config['preference_method']['max_tries'],
-                return_top_n=config['preference_method']['return_top_n'],
+                return_top_n=return_top_n,
                 n_candidates_per_cf=n_candidates_per_cf
             )
         else:  # continuous
             cf_samples, cf_predictions, cf_scores, cf_iterations = explainer.generate_random_samples(
-                expected_counterfactuals=config['preference_method']['expected_counterfactuals'],
+                expected_counterfactuals=num_cfs,
                 max_iterations=config['preference_method']['max_iterations'],
                 epsilon=config['preference_method']['epsilon'],
                 random_seed=config['random_seed'],
                 use_monte_carlo=config['preference_method']['use_monte_carlo'],
                 max_tries=config['preference_method']['max_tries'],
-                return_top_n=config['preference_method']['return_top_n'],
+                return_top_n=return_top_n,
                 n_candidates_per_cf=n_candidates_per_cf
             )
         
@@ -1992,7 +2096,7 @@ def test_preference_methods(model, X_train, y_train, test_indices, X_test_sample
         # Collect CF data for metrics
         method_cf_data = []
         method_run_stats = []
-        expected_cfs = config['preference_method']['expected_counterfactuals']
+        expected_cfs = get_configured_num_cfs(config)
         
         for i, (idx, x_original) in enumerate(zip(test_indices, X_test_samples)):
             sample_id = int(idx)
@@ -2014,6 +2118,12 @@ def test_preference_methods(model, X_train, y_train, test_indices, X_test_sample
                 target_sample=target_sample
             )
             calc_duration = time.perf_counter() - calc_start
+
+            results = enforce_expected_cf_count(results, expected_cfs, method_display_name, sample_id)
+
+            # Ensure stored rank reflects final per-sample ordering after enforcement.
+            for rank, result in enumerate(results, start=1):
+                result['cf_rank'] = rank
 
             sample_total_cfs = 0
             sample_valid_cfs = 0
@@ -2046,6 +2156,7 @@ def test_preference_methods(model, X_train, y_train, test_indices, X_test_sample
             run_iterations = float(max_iteration_found) if max_iteration_found > 0 else float(
                 config['preference_method']['max_iterations']
             )
+
             is_valid_expected = (
                 sample_total_cfs >= expected_cfs and sample_valid_cfs >= expected_cfs
             )
@@ -2218,23 +2329,64 @@ def process_dataset(dataset_key, config, status_tracker=None):
     }
 
 
+def _worker_init(cfg):
+    """
+    Initialise a worker process: set the global config and configure logging.
+    Called once per child process before any tasks are submitted to it.
+    """
+    global config
+    config = cfg
+    # Spawned child processes don't inherit parent logging handlers.
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s'
+    )
+    if cfg.get('random_seed') is not None:
+        np.random.seed(cfg['random_seed'])
+        tf.random.set_seed(cfg['random_seed'])
+
+
+def _run_dataset_worker(dataset_key):
+    """
+    Worker entry point for running a single dataset in a child process.
+    Sets up per-dataset file logging, creates a per-dataset status tracker,
+    then delegates to process_dataset().
+    """
+    log_path = setup_dataset_logging(dataset_key)
+    logger.info(f"=== Dataset worker started: {dataset_key} — log: {log_path} ===")
+
+    standard_method_names = get_selected_standard_method_display_names(config)
+    preference_method_names = get_selected_preference_method_display_names(config)
+    total_steps = len(standard_method_names) + len(preference_method_names)
+
+    status_file = SCRIPT_DIR / f"status_{dataset_key}.txt"
+    status_tracker = RunStatusTracker(status_file, total_steps)
+    status_tracker.reset_file()
+
+    return process_dataset(dataset_key, config, status_tracker)
+
+
 def main():
     """Main execution function."""
     # Load configuration
     config_path = SCRIPT_DIR / 'config.yaml'
     global config
     config = load_config(config_path)
-    
-    # Set random seed
+
+    # Set random seed in the main process
     if config['random_seed'] is not None:
         np.random.seed(config['random_seed'])
         tf.random.set_seed(config['random_seed'])
-    
+
     logger.info("\n" + "="*80)
     logger.info("COMBINED COUNTERFACTUAL METHODS TEST")
     logger.info("="*80)
     logger.info(f"Random seed: {config['random_seed']}")
-    
+    logger.info(
+        "Expected CFs per sample for all methods: %s",
+        get_configured_num_cfs(config)
+    )
+
     # Determine datasets to process
     dataset_selection = config['datasets']['selection']
     if dataset_selection == 'all':
@@ -2244,27 +2396,40 @@ def main():
     else:
         datasets = [dataset_selection]
 
-    standard_method_names = get_selected_standard_method_display_names(config)
-    preference_method_names = get_selected_preference_method_display_names(config)
-    total_steps = len(datasets) * (len(standard_method_names) + len(preference_method_names))
-    status_tracker = RunStatusTracker(STATUS_FILE, total_steps)
-    status_tracker.reset_file()
-    
-    # Process each dataset
+    logger.info(f"Datasets to process in parallel: {datasets}")
+
+    # Run all datasets simultaneously in separate worker processes
     all_results = {}
-    for dataset_key in datasets:
-        result = process_dataset(dataset_key, config, status_tracker)
-        if result:
-            all_results[result['dataset_name']] = result
-    
+    n_workers = len(datasets)
+    logger.info(f"Launching {n_workers} parallel worker process(es)...")
+
+    with concurrent.futures.ProcessPoolExecutor(
+        max_workers=n_workers,
+        initializer=_worker_init,
+        initargs=(config,)
+    ) as executor:
+        futures = {executor.submit(_run_dataset_worker, dk): dk for dk in datasets}
+        for future in concurrent.futures.as_completed(futures):
+            dataset_key = futures[future]
+            try:
+                result = future.result()
+                if result:
+                    all_results[result['dataset_name']] = result
+                    logger.info(f"✓ Completed dataset: {dataset_key}")
+            except Exception as exc:
+                logger.error(
+                    f"✗ Dataset '{dataset_key}' raised an exception: {exc}",
+                    exc_info=True
+                )
+
     # Final summary
     logger.info("\n" + "="*80)
     logger.info("OVERALL SUMMARY")
     logger.info("="*80)
-    
+
     for dataset_name, result in all_results.items():
         logger.info(f"\n{dataset_name}:")
-        
+
         # Standard methods
         if 'summary' in result['standard_methods']:
             logger.info("  Standard Methods:")
@@ -2273,38 +2438,48 @@ def main():
                           f"Success: {method_result['n_successful']}/{method_result['n_cfs']} "
                           f"({method_result['success_rate']:.1f}%) "
                           f"Avg Dist: {method_result['avg_distance']:.4f}")
-        
+
         # Preference methods
         if result['preference_methods']:
             logger.info("  Preference-Based Methods:")
             for method_name, method_result in result['preference_methods'].items():
-                logger.info(f"    {method_name.capitalize():<30s} "
-                          f"Success: {method_result['n_successful']}/{method_result['n_cfs']} "
-                          f"({method_result['success_rate']:.1f}%) "
-                          f"Avg Dist: {method_result['avg_distance']:.4f}")
-    
+                if isinstance(method_result, dict) and 'n_successful' in method_result:
+                    logger.info(f"    {method_name.capitalize():<30s} "
+                              f"Success: {method_result['n_successful']}/{method_result['n_cfs']} "
+                              f"({method_result['success_rate']:.1f}%) "
+                              f"Avg Dist: {method_result['avg_distance']:.4f}")
+
     logger.info("\n" + "="*80)
     logger.info("TEST COMPLETE")
     logger.info("="*80)
-    
-    # Display Mothilal et al. 2020 metrics
+
+    # Display Mothilal et al. 2020 metrics from all per-dataset files
     display_mothilal_metrics()
 
 
 def display_mothilal_metrics():
-    """Display Mothilal et al. 2020 metrics from the saved CSV file."""
-    metrics_path = RESULTS_DIR / 'mothilal_2020_metrics.csv'
-    
-    if not metrics_path.exists():
-        logger.warning("\nNo Mothilal et al. 2020 metrics file found")
+    """Display Mothilal et al. 2020 metrics from per-dataset CSV files."""
+    metrics_files = sorted(RESULTS_DIR.glob('metrics_*.csv'))
+
+    if not metrics_files:
+        logger.warning("\nNo metrics_*.csv files found in results directory")
         return
-    
+
     logger.info("\n" + "="*80)
     logger.info("MOTHILAL ET AL. 2020 METRICS")
     logger.info("="*80)
-    
+
     try:
-        metrics_df = pd.read_csv(metrics_path)
+        all_dfs = []
+        for path in metrics_files:
+            try:
+                all_dfs.append(pd.read_csv(path))
+            except Exception as e:
+                logger.warning(f"Could not read {path}: {e}")
+        if not all_dfs:
+            logger.warning("  No readable metrics files found")
+            return
+        metrics_df = pd.concat(all_dfs, ignore_index=True)
         
         # Group by dataset
         for dataset in metrics_df['dataset'].unique():
@@ -2344,14 +2519,12 @@ def display_mothilal_metrics():
                 )
         
         logger.info("\n" + "="*80)
-        logger.info(f"Full metrics saved to: {metrics_path}")
+        logger.info(f"Full metrics loaded from: {len(metrics_files)} file(s) in {RESULTS_DIR}")
         logger.info("="*80)
-        
+
     except Exception as e:
         logger.error(f"Error reading metrics file: {e}")
 
 
 if __name__ == "__main__":
-    # Import csv module (used in saving functions)
-    import csv
     main()
