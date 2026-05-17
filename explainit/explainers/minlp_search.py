@@ -1010,7 +1010,13 @@ class MINLSearchExplainer:
 
         # calcualting coefficients for numerical features
         for key, value in self.priorities_state.numerical_priorities.items():
-            temp_unit_phi = num_shap[key]/(self.sample_state.target_exemplar[key] - self.sample_state.sample[key])
+            denom = (self.sample_state.target_exemplar[key] - self.sample_state.sample[key])
+            # If the feature value does not change between sample and target_exemplar,
+            # the unit coefficient is undefined; treat it as 0 to avoid NaNs.
+            if abs(float(denom)) < 1e-12:
+                temp_unit_phi = 0.0
+            else:
+                temp_unit_phi = num_shap[key] / denom
             shap_coeffs[key] = temp_unit_phi # save coefficient, even for non-actionable features
             
             # Only include actionable features in coef_times_original

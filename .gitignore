@@ -1,6 +1,9 @@
 # Dev
 dev/
 data/
+images/
+.venv_test/
+ML_models_for_tests/
 binary_classifiers/
 binary_classifiers_results/
 linear_regression_results/

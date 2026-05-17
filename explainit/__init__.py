@@ -2,12 +2,10 @@
 # Define the version of the package
 __version__ = "0.1.0"
 
-# Import key modules, functions, or classes
-from .explainers.basic import basic_function
+# Re-export commonly used objects.
 from .logging_config import logger
 
-# Optionally, you can define a list of all the public objects of your package
-__all__ = ['basic_function', 'logging_config']
+__all__ = ["logger"]
 
 # Initialization code can go here
 def _initialize():
