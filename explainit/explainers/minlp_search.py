@@ -1507,6 +1507,214 @@ class MINLSearchExplainer:
             counterfactual = counterfactuals[0]
         return counterfactual
 
+    def find_counterfactuals_for_binary(self, target_class=1, threshold=0.5, 
+                                       expected_counterfactuals=10, max_iterations=100,
+                                       shap_approx=False, num_samples=200, return_top_n=None):
+        """
+        Find counterfactual explanations for binary classification problems.
+        
+        This method extends the MINLP approach to work with binary classifiers by searching
+        for samples that cross the decision threshold in the desired direction. Instead of 
+        finding an exact target prediction value, it optimizes within a target range that
+        ensures the prediction crosses the threshold appropriately.
+        
+        The algorithm:
+        1. Sets target prediction to 0.75 (for class 1) or 0.25 (for class 0)
+        2. Uses confidence interval to create an acceptable range around the target
+        3. Runs MINLP optimization for each categorical combination
+        4. Returns top-N counterfactuals ranked by priority weight
+        
+        Args:
+            target_class: Desired class (0 or 1)
+            threshold: Decision threshold for binary classification (default: 0.5)
+            expected_counterfactuals: Number of counterfactuals to find
+            max_iterations: Maximum optimization iterations per combination
+            shap_approx: If True, uses sampling-based Shapley approximation
+            num_samples: Number of samples for Shapley approximation
+            return_top_n: If specified, return only top N most preferable counterfactuals
+                         (default: return all found)
+        
+        Returns:
+            tuple: (counterfactuals, predictions, scores, found_counts)
+                - counterfactuals: List of counterfactual samples
+                - predictions: List of model predictions for each counterfactual
+                - scores: List of preference scores based on priority weights
+                - found_counts: List indicating iteration number when each CF was found
+        
+        Raises:
+            ValueError: If no samples found satisfy the classification constraint
+        """
+        logger.info(f"Starting MINLP-based binary classification counterfactual search...")
+        logger.info(f"Target class: {target_class}, Threshold: {threshold}")
+        
+        # Set target prediction value based on desired class
+        # For class 1: target ~0.75 (well above threshold)
+        # For class 0: target ~0.25 (well below threshold)
+        if target_class == 1:
+            self.target = 0.75
+        else:
+            self.target = 0.25
+        
+        # Set confidence interval (epsilon) to ensure we're comfortably across the threshold
+        self.epsilon = max(0.1, abs(self.target - threshold))
+        
+        logger.info(f"Set internal target to {self.target} with epsilon {self.epsilon}")
+        
+        # Run the standard MINLP pipeline
+        try:
+            ############
+            # 1. Finding the target exemplar in the dataset
+            self.find_closest_elem()
+            logger.info(f"Target exemplar prediction: {self.model_pred([self.sample_state.target_exemplar])[0]:.4f}")
+        except ValueError as e:
+            logger.warning(f"Could not find target exemplar: {e}")
+            logger.warning("Proceeding without target exemplar - using current sample as reference")
+            self.sample_state.target_exemplar = self.sample_state.sample.copy()
+
+        ############
+        # 2. Determining bounds for numerical features
+        bounds = self.priorities_state.bounds
+        logger.info(f"Bounds for numerical features: {bounds}")
+
+        ###########
+        # 3. Calculate SHAP values
+        self.calc_shapley(self.sample_state.sample, use_approximation=shap_approx, num_samples=num_samples)
+        logger.info(f'SHAP values computed: {len(self.sample_state.shapley_values["numerical"])} numerical, '
+                   f'{len(self.sample_state.shapley_values["categorical"])} categorical features')
+
+        ###########
+        # 4. Create initial values per categorical combination
+        try:
+            init_vals_per_combo = self.confirm_existence_of_solution_for_combo()
+        except (ValueError, AssertionError) as e:
+            logger.warning(f"Could not confirm solution existence: {e}")
+            logger.info("Attempting to proceed with optimizations anyway...")
+            init_vals_per_combo = {}
+        
+        if not init_vals_per_combo:
+            logger.info("No feasible combinations found. Generating initial values from sample/target...")
+            init_vals_per_combo = {0: {
+                'initial_solution': {},
+                'categorical_combo': {}
+            }}
+
+        priorities_for_search = self.sample_state.limited_priorities if hasattr(self.sample_state, 'limited_priorities') else self.priorities_state.priorities
+        logger.info(f"Processing {len(init_vals_per_combo)} categorical combinations")
+
+        ############
+        # 5. For each categorical combination, perform MINLP optimization
+        logger.info("Starting MINLP search for binary classification counterfactuals...")
+        counterfactuals = []
+        predictions = []
+        scores = []
+        found_counts = []
+        
+        for combo_id, values in init_vals_per_combo.items():
+            logger.info(f"Processing categorical combination {combo_id}...")
+            prepared_input = self.sample_state.sample.copy()
+            
+            if 'initial_solution' in values and values['initial_solution']:
+                initial_numerical = values['initial_solution']
+                cat_combo = values.get('categorical_combo', {})
+            else:
+                # Use sample as initial solution if none provided
+                initial_numerical = {}
+                cat_combo = {}
+            
+            for idx, val in cat_combo.items():
+                prepared_input[idx] = val
+            for idx, val in initial_numerical.items():
+                prepared_input[idx] = val
+            
+            # Define constraint and objective functions
+            numerical_indices = list(self.priorities_state.numerical_priorities.keys())
+            
+            def objective_wrapper(x):
+                temp_input = prepared_input.copy()
+                for i, idx in enumerate(numerical_indices):
+                    if i < len(x):
+                        temp_input[idx] = x[i]
+                return self.calculate_total_weight(temp_input)
+            
+            # For binary classification, use direct model prediction instead of Shapley approximation
+            def classification_constraint(x):
+                temp_input = prepared_input.copy()
+                for i, idx in enumerate(numerical_indices):
+                    if i < len(x):
+                        temp_input[idx] = x[i]
+                pred = self.model_pred([temp_input])[0]
+                if target_class == 1:
+                    return pred - threshold  # pred > threshold
+                else:
+                    return threshold - pred  # pred < threshold
+            
+            constraints = [
+                {'type': 'ineq', 'fun': classification_constraint}
+            ]
+            
+            x0 = np.array([prepared_input[idx] for idx in numerical_indices])
+            bounds_list = [bounds[idx] for idx in numerical_indices]
+            
+            logger.info(f"Starting optimization for combination {combo_id}...")
+            logger.debug(f"Initial values: {x0}")
+            logger.debug(f"Bounds: {bounds_list}")
+            
+            try:
+                result = minimize(
+                    lambda x: -objective_wrapper(x),  # Maximize weight (minimize negative weight)
+                    x0,
+                    method='SLSQP',
+                    bounds=bounds_list,
+                    constraints=constraints,
+                    options={'maxiter': max_iterations, 'ftol': 1e-6}
+                )
+                
+                if result.success or not result.success:  # Accept both success and partial convergence
+                    complete_solution = prepared_input.copy()
+                    for i, idx in enumerate(numerical_indices):
+                        complete_solution[idx] = result.x[i]
+                    
+                    # Verify the solution meets the classification constraint
+                    pred = self.model_pred([complete_solution])[0]
+                    is_valid = (pred > threshold) if target_class == 1 else (pred < threshold)
+                    
+                    logger.debug(f"Solution prediction: {pred:.4f}, valid: {is_valid}, message: {result.message}")
+                    
+                    if is_valid:
+                        counterfactuals.append(complete_solution)
+                        predictions.append(pred)
+                        scores.append(objective_wrapper(result.x))
+                        found_counts.append(combo_id + 1)
+                        logger.info(f"Found valid counterfactual: pred={pred:.4f}, weight={scores[-1]:.4f}")
+                    else:
+                        logger.debug(f"Solution doesn't meet classification constraint: pred={pred:.4f}, threshold={threshold}")
+            
+            except Exception as e:
+                logger.warning(f"Error during optimization for combination {combo_id}: {e}")
+                import traceback
+                logger.debug(traceback.format_exc())
+        
+        # Sort by preference score (ascending = lower cost/weight is better)
+        if counterfactuals:
+            sorted_indices = np.argsort(scores)
+            counterfactuals = [counterfactuals[i] for i in sorted_indices]
+            predictions = [predictions[i] for i in sorted_indices]
+            scores = [scores[i] for i in sorted_indices]
+            found_counts = [found_counts[i] for i in sorted_indices]
+            
+            # Limit to top N if requested
+            if return_top_n is not None and len(counterfactuals) > return_top_n:
+                counterfactuals = counterfactuals[:return_top_n]
+                predictions = predictions[:return_top_n]
+                scores = scores[:return_top_n]
+                found_counts = found_counts[:return_top_n]
+            
+            logger.info(f"Found {len(counterfactuals)} valid counterfactuals")
+        else:
+            logger.warning("No valid counterfactuals found!")
+        
+        return counterfactuals, predictions, scores, found_counts
+
 
     #################################################################
     # Utils

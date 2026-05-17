@@ -5,7 +5,7 @@
 # Dataset settings
 datasets:
   # Options: 'all' or list like ['credit_card_default', 'communities_crime', 'german_credit']
-  selection: ['credit_card_default', 'communities_crime', 'german_credit'] #'all' #['german_credit'] #'credit_card_default'] #'all'
+  selection: ['credit_card_default', 'communities_crime', 'german_credit']
   # Which class to generate counterfactuals from
   source_class: 0
   # Which class to generate counterfactuals to
@@ -23,7 +23,7 @@ model:
 # Sample selection
 samples:
   # Number of test samples per dataset
-  n_samples: 100
+  n_samples: 5 # 500
   # Decision boundary for binary classification
   threshold: 0.5
   # Fallback when unique source-class test samples are insufficient.
@@ -46,8 +46,8 @@ standard_methods:
   selection: ['dice_official', 'wachter', 'sparse_wachter', 'prototype']
   
   # General settings for standard methods
-  max_iterations: 5000 #5000
-  #100: 1, 7, 10, [5], 3
+  max_iterations: 15 # 5000
+
   # Number of CFs per sample for all methods, including preference-based ones.
   num_cfs: 2
   
@@ -55,7 +55,7 @@ standard_methods:
   prototype:
     n_prototypes: 5
   
-  # DiCE custom implementation settings
+  # DiCE custom implementation settings - deprecated
   dice:
     learning_rate: 0.05
     diversity_weight: 0.1
@@ -64,8 +64,8 @@ standard_methods:
   # Official DiCE library settings
   dice_official:
     learning_rate: 0.05
-    min_iter: 50
-    max_iter: 5000
+    min_iter: 5 # 50
+    max_iter: 15 # 5000
     proximity_weight: 0.5 # default=0.5 0.05
     diversity_weight: 1.0 # defult=1.0 0.5
     categorical_penalty: 0.0
@@ -91,7 +91,7 @@ preference_method:
   # Number of candidates to generate for each requested CF (new logic)
   n_candidates_per_cf: 5
   # Maximum iterations for CF generation
-  max_iterations: 5000 #5000
+  max_iterations: 5 #5000
   # Use Monte Carlo sampling
   use_monte_carlo: true
   # Return top N counterfactuals by preference score; values above standard_methods.num_cfs are ignored.
