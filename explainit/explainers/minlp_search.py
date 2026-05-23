@@ -178,7 +178,9 @@ class MINLSearchExplainer:
             mask = ~(np.all(data_np[:, idx_tup] == vals, axis=1))
             return np_arr[mask]
 
-        logger.info("Filtering dataset based on priorities from {} samples...".format(self.dataset.shape[0]))
+        logger.info("[Stage 1.1] Filtering dataset (%d rows) using priority "
+                    "constraints (categorical None entries + numerical bounds)...",
+                    self.dataset.shape[0])
         data_np = self.dataset.copy()
 
         # Categorical features
@@ -191,11 +193,15 @@ class MINLSearchExplainer:
         ]
 
         # removing samples (rows) that categorical features are None in priorities
+        if unwanted_cat_groups:
+            logger.info("[Stage 1.1a] Dropping rows matching disallowed categorical "
+                        "combos: %d combo(s)", len(unwanted_cat_groups))
         for group, cat_vals in unwanted_cat_groups:
             data_np = remv_cat(data_np, group, cat_vals)
             if data_np.size == 0:
                 raise Exception("There are no elements fulfilling the requirements")
-        logger.info(f"After categorical filtering, {data_np.shape[0]} samples remain.")
+        logger.info("[Stage 1.1a] After categorical filtering: %d rows remain.",
+                    data_np.shape[0])
 
         # Numerical features
         # applying min/max bounds from priorities
@@ -213,7 +219,8 @@ class MINLSearchExplainer:
                 data_np = data_np[data_np[:, idx] <= max_val]
             if data_np.size == 0:
                 raise Exception("There are no elements fulfilling the requirements")
-        logger.info(f"After numerical filtering, {data_np.shape[0]} samples remain.")
+        logger.info("[Stage 1.1b] After numerical bound filtering: %d rows remain.",
+                    data_np.shape[0])
 
         return data_np
 
@@ -226,17 +233,24 @@ class MINLSearchExplainer:
         Finds the elements in the dataset that are closest to the desired target value +- epsilon.
         Returns the actual samples of all such elements.
         """
-        logger.info("Finding the closest element in the dataset based on the specified priorities...")
+        logger.info("[Stage 1.2] Searching the priority-filtered dataset for the row "
+                    "whose model prediction best matches target=%.4f...",
+                    float(self.target))
         filtered_data = self.get_rows_in_priorities()
         pred = self.model_pred(filtered_data)
 
         min_dist = np.abs(pred - self.target).min()
+        logger.info("[Stage 1.2] Closest filtered-row prediction is %.4f away from target.",
+                    float(min_dist))
         if min_dist > self.target_exemplar_epsilon:
             raise ValueError(f"No elements found within the specified epsilon of {self.target_exemplar_epsilon}. Closest distance is {min_dist}.")
 
         idx_all = np.where(np.abs(pred - self.target) == min_dist)[0]
         assert len(idx_all) == 1, "Expected exactly one target exemplar index, but found multiple."
         self.sample_state.target_exemplar = filtered_data[idx_all[0]]
+        logger.info("[Stage 1.2] Target exemplar locked in (filtered idx=%d, "
+                    "prediction=%.4f).",
+                    int(idx_all[0]), float(pred[idx_all[0]]))
     
     ##################################
     # Calculating Shapley values (3)
@@ -342,7 +356,9 @@ class MINLSearchExplainer:
             all_weights = []
             
             total_subsets = 2 ** len(others)
-            logger.info(f"Computing Shapley for consolidated feature {i}, processing {total_subsets} subsets...")
+            logger.info("[Stage 3] Exact Shapley for unit %d/%d: enumerating %d subsets "
+                        "(O(2^(n-1)) work).",
+                        i + 1, n, total_subsets)
             
             for k in range(len(others) + 1):
                 for S in itertools.combinations(others, k):
@@ -378,7 +394,9 @@ class MINLSearchExplainer:
             """Approximate Shapley calculation for consolidated features"""
             others = [j for j in range(n) if j != i]
             
-            logger.info(f"Computing approximate Shapley for consolidated feature {i}, using {num_samples} samples...")
+            logger.info("[Stage 3] Approximate Shapley for unit %d/%d: averaging %d "
+                        "random subsets (Monte-Carlo estimator).",
+                        i + 1, n, num_samples)
             
             all_subsets = []
             all_subsets_with_i = []
@@ -425,9 +443,11 @@ class MINLSearchExplainer:
         feature_map, cat_to_shapley, total_shapley_features = create_feature_mapping()
         consolidated_r, consolidated_x = create_consolidated_vectors(original_r, original_x, feature_map, total_shapley_features)
 
-        logger.info(f"Consolidated {original_length} original features into {total_shapley_features} Shapley calculation units")
-        logger.info(f"Numerical features: {len(self.priorities_state.numerical_priorities)}")
-        logger.info(f"Categorical groups: {len(cat_groups)}")
+        logger.info("[Stage 3] Consolidating features for Shapley: %d original cols -> "
+                    "%d units (numerical kept 1:1, each one-hot group merged).",
+                    original_length, total_shapley_features)
+        logger.info("[Stage 3] Numerical features tracked: %d | Categorical groups: %d",
+                    len(self.priorities_state.numerical_priorities), len(cat_groups))
 
         # Calculate Shapley values for consolidated features
         if use_approximation:
@@ -1167,23 +1187,45 @@ class MINLSearchExplainer:
         # creates list of categorical combinations to explore
         # creates self.sample_state.limited_priorities and self.sample_state.all_combinations
         # now, there are at most two categories in each categorical group (one from sample, one from target_exemplar)
+        logger.info("[Stage 4.1] Pruning categorical combinations using Shapley values "
+                    "(zero-impact groups collapse to the sample's own category).")
         self.create_limited_priorities()
+        logger.info("[Stage 4.1] %d categorical combination(s) survive after pruning.",
+                    len(self.sample_state.all_combinations))
 
         # self.shap_dict = shap_dict
         # 2. Extract targets for linear search for each categorical combination
+        logger.info("[Stage 4.2] Caching baseline prediction for the original sample "
+                    "(used as anchor in the linear approximation).")
         self.basic_prediction=self.model_pred([self.sample_state.sample])[0]
+        logger.info("[Stage 4.2] basic_prediction=%.4f (target=%.4f)",
+                    float(self.basic_prediction), float(self.target))
 
         # 3. Prepare targets and coefficients for linear search
+        logger.info("[Stage 4.3] Building per-combo LP targets and per-feature linear "
+                    "coefficients from Shapley values.")
         target_for_combo = self.extract_for_linear_search()
+        logger.info("[Stage 4.3] LP targets per categorical combo: %s", target_for_combo)
+        logger.debug("[Stage 4.3] Per-feature shap_coeffs (unit phi): %s",
+                     self.sample_state.shap_coeffs)
 
         # 4. Verify which are actionable and prepare input for linear search
+        logger.info("[Stage 4.4] Selecting actionable numerical features and gathering "
+                    "their bounds for the LP solver.")
         indices_to_modify = [i for i in self.sample_state.shap_coeffs.keys() if i not in self.priorities_state.non_actionable_indices]
         coeff_to_linear_search = [self.sample_state.shap_coeffs[key] for key in indices_to_modify]
         bounds_for_linear_search = [self.priorities_state.bounds[key] for key in indices_to_modify]
+        logger.info("[Stage 4.4] %d actionable numerical features: %s",
+                    len(indices_to_modify), indices_to_modify)
+        logger.debug("[Stage 4.4] LP coefficients=%s | bounds=%s",
+                     coeff_to_linear_search, bounds_for_linear_search)
 
 
         # 5. For each categorical combination, solve the linear programming problem to find at least one solution
         # TODO: Optimize by removing for loop and vectorize if possible
+        logger.info("[Stage 4.5] Solving an LP per categorical combination "
+                    "(coefficients . x = adjusted_target, bounded). The first feasible "
+                    "x becomes the warm-start for SLSQP later on.")
         combo_and_initial_solutions = {}
         shap_dict = self.sample_state.shapley_values
         cat_combinations = self.sample_state.all_combinations
@@ -1192,30 +1234,44 @@ class MINLSearchExplainer:
         basic_prediction = self.basic_prediction
 
         for combination_id, temp_target in target_for_combo.items():
-            logger.info(f'Processing combination_id: {combination_id} with target: {temp_target}')
+            logger.info("[Stage 4.5] Combo %d/%d -> LP target=%.4f",
+                        combination_id + 1, len(target_for_combo), float(temp_target))
             temp_combo = cat_combinations[combination_id]
-            logger.info(f'temp_combo: {temp_combo}')
+            logger.debug("[Stage 4.5] Combo %d categorical assignment: %s",
+                         combination_id, temp_combo)
             dummy_x = self.sample_state.sample.copy()
 
             for idx, val in temp_combo.items():
                 dummy_x[idx] = val
 
             linear_solution = MINLSearchExplainer.solve_linear_constraint_lp(coeff_to_linear_search, temp_target, bounds_for_linear_search, method='auto', tolerance=self.epsilon)
-            logger.info(f'linear_solution["success"]: {linear_solution["success"]}')
+            logger.info("[Stage 4.5] Combo %d LP %s (method=%s).",
+                        combination_id,
+                        "feasible" if linear_solution["success"] else "infeasible",
+                        linear_solution.get("method_used"))
             solution = linear_solution['solution']
-            logger.info(f'solution: {solution}')
+            logger.debug("[Stage 4.5] Combo %d LP solution=%s",
+                         combination_id, solution)
             if solution is not None:
                 solutions_indices = {key: value for key, value in zip(indices_to_modify, solution)}
                 combo_and_initial_solutions[combination_id] = {'initial_solution': solutions_indices, 'categorical_combo': temp_combo}
                 for key, value in solutions_indices.items():
                     dummy_x[key] = value
-                logger.info(f'sample: {self.sample_state.sample}')
-                logger.info(f'dummy_x: {dummy_x}')
-                assert abs(self.constraint_function(dummy_x, shap_dict, self.sample_state.sample, self.sample_state.target_exemplar, priorities_for_search, basic_prediction=self.basic_prediction) - self.target) <= self.epsilon, \
-                    f"Constraint function value {self.constraint_function(dummy_x, shap_dict, self.sample_state.sample, self.sample_state.target_exemplar, priorities_for_search, basic_prediction=self.basic_prediction)} exceeds tolerance {self.epsilon} from target {self.target}"
-                logger.info(f'constraint_function: {self.constraint_function(dummy_x, shap_dict, self.sample_state.sample, self.sample_state.target_exemplar, priorities_for_search, basic_prediction=self.basic_prediction)}')
+                logger.debug("[Stage 4.5] Combo %d candidate vector: %s",
+                             combination_id, dummy_x)
+                check_value = self.constraint_function(dummy_x, shap_dict, self.sample_state.sample, self.sample_state.target_exemplar, priorities_for_search, basic_prediction=self.basic_prediction)
+                assert abs(check_value - self.target) <= self.epsilon, \
+                    f"Constraint function value {check_value} exceeds tolerance {self.epsilon} from target {self.target}"
+                logger.info("[Stage 4.5] Combo %d sanity check: linearised h(x)=%.4f "
+                            "(target=%.4f, |gap|=%.4f, epsilon=%.4f).",
+                            combination_id, float(check_value),
+                            float(self.target),
+                            abs(float(check_value) - float(self.target)),
+                            float(self.epsilon))
 
-        print('combo_and_initial_solutions: ', combo_and_initial_solutions)
+        logger.info("[Stage 4.6] %d/%d categorical combination(s) yielded an initial "
+                    "feasible solution.",
+                    len(combo_and_initial_solutions), len(target_for_combo))
 
         # 6. If no feasible solutions were found, analyze why and suggest bounds adjustments
         # TODO: It worked fine when there were no categorical fatures - I need to rethink this part
@@ -1401,35 +1457,72 @@ class MINLSearchExplainer:
             list: List of counterfactual examples (modified feature vectors)
         """
         
+        logger.info("=" * 78)
+        logger.info("MINLP COUNTERFACTUAL SEARCH | target=%.4f | epsilon=%.4f | "
+                    "shap_approx=%s | num_samples=%d",
+                    float(self.target), float(self.epsilon),
+                    bool(shap_approx), int(num_samples))
+        logger.info("=" * 78)
+
         ############
         # 1. Finding the target exemplar in the desired target class
+        logger.info("--- STAGE 1/6: Locate target exemplar in dataset ---")
+        logger.info("Goal: pick a real training point whose model prediction is closest "
+                    "to the requested target (within target_exemplar_epsilon=%.4f). "
+                    "It anchors the linear (Shapley) approximation used in later stages.",
+                    float(self.target_exemplar_epsilon))
         self.find_closest_elem()
+        logger.info("Target exemplar selected: prediction=%.4f (target=%.4f)",
+                    float(self.model_pred([self.sample_state.target_exemplar])[0]),
+                    float(self.target))
 
         ############
         # 2. Determining bounds for numerical features
+        logger.info("--- STAGE 2/6: Collect numerical-feature bounds from priorities ---")
+        logger.info("These (min, max) pairs constrain how far each numerical feature is "
+                    "allowed to move during the LP and SLSQP searches.")
         bounds = self.priorities_state.bounds
-        logger.info(f"Bounds for numerical features: {bounds}")
+        logger.info("Bounds for numerical features: %s", bounds)
+        logger.info("Non-actionable feature indices (frozen at sample values): %s",
+                    self.priorities_state.non_actionable_indices)
 
         ###########
         # 3. Calculate SHAP values for the sample
+        logger.info("--- STAGE 3/6: Compute Shapley values (sample vs. target exemplar) ---")
+        logger.info("Shapley values quantify each feature's contribution to the gap "
+                    "between the prediction on the sample and on the target exemplar. "
+                    "Numerical features get one value each; one-hot categorical groups "
+                    "are consolidated into a single value per group.")
         self.calc_shapley(self.sample_state.sample, use_approximation=shap_approx, num_samples=num_samples)
-        logger.info(f'SHAP values: {self.sample_state.shapley_values}')
+        logger.info("Shapley values (numerical): %s",
+                    self.sample_state.shapley_values.get('numerical'))
+        logger.info("Shapley values (categorical groups): %s",
+                    self.sample_state.shapley_values.get('categorical'))
 
         ###########
         # 4. Create initial values per categorical combination
+        logger.info("--- STAGE 4/6: Build initial feasible solutions per categorical combo ---")
+        logger.info("For each surviving categorical combination, solve a linear program "
+                    "(in the Shapley-linearised model) to find numerical values that "
+                    "land within +/- epsilon of the target. These become warm starts "
+                    "for the nonlinear SLSQP optimisation in stage 5.")
         init_vals_per_combo = self.confirm_existence_of_solution_for_combo()
         priorities_for_search = self.sample_state.limited_priorities
-        logger.info(f"Initial values per combination: {init_vals_per_combo}")
-        logger.info(f"Priorities for search: {priorities_for_search}")
+        logger.info("Initial values per combination: %s", init_vals_per_combo)
+        logger.info("Limited priorities used for search: %s", priorities_for_search)
 
 
         ############
         # 5. For each categorical combination, perform MINLP to find counterfactuals
         # If there are no categorical features, this loop will run only once
-        logger.info("Starting MINLP search for counterfactuals...")
+        logger.info("--- STAGE 5/6: SLSQP optimisation per categorical combination ---")
+        logger.info("Minimise the priority cost subject to the Shapley-linear constraint "
+                    "h(x) in [target-epsilon, target+epsilon]. One run per categorical "
+                    "combination; without categorical features the loop runs once.")
         counterfactuals = []
         for i, values in init_vals_per_combo.items():
-            logger.info(f"Processing categorical combination {i}...")
+            logger.info("[combo %d/%d] Preparing input from initial LP solution and "
+                        "categorical assignment...", i + 1, len(init_vals_per_combo))
             prepared_input = self.sample_state.sample.copy()
             initial_numerical = values['initial_solution']
             cat_combo = values['categorical_combo']
@@ -1469,29 +1562,41 @@ class MINLSearchExplainer:
             x0 = np.array([prepared_input[idx] for idx in self.priorities_state.numerical_priorities.keys()])
             # Convert bounds dictionary to list of tuples in the same order as x0
             bounds_list = [bounds[idx] for idx in self.priorities_state.numerical_priorities.keys()]
-            logger.info(f"Initial numerical values for optimization: {x0}")
-            print('constraints: ', constraints)
-            print('bounds: ', bounds_list)
-            logger.info("Starting optimization...")
+            logger.info("[combo %d/%d] Initial numerical x0=%s",
+                        i + 1, len(init_vals_per_combo), x0)
+            logger.debug("[combo %d/%d] Constraints (bounded): h(x) in [%.4f, %.4f]",
+                         i + 1, len(init_vals_per_combo),
+                         self.target - self.epsilon, self.target + self.epsilon)
+            logger.debug("[combo %d/%d] Bounds list passed to SLSQP: %s",
+                         i + 1, len(init_vals_per_combo), bounds_list)
+            logger.info("[combo %d/%d] Running SLSQP (maximise priority weight subject "
+                        "to Shapley-linear constraint)...",
+                        i + 1, len(init_vals_per_combo))
             result = minimize(
-                objective_fun, 
+                objective_fun,
                 x0,
                 method='SLSQP',
                 bounds=bounds_list,
                 constraints=constraints,
             )
-            
+
             # The optimal solution is in result.x
             complete_solution = prepared_input.copy()
             for j, idx in enumerate(self.sample_state.shapley_values['numerical'].keys()):
                 complete_solution[idx] = result.x[j]
             counterfactuals.append(complete_solution)
-            # Print results
-            logger.debug("Combination values: %s", values)
-            logger.debug("Optimal numerical solution: %s", result.x)
-            logger.debug("Complete solution (prepared_input with optimal numerical values): %s", self.model_pred([complete_solution]))
-            logger.debug("Constraint value at solution: %s", constraint_fun(result.x))
-            logger.debug("Maximized objective value: %s", -result.fun)
+            logger.info("[combo %d/%d] SLSQP done: success=%s | iterations=%s | "
+                        "model_pred(cf)=%.4f | constraint h(x)=%.4f | "
+                        "objective(weight)=%.4f",
+                        i + 1, len(init_vals_per_combo),
+                        getattr(result, "success", None),
+                        getattr(result, "nit", "?"),
+                        float(self.model_pred([complete_solution])[0]),
+                        float(constraint_fun(result.x)),
+                        float(-result.fun))
+            logger.debug("[combo %d/%d] Optimal x=%s | message=%s",
+                         i + 1, len(init_vals_per_combo),
+                         result.x, getattr(result, "message", ""))
             logger.debug("-----")
 
         # TODO: create a loop to check if found counterfactuals meet the criteria (within epsilon of target) and use found counterfactuals as new samples
@@ -1499,18 +1604,29 @@ class MINLSearchExplainer:
         ####################
         # 6. Select the best counterfactual based on total weight
         # if multiple found (only for cases with categorical features)
-        logger.info("MINLP search completed. Selecting best counterfactual among {} candidates.".format(len(counterfactuals)))
+        logger.info("--- STAGE 6/6: Pick best counterfactual ---")
+        logger.info("Among %d candidate(s), pick the one with the lowest priority "
+                    "cost (calculate_total_weight). With no categorical features there "
+                    "is exactly one candidate.", len(counterfactuals))
         if len(counterfactuals) > 1:
             best_counterfactual = None
             best_weight = float('inf')
             for cf in counterfactuals:
                 weight = self.calculate_total_weight(cf)
+                logger.debug("Candidate weight=%.4f", weight)
                 if weight < best_weight:
                     best_weight = weight
                     best_counterfactual = cf
             counterfactual = best_counterfactual
+            logger.info("Selected candidate weight=%.4f", best_weight)
         else:
             counterfactual = counterfactuals[0]
+        logger.info("=" * 78)
+        logger.info("MINLP COUNTERFACTUAL SEARCH DONE | model_pred(cf)=%.4f "
+                    "(target=%.4f, epsilon=%.4f)",
+                    float(self.model_pred([counterfactual])[0]),
+                    float(self.target), float(self.epsilon))
+        logger.info("=" * 78)
         return counterfactual
 
     def find_counterfactuals_for_binary(self, target_class=1, threshold=0.5, 
