@@ -531,6 +531,7 @@ def save_priority_plots(
     *,
     sample_index: Optional[int] = None,
     exemplar: Optional[np.ndarray] = None,
+    target_threshold: Optional[float] = None,
     output_dir: Path = IMAGES_DIR,
 ) -> List[Path]:
     """Render priority plots for ``priorities`` into ``output_dir``.
@@ -552,6 +553,7 @@ def save_priority_plots(
         feature_matrix=_as_array(ctx.X_train),
         target_values=np.asarray(ctx.y_train, dtype=float).flatten(),
         target_name=_TARGET_NAME_BY_DATASET.get(ctx.dataset_key, "target"),
+        target_threshold=target_threshold,
         feature_names=ctx.feature_names,
         save_dir=target_dir,
         show=False,
@@ -613,6 +615,7 @@ def run_minlp_cont_on_sample(
                 ctx, sample, priorities,
                 sample_index=sample_index,
                 exemplar=priority_exemplar,
+                target_threshold=float(target_y),
                 output_dir=save_priority_plots_to,
             )
         except Exception as exc:  # pragma: no cover - plotting is best-effort

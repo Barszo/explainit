@@ -54,9 +54,9 @@ def apply_style():
     # Font sizes - significantly larger
     plt.rcParams['font.size'] = 16           # Base font size increased
     plt.rcParams['axes.titlesize'] = 24      # Title size increased
-    plt.rcParams['axes.labelsize'] = 20      # Axis label size increased  
-    plt.rcParams['xtick.labelsize'] = 16     # X-tick label size increased
-    plt.rcParams['ytick.labelsize'] = 16     # Y-tick label size increased
+    plt.rcParams['axes.labelsize'] = 26      # Axis label size increased  
+    plt.rcParams['xtick.labelsize'] = 24     # X-tick label size increased
+    plt.rcParams['ytick.labelsize'] = 24     # Y-tick label size increased
     plt.rcParams['legend.fontsize'] = 18     # Legend size increased
     # Ensure minus sign renders on fonts lacking U+2212
     plt.rcParams['axes.unicode_minus'] = False
@@ -97,12 +97,12 @@ def style_categorical_plot(ax, num_categories=1):
     # Title and labels with dirty white text and larger fonts
     ax.set_title(ax.get_title(), color=COLORS['dirty_white'], fontweight='bold', 
                 fontsize=26, pad=30)
-    ax.set_xlabel(ax.get_xlabel(), color=COLORS['dirty_white'], fontweight='bold', fontsize=22)
-    ax.set_ylabel(ax.get_ylabel(), color=COLORS['dirty_white'], fontweight='bold', fontsize=22)
+    ax.set_xlabel(ax.get_xlabel(), color=COLORS['dirty_white'], fontweight='bold', fontsize=28)
+    ax.set_ylabel(ax.get_ylabel(), color=COLORS['dirty_white'], fontweight='bold', fontsize=28)
     
     # Tick colors with dirty white
-    ax.tick_params(axis='x', colors=COLORS['dirty_white'], labelsize=18)
-    ax.tick_params(axis='y', colors=COLORS['dirty_white'], labelsize=18)
+    ax.tick_params(axis='x', colors=COLORS['dirty_white'], labelsize=24)
+    ax.tick_params(axis='y', colors=COLORS['dirty_white'], labelsize=24)
 
 def style_numerical_plot(ax, plot_type='line'):
     """Apply dark theme styling to numerical distribution plots with enhanced contrast."""
@@ -126,12 +126,12 @@ def style_numerical_plot(ax, plot_type='line'):
     # Title and labels with dirty white text and larger fonts
     ax.set_title(ax.get_title(), color=COLORS['dirty_white'], fontweight='bold', 
                 fontsize=26, pad=30)
-    ax.set_xlabel(ax.get_xlabel(), color=COLORS['dirty_white'], fontweight='bold', fontsize=22)
-    ax.set_ylabel(ax.get_ylabel(), color=COLORS['dirty_white'], fontweight='bold', fontsize=22)
+    ax.set_xlabel(ax.get_xlabel(), color=COLORS['dirty_white'], fontweight='bold', fontsize=28)
+    ax.set_ylabel(ax.get_ylabel(), color=COLORS['dirty_white'], fontweight='bold', fontsize=28)
     
     # Tick colors with dirty white
-    ax.tick_params(axis='x', colors=COLORS['dirty_white'], labelsize=18)
-    ax.tick_params(axis='y', colors=COLORS['dirty_white'], labelsize=18)
+    ax.tick_params(axis='x', colors=COLORS['dirty_white'], labelsize=24)
+    ax.tick_params(axis='y', colors=COLORS['dirty_white'], labelsize=24)
 
 def get_bar_color(index=0):
     """Get bar color for categorical plots with gradient and alpha effects."""
