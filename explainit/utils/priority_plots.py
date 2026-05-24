@@ -1,0 +1,864 @@
+"""Reusable plotting helpers for priority functions.
+
+Centralises the matplotlib code that used to live in
+``RandomSearchExplainer.display_priorities`` /
+``RandomSearchExplainer.investigate_probability_distribution`` and
+``MINLSearchExplainer.display_priorities``.
+
+Public entry points
+-------------------
+Static priority weights (what the optimiser actually sees):
+- ``plot_numerical_priority(idx, constraint, ...)`` - one numerical feature.
+- ``plot_categorical_priority(group_indices, mapping, ...)`` - one categorical
+  group.
+- ``plot_priorities(priorities, ...)`` - convenience wrapper that walks the
+  full priorities dict and plots every actionable entry.
+
+Probability-distribution views (sampling-oriented interpretation of the same
+priorities -- mirrors the old
+``RandomSearchExplainer.investigate_probability_distribution``):
+- ``plot_numerical_probability_distribution(idx, constraint, ...)`` - theoretical
+  density (priority normalised by area) overlaid with the empirical histogram
+  obtained via Monte-Carlo rejection sampling.
+- ``plot_categorical_probability_distribution(group_indices, mapping, ...)`` -
+  bars of normalised probabilities, with forbidden (zero-weight) combinations
+  filtered out.
+- ``plot_probability_distributions(priorities, ...)`` - walks the priorities
+  dict and produces a distribution plot per actionable entry.
+
+Sampling helpers:
+- ``sample_numeric_value(constraint, max_tries=100)`` - rejection sampler used
+  by the distribution plots. Exposed so callers can reuse the exact same
+  sampling logic that the plots rely on.
+
+All functions accept an optional ``save_dir`` (or explicit ``save_path``) so
+callers can persist plots to disk without touching matplotlib state.
+"""
+
+from __future__ import annotations
+
+import os
+import math
+from pathlib import Path
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
+
+import matplotlib.pyplot as plt
+import numpy as np
+
+from explainit.utils.plot_styles import (
+    COLORS,
+    apply_style,
+    get_bar_color,
+    get_line_color,
+    style_categorical_plot,
+    style_numerical_plot,
+)
+
+
+PathLike = Union[str, os.PathLike]
+
+
+def _ensure_dir(directory: Optional[PathLike]) -> Optional[Path]:
+    if directory is None:
+        return None
+    path = Path(directory)
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _is_actionable_numeric(constraint: Any) -> bool:
+    if not isinstance(constraint, dict) or "function" not in constraint:
+        return False
+    f = constraint.get("function")
+    min_val = constraint.get("min")
+    max_val = constraint.get("max")
+    if f is None:
+        return False
+    if min_val is None or max_val is None:
+        return False
+    if min_val == max_val:
+        return False
+    return True
+
+
+def _bar_width_for(num_categories: int) -> float:
+    if num_categories == 1:
+        return 0.1
+    if num_categories == 2:
+        return 0.4
+    if num_categories <= 4:
+        return 0.5
+    if num_categories <= 6:
+        return 0.6
+    return 0.8
+
+
+def sample_numeric_value(constraint: Mapping[str, Any], max_tries: int = 100) -> float:
+    """Rejection-sample a value from the [min, max] range proportional to
+    ``constraint['function']`` (which must take values in [0, 1]).
+
+    Falls back to a discretised inverse-transform on a 256-point grid if
+    rejection sampling does not succeed within ``max_tries`` iterations.
+    """
+
+    min_val = float(constraint["min"])
+    max_val = float(constraint["max"])
+    f = constraint["function"]
+
+    for _ in range(max_tries):
+        rv = np.random.uniform(min_val, max_val)
+        w = float(np.asarray(f(rv)).squeeze())
+        if np.random.random() < w:
+            return float(rv)
+
+    xs = np.linspace(min_val, max_val, 256)
+    ws = np.asarray(f(xs)).astype(float).ravel()
+    ws = np.clip(ws, 0.0, None)
+    if ws.sum() == 0 or not np.isfinite(ws).all():
+        return float(np.random.uniform(min_val, max_val))
+    p = ws / ws.sum()
+    idx = np.random.choice(len(xs), p=p)
+    jitter = (max_val - min_val) / 256 * (np.random.random() - 0.5)
+    return float(np.clip(xs[idx] + jitter, min_val, max_val))
+
+
+def _finalize(fig: plt.Figure, save_path: Optional[PathLike], show: bool) -> None:
+    if save_path is not None:
+        save_path = Path(save_path)
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(save_path, dpi=300, bbox_inches="tight")
+    if show:
+        plt.show()
+    else:
+        plt.close(fig)
+
+
+def _infer_target_type(target_values: np.ndarray) -> str:
+    vals = np.asarray(target_values).flatten()
+    vals = vals[np.isfinite(vals)]
+    if vals.size == 0:
+        return "unknown"
+    uniq = np.unique(vals)
+    if uniq.size <= 12:
+        return "categorical"
+    return "continuous"
+
+
+def _find_level_x_positions(
+    x_vals: np.ndarray, y_vals: np.ndarray, level: float, tol: float = 1e-4
+) -> List[float]:
+    if x_vals.size < 2 or y_vals.size < 2:
+        return []
+    out: List[float] = []
+    d = y_vals - float(level)
+    # For flat runs where priority == level, draw only the LEFT boundary.
+    close = np.isclose(d, 0.0, atol=tol)
+    if np.any(close):
+        starts = np.where(close & np.concatenate(([True], ~close[:-1])))[0]
+        for i in starts:
+            out.append(float(x_vals[i]))
+    # zero crossings with linear interpolation
+    sign = np.sign(d)
+    for i in range(len(sign) - 1):
+        if sign[i] == 0 or sign[i + 1] == 0:
+            continue
+        if sign[i] == sign[i + 1]:
+            continue
+        x0, x1 = float(x_vals[i]), float(x_vals[i + 1])
+        y0, y1 = float(y_vals[i]), float(y_vals[i + 1])
+        if abs(y1 - y0) < 1e-12:
+            continue
+        t = (level - y0) / (y1 - y0)
+        out.append(x0 + t * (x1 - x0))
+    out.sort()
+    dedup: List[float] = []
+    for x in out:
+        if not dedup or abs(x - dedup[-1]) > 2e-3:
+            dedup.append(x)
+    return dedup
+
+
+def plot_numerical_priority(
+    idx: int,
+    constraint: Mapping[str, Any],
+    *,
+    sample: Optional[Sequence[float]] = None,
+    exemplar: Optional[Sequence[float]] = None,
+    feature_values: Optional[Sequence[float]] = None,
+    target_values: Optional[Sequence[float]] = None,
+    target_name: str = "target",
+    feature_name: Optional[str] = None,
+    save_path: Optional[PathLike] = None,
+    save_dir: Optional[PathLike] = None,
+    show: bool = False,
+) -> Optional[plt.Figure]:
+    """Plot the priority weight curve for a single numerical feature.
+
+    Returns the figure (or ``None`` if the feature is non-actionable and was
+    skipped). When ``save_dir`` is provided a default filename is used.
+    """
+
+    if not _is_actionable_numeric(constraint):
+        return None
+
+    apply_style()
+
+    min_val = float(constraint["min"])
+    max_val = float(constraint["max"])
+    f = constraint["function"]
+
+    x_vals = np.linspace(min_val, max_val, 1200)
+    priority_values = np.array([float(f(x)) for x in x_vals])
+    title_name = feature_name if feature_name else f"Feature {idx}"
+
+    sample_value = None
+    if sample is not None and idx < len(sample):
+        sample_value = float(sample[idx])
+    exemplar_value = None
+    if exemplar is not None and idx < len(exemplar):
+        exemplar_value = float(exemplar[idx])
+
+    has_target_distribution = feature_values is not None and target_values is not None
+    if has_target_distribution:
+        feature_arr = np.asarray(feature_values, dtype=float).flatten()
+        target_arr = np.asarray(target_values, dtype=float).flatten()
+        mask = np.isfinite(feature_arr) & np.isfinite(target_arr)
+        feature_arr = feature_arr[mask]
+        target_arr = target_arr[mask]
+        has_target_distribution = (
+            feature_arr.size >= 3 and target_arr.size == feature_arr.size
+        )
+
+    if not has_target_distribution:
+        fig, ax = plt.subplots(figsize=(12, 8))
+        ax.plot(
+            x_vals, priority_values, label="Priority Function",
+            color=get_line_color("theoretical"), linewidth=4, alpha=0.9,
+            solid_capstyle="round",
+        )
+        ax.fill_between(
+            x_vals, priority_values, alpha=0.2, color=get_line_color("theoretical")
+        )
+
+        if sample_value is not None and min_val <= sample_value <= max_val:
+            ax.plot(
+                sample_value, float(f(sample_value)), "o",
+                color=get_line_color("empirical"), markersize=12,
+                label=f"Current Sample Value ({sample_value:.3f})",
+                markeredgecolor=COLORS["dirty_white"], markeredgewidth=2,
+            )
+        if exemplar_value is not None and min_val <= exemplar_value <= max_val:
+            ax.plot(
+                exemplar_value, float(f(exemplar_value)), "s",
+                color="#FF6B35", markersize=12,
+                label=f"Exemplar Value ({exemplar_value:.3f})",
+                markeredgecolor=COLORS["dirty_white"], markeredgewidth=2,
+            )
+
+        ax.set_xlabel("Feature Value")
+        ax.set_ylabel("Priority Weight")
+        ax.set_title(f"Priority Function for Numerical {title_name}")
+        legend = ax.legend(
+            frameon=True, fancybox=True, shadow=True,
+            facecolor=COLORS["dark_background"], edgecolor=COLORS["dirty_white"],
+            fontsize=16, loc="center left", bbox_to_anchor=(1.02, 0.9), ncol=1,
+        )
+        legend.get_frame().set_alpha(0.9)
+        for text in legend.get_texts():
+            text.set_color(COLORS["dirty_white"])
+        style_numerical_plot(ax)
+        plt.tight_layout()
+        plt.subplots_adjust(right=0.75)
+    else:
+        target_type = _infer_target_type(target_arr)
+        fig, ax = plt.subplots(figsize=(12, 8))
+
+        if target_type == "continuous":
+            # Restore original priority curve and place it below the density plot
+            fig, (ax_top, ax_bottom) = plt.subplots(
+                2, 1, figsize=(12, 12), sharex=True, gridspec_kw={"height_ratios": [3, 2]}
+            )
+
+            bins_x = min(60, max(10, int(np.sqrt(feature_arr.size))))
+            bins_y = min(60, max(10, int(np.sqrt(target_arr.size))))
+            h = ax_top.hist2d(feature_arr, target_arr, bins=[bins_x, bins_y], cmap="viridis")
+            cbar = fig.colorbar(h[3], ax=ax_top)
+            cbar.ax.tick_params(colors=COLORS["dirty_white"])
+            cbar.set_label("density", color=COLORS["dirty_white"])
+
+            is_constant = np.allclose(priority_values, priority_values[0], atol=1e-5)
+            levels = [1.0, 0.75, 0.5, 0.25, 0.0]
+            level_colors = {
+                1.0: "#90EE90",
+                0.75: "#A0E7E5",
+                0.5: "#FFD166",
+                0.25: "#F4A261",
+                0.0: "#E76F51",
+            }
+            if not is_constant:
+                for level in levels:
+                    x_positions = _find_level_x_positions(x_vals, priority_values, level)
+                    first = True
+                    for xv in x_positions:
+                        ax_top.axvline(
+                            xv, color=level_colors[level], linewidth=2.2,
+                            linestyle="--", alpha=0.95,
+                            label=(f"priority={level:g}" if first else None),
+                        )
+                        first = False
+
+            if sample_value is not None and np.isfinite(sample_value):
+                yv = float(np.median(target_arr))
+                ax_top.scatter(
+                    [sample_value], [yv], marker="v", s=130,
+                    color=get_line_color("empirical"),
+                    edgecolors=COLORS["dirty_white"], linewidths=1.5,
+                    label=f"sample x={sample_value:.3f}",
+                )
+            if exemplar_value is not None and np.isfinite(exemplar_value):
+                yv = float(np.median(target_arr))
+                ax_top.scatter(
+                    [exemplar_value], [yv], marker="s", s=130, color="#FF6B35",
+                    edgecolors=COLORS["dirty_white"], linewidths=1.5,
+                    label=f"exemplar x={exemplar_value:.3f}",
+                )
+
+            ax_top.set_ylabel(target_name)
+            ax_top.set_title(f"Priority + {title_name} vs {target_name} density")
+            legend = ax_top.legend(
+                frameon=True, fancybox=True, shadow=True,
+                facecolor=COLORS["dark_background"], edgecolor=COLORS["dirty_white"],
+                fontsize=12, loc="center left", bbox_to_anchor=(1.24, 0.9), ncol=1,
+            )
+            legend.get_frame().set_alpha(0.9)
+            for text in legend.get_texts():
+                text.set_color(COLORS["dirty_white"])
+            if is_constant:
+                ax_top.text(
+                    1.24, 0.18,
+                    "Note: priority is constant on this range;\nlevel lines hidden.",
+                    transform=ax_top.transAxes, ha="left", va="top",
+                    color=COLORS["dirty_white"], fontsize=11,
+                )
+            style_numerical_plot(ax_top)
+
+            # Previous/original priority function plot restored below density
+            ax_bottom.plot(
+                x_vals, priority_values, label="Priority Function",
+                color=get_line_color("theoretical"), linewidth=4, alpha=0.9,
+                solid_capstyle="round",
+            )
+            ax_bottom.fill_between(
+                x_vals, priority_values, alpha=0.2, color=get_line_color("theoretical")
+            )
+            if sample_value is not None and min_val <= sample_value <= max_val:
+                ax_bottom.plot(
+                    sample_value, float(f(sample_value)), "o",
+                    color=get_line_color("empirical"), markersize=10,
+                    label=f"Current Sample Value ({sample_value:.3f})",
+                    markeredgecolor=COLORS["dirty_white"], markeredgewidth=1.5,
+                )
+            if exemplar_value is not None and min_val <= exemplar_value <= max_val:
+                ax_bottom.plot(
+                    exemplar_value, float(f(exemplar_value)), "s",
+                    color="#FF6B35", markersize=10,
+                    label=f"Exemplar Value ({exemplar_value:.3f})",
+                    markeredgecolor=COLORS["dirty_white"], markeredgewidth=1.5,
+                )
+            ax_bottom.set_xlabel("Feature Value")
+            ax_bottom.set_ylabel("Priority Weight")
+            ax_bottom.set_title(f"Priority Function for Numerical {title_name}")
+            legend2 = ax_bottom.legend(
+                frameon=True, fancybox=True, shadow=True,
+                facecolor=COLORS["dark_background"], edgecolor=COLORS["dirty_white"],
+                fontsize=11, loc="center left", bbox_to_anchor=(1.24, 0.82), ncol=1,
+            )
+            legend2.get_frame().set_alpha(0.9)
+            for text in legend2.get_texts():
+                text.set_color(COLORS["dirty_white"])
+            style_numerical_plot(ax_bottom)
+            plt.tight_layout()
+            plt.subplots_adjust(right=0.66, hspace=0.28)
+        else:
+            # categorical target: class-wise feature distributions + priority function
+            classes = np.unique(target_arr)
+            bins = min(50, max(10, int(np.sqrt(feature_arr.size))))
+            for i, cls in enumerate(classes):
+                vals = feature_arr[target_arr == cls]
+                if vals.size == 0:
+                    continue
+                ax.hist(
+                    vals, bins=bins, density=True, alpha=0.35,
+                    color=get_bar_color(i), edgecolor=COLORS["dirty_white"], linewidth=1.0,
+                    label=f"{target_name}={cls}",
+                )
+            ax.set_xlabel("Feature Value")
+            ax.set_ylabel("Class-conditional density")
+
+            ax2 = ax.twinx()
+            ax2.plot(
+                x_vals, priority_values, color=get_line_color("theoretical"),
+                linewidth=3.2, alpha=0.95, label="Priority Function",
+            )
+            ax2.set_ylim(-0.02, 1.02)
+            ax2.set_ylabel("Priority Weight", color=COLORS["dirty_white"])
+            ax2.tick_params(axis="y", colors=COLORS["dirty_white"])
+
+            if sample_value is not None and min_val <= sample_value <= max_val:
+                ax2.plot(
+                    sample_value, float(f(sample_value)), "o",
+                    color=get_line_color("empirical"), markersize=10,
+                    markeredgecolor=COLORS["dirty_white"], markeredgewidth=1.5,
+                    label=f"sample ({sample_value:.3f})",
+                )
+            if exemplar_value is not None and min_val <= exemplar_value <= max_val:
+                ax2.plot(
+                    exemplar_value, float(f(exemplar_value)), "s",
+                    color="#FF6B35", markersize=10,
+                    markeredgecolor=COLORS["dirty_white"], markeredgewidth=1.5,
+                    label=f"exemplar ({exemplar_value:.3f})",
+                )
+
+            ax.set_title(f"Priority + class-wise distribution for {title_name}")
+            h1, l1 = ax.get_legend_handles_labels()
+            h2, l2 = ax2.get_legend_handles_labels()
+            legend = ax.legend(
+                h1 + h2, l1 + l2,
+                frameon=True, fancybox=True, shadow=True,
+                facecolor=COLORS["dark_background"], edgecolor=COLORS["dirty_white"],
+                fontsize=12, loc="center left", bbox_to_anchor=(1.02, 0.9), ncol=1,
+            )
+            legend.get_frame().set_alpha(0.9)
+            for text in legend.get_texts():
+                text.set_color(COLORS["dirty_white"])
+            style_numerical_plot(ax)
+            plt.tight_layout()
+            plt.subplots_adjust(right=0.75)
+
+    if save_path is None and save_dir is not None:
+        directory = _ensure_dir(save_dir)
+        slug = feature_name.replace(" ", "_") if feature_name else f"feature_{idx}"
+        save_path = directory / f"priority_function_{idx}_{slug}.png"
+
+    _finalize(fig, save_path, show)
+    return fig
+
+
+def plot_categorical_priority(
+    group_indices: Tuple[int, ...],
+    mapping: Mapping[Tuple[Any, ...], float],
+    *,
+    sample: Optional[Sequence[float]] = None,
+    feature_names: Optional[Sequence[str]] = None,
+    save_path: Optional[PathLike] = None,
+    save_dir: Optional[PathLike] = None,
+    show: bool = False,
+) -> Optional[plt.Figure]:
+    """Plot a bar chart with the priority weights of a categorical group."""
+
+    if not mapping:
+        return None
+
+    apply_style()
+
+    categories: List[Tuple[Any, ...]] = list(mapping.keys())
+    weights = np.array([0.0 if v is None else float(v) for v in mapping.values()], dtype=float)
+    category_labels = [str(cat) for cat in categories]
+    num_categories = len(category_labels)
+    bar_width = _bar_width_for(num_categories)
+
+    fig, ax = plt.subplots(figsize=(12, 8))
+    bar_colors = [get_bar_color(i) for i in range(num_categories)]
+    bars = ax.bar(
+        range(num_categories), weights, width=bar_width,
+        color=bar_colors, edgecolor=COLORS["dirty_white"], linewidth=2.0,
+    )
+    for i, bar in enumerate(bars):
+        bar.set_alpha(0.7 + 0.2 * (i % 2))
+        height = bar.get_height()
+        if height > 0:
+            ax.add_patch(plt.Rectangle(
+                (bar.get_x() + 0.02, 0.01),
+                bar.get_width() - 0.04, height - 0.02,
+                fill=False, edgecolor=COLORS["steel_gray"],
+                linewidth=0.8, alpha=0.6,
+            ))
+
+    current_sample_combo: Optional[Tuple[Any, ...]] = None
+    if sample is not None and all(idx < len(sample) for idx in group_indices):
+        current_sample_combo = tuple(sample[idx] for idx in group_indices)
+        if current_sample_combo in categories:
+            current_idx = categories.index(current_sample_combo)
+            bars[current_idx].set_edgecolor(get_line_color("empirical"))
+            bars[current_idx].set_linewidth(4)
+            ax.plot(
+                current_idx, weights[current_idx] + max(weights) * 0.05, "v",
+                color=get_line_color("empirical"), markersize=15,
+                markeredgecolor=COLORS["dirty_white"], markeredgewidth=2,
+            )
+
+    if num_categories == 1:
+        ax.set_xlim(-1, 1)
+
+    current_idx_for_label = (
+        categories.index(current_sample_combo)
+        if current_sample_combo is not None and current_sample_combo in categories
+        else -1
+    )
+    weights_max = float(max(weights)) if num_categories else 0.0
+    for i, (bar, weight) in enumerate(zip(bars, weights)):
+        label_text = f"{weight:.3f}"
+        if i == current_idx_for_label:
+            label_text += " (Current)"
+        ax.text(
+            bar.get_x() + bar.get_width() / 2,
+            bar.get_height() + (weights_max * 0.01 if weights_max else 0.01),
+            label_text, ha="center", va="bottom", fontsize=16,
+            fontweight="bold", color=COLORS["dirty_white"],
+            bbox=dict(
+                boxstyle="round,pad=0.4", facecolor=COLORS["dark_background"],
+                alpha=0.8, edgecolor=COLORS["dirty_white"], linewidth=1.5,
+            ),
+        )
+
+    if feature_names is not None:
+        names = ", ".join(
+            feature_names[i] for i in group_indices if i < len(feature_names)
+        )
+        title = f"Priority Weights for Categorical Features [{names}]"
+    else:
+        title = f"Priority Weights for Categorical Features {group_indices}"
+
+    ax.set_xlabel("Category Combinations")
+    ax.set_ylabel("Priority Weight")
+    ax.set_title(title)
+    ax.set_xticks(range(num_categories))
+    ax.set_xticklabels(category_labels, rotation=45, ha="right")
+
+    style_categorical_plot(ax, num_categories)
+    plt.tight_layout()
+
+    if save_path is None and save_dir is not None:
+        directory = _ensure_dir(save_dir)
+        group_str = "_".join(map(str, group_indices))
+        save_path = directory / f"priority_categorical_{group_str}.png"
+
+    _finalize(fig, save_path, show)
+    return fig
+
+
+def plot_priorities(
+    priorities: Mapping[str, Any],
+    *,
+    sample: Optional[Sequence[float]] = None,
+    exemplar: Optional[Sequence[float]] = None,
+    feature_matrix: Optional[Sequence[Sequence[float]]] = None,
+    target_values: Optional[Sequence[float]] = None,
+    target_name: str = "target",
+    feature_names: Optional[Sequence[str]] = None,
+    save_dir: Optional[PathLike] = None,
+    show: bool = False,
+) -> List[Path]:
+    """Plot every actionable priority in a priorities dict.
+
+    Returns the list of paths written when ``save_dir`` is provided.
+    """
+
+    written: List[Path] = []
+    directory = _ensure_dir(save_dir)
+
+    numerical: Mapping[int, Any] = priorities.get("numerical", {}) or {}
+    categorical: Mapping[Tuple[int, ...], Any] = priorities.get("categorical", {}) or {}
+
+    for idx, constraint in numerical.items():
+        if not _is_actionable_numeric(constraint):
+            continue
+        feature_name = (
+            feature_names[idx]
+            if feature_names is not None and idx < len(feature_names)
+            else None
+        )
+        save_path = None
+        if directory is not None:
+            slug = (feature_name or f"feature_{idx}").replace(" ", "_")
+            save_path = directory / f"priority_function_{idx}_{slug}.png"
+        column = None
+        if feature_matrix is not None:
+            fm = np.asarray(feature_matrix)
+            if fm.ndim == 2 and idx < fm.shape[1]:
+                column = fm[:, idx]
+
+        plot_numerical_priority(
+            idx, constraint,
+            sample=sample, exemplar=exemplar,
+            feature_values=column,
+            target_values=target_values,
+            target_name=target_name,
+            feature_name=feature_name,
+            save_path=save_path, show=show,
+        )
+        if save_path is not None:
+            written.append(save_path)
+
+    for group_indices, mapping in categorical.items():
+        if not mapping:
+            continue
+        save_path = None
+        if directory is not None:
+            group_str = "_".join(map(str, group_indices))
+            save_path = directory / f"priority_categorical_{group_str}.png"
+        plot_categorical_priority(
+            group_indices, mapping,
+            sample=sample, feature_names=feature_names,
+            save_path=save_path, show=show,
+        )
+        if save_path is not None:
+            written.append(save_path)
+
+    return written
+
+
+def plot_numerical_probability_distribution(
+    idx: int,
+    constraint: Mapping[str, Any],
+    *,
+    n_samples: int = 10000,
+    sampler: Optional[Callable[[Mapping[str, Any]], float]] = None,
+    feature_name: Optional[str] = None,
+    save_path: Optional[PathLike] = None,
+    save_dir: Optional[PathLike] = None,
+    show: bool = False,
+) -> Optional[plt.Figure]:
+    """Plot the theoretical density vs the empirical Monte-Carlo histogram for a
+    numerical feature's priority.
+
+    The theoretical curve is the priority function normalised by its integral
+    over [min, max]. The empirical histogram is built by repeatedly calling
+    ``sampler(constraint)`` (default: :func:`sample_numeric_value`).
+    """
+
+    if not _is_actionable_numeric(constraint):
+        return None
+
+    apply_style()
+
+    min_val = float(constraint["min"])
+    max_val = float(constraint["max"])
+    f = constraint["function"]
+    draw = sampler if sampler is not None else sample_numeric_value
+
+    x_vals = np.linspace(min_val, max_val, 1000)
+    weights = np.array([float(f(x)) for x in x_vals])
+    area = float(np.trapezoid(weights, x_vals))
+    if area <= 0 or not np.isfinite(area):
+        prob_density = np.zeros_like(weights)
+    else:
+        prob_density = weights / area
+
+    samples = np.array([draw(constraint) for _ in range(int(n_samples))])
+    hist, bin_edges = np.histogram(samples, bins=50, density=True)
+    bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
+
+    fig, ax = plt.subplots(figsize=(12, 8))
+    ax.plot(
+        x_vals, prob_density, label="Theoretical Distribution",
+        color=get_line_color("theoretical"), linewidth=4, alpha=0.9,
+        solid_capstyle="round",
+    )
+    ax.fill_between(x_vals, prob_density, alpha=0.2, color=get_line_color("theoretical"))
+
+    bars = ax.bar(
+        bin_centers, hist, width=np.diff(bin_edges), alpha=0.8,
+        label="Empirical Distribution", color=get_line_color("empirical"),
+        edgecolor=COLORS["dirty_white"], linewidth=1.5,
+    )
+    for i, bar in enumerate(bars):
+        bar.set_alpha(0.6 + 0.3 * (i % 2 == 0))
+
+    title_name = feature_name if feature_name else f"Feature {idx}"
+    ax.set_xlabel("Feature Value")
+    ax.set_ylabel("Probability Density")
+    ax.set_title(f"Probability Distribution for Numerical {title_name}")
+
+    legend = ax.legend(
+        frameon=True, fancybox=True, shadow=True,
+        facecolor=COLORS["dark_background"], edgecolor=COLORS["dirty_white"],
+        fontsize=16, loc="center left", bbox_to_anchor=(1.02, 0.9), ncol=1,
+    )
+    legend.get_frame().set_alpha(0.9)
+    for text in legend.get_texts():
+        text.set_color(COLORS["dirty_white"])
+
+    style_numerical_plot(ax)
+    plt.tight_layout()
+    plt.subplots_adjust(right=0.75)
+
+    if save_path is None and save_dir is not None:
+        directory = _ensure_dir(save_dir)
+        slug = (feature_name or f"feature_{idx}").replace(" ", "_")
+        save_path = directory / f"probability_distribution_{idx}_{slug}.png"
+
+    _finalize(fig, save_path, show)
+    return fig
+
+
+def plot_categorical_probability_distribution(
+    group_indices: Tuple[int, ...],
+    mapping: Mapping[Tuple[Any, ...], float],
+    *,
+    feature_names: Optional[Sequence[str]] = None,
+    save_path: Optional[PathLike] = None,
+    save_dir: Optional[PathLike] = None,
+    show: bool = False,
+) -> Optional[plt.Figure]:
+    """Plot normalised sampling probabilities for a categorical group.
+
+    Forbidden combinations (weight == 0 or None) are filtered out before
+    renormalising. Returns ``None`` if no combination survives.
+    """
+
+    if not mapping:
+        return None
+
+    apply_style()
+
+    categories = list(mapping.keys())
+    weights = np.array(
+        [0.0 if v is None else float(v) for v in mapping.values()], dtype=float,
+    )
+    allowed_mask = weights > 0
+    if not np.any(allowed_mask):
+        return None
+
+    allowed_categories = [categories[i] for i in range(len(categories)) if allowed_mask[i]]
+    allowed_weights = weights[allowed_mask]
+    probabilities = allowed_weights / allowed_weights.sum()
+    category_labels = [str(cat) for cat in allowed_categories]
+    num_categories = len(category_labels)
+    bar_width = _bar_width_for(num_categories)
+
+    fig, ax = plt.subplots(figsize=(12, 8))
+    bar_colors = [get_bar_color(i) for i in range(num_categories)]
+    bars = ax.bar(
+        range(num_categories), probabilities, width=bar_width,
+        color=bar_colors, edgecolor=COLORS["dirty_white"], linewidth=2.0,
+    )
+    for i, bar in enumerate(bars):
+        bar.set_alpha(0.7 + 0.2 * (i % 2))
+        height = bar.get_height()
+        if height > 0:
+            ax.add_patch(plt.Rectangle(
+                (bar.get_x() + 0.02, 0.01),
+                bar.get_width() - 0.04, height - 0.02,
+                fill=False, edgecolor=COLORS["steel_gray"],
+                linewidth=0.8, alpha=0.6,
+            ))
+
+    if num_categories == 1:
+        ax.set_xlim(-1, 1)
+
+    for bar, prob in zip(bars, probabilities):
+        ax.text(
+            bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.003,
+            f"{prob:.3f}", ha="center", va="bottom", fontsize=16,
+            fontweight="bold", color=COLORS["dirty_white"],
+            bbox=dict(
+                boxstyle="round,pad=0.4", facecolor=COLORS["dark_background"],
+                alpha=0.8, edgecolor=COLORS["dirty_white"], linewidth=1.5,
+            ),
+        )
+
+    if feature_names is not None:
+        names = ", ".join(
+            feature_names[i] for i in group_indices if i < len(feature_names)
+        )
+        title = f"Probability Distribution for Categorical Features [{names}]"
+    else:
+        title = f"Probability Distribution for Categorical Features {group_indices}"
+
+    ax.set_xlabel("Category Combinations")
+    ax.set_ylabel("Probability")
+    ax.set_title(title)
+    ax.set_xticks(range(num_categories))
+    ax.set_xticklabels(category_labels, rotation=45, ha="right")
+
+    style_categorical_plot(ax, num_categories)
+    plt.tight_layout()
+
+    if save_path is None and save_dir is not None:
+        directory = _ensure_dir(save_dir)
+        group_str = "_".join(map(str, group_indices))
+        save_path = directory / f"probability_distribution_categorical_{group_str}.png"
+
+    _finalize(fig, save_path, show)
+    return fig
+
+
+def plot_probability_distributions(
+    priorities: Mapping[str, Any],
+    *,
+    n_samples: int = 10000,
+    sampler: Optional[Callable[[Mapping[str, Any]], float]] = None,
+    feature_names: Optional[Sequence[str]] = None,
+    save_dir: Optional[PathLike] = None,
+    show: bool = False,
+) -> List[Path]:
+    """Render probability-distribution plots for every actionable entry in
+    ``priorities``. Mirrors ``plot_priorities`` but uses the sampling-oriented
+    views.
+    """
+
+    written: List[Path] = []
+    directory = _ensure_dir(save_dir)
+
+    numerical: Mapping[int, Any] = priorities.get("numerical", {}) or {}
+    categorical: Mapping[Tuple[int, ...], Any] = priorities.get("categorical", {}) or {}
+
+    for idx, constraint in numerical.items():
+        if not _is_actionable_numeric(constraint):
+            continue
+        feature_name = (
+            feature_names[idx]
+            if feature_names is not None and idx < len(feature_names)
+            else None
+        )
+        save_path = None
+        if directory is not None:
+            slug = (feature_name or f"feature_{idx}").replace(" ", "_")
+            save_path = directory / f"probability_distribution_{idx}_{slug}.png"
+        plot_numerical_probability_distribution(
+            idx, constraint,
+            n_samples=n_samples, sampler=sampler,
+            feature_name=feature_name,
+            save_path=save_path, show=show,
+        )
+        if save_path is not None:
+            written.append(save_path)
+
+    for group_indices, mapping in categorical.items():
+        if not mapping:
+            continue
+        save_path = None
+        if directory is not None:
+            group_str = "_".join(map(str, group_indices))
+            save_path = directory / f"probability_distribution_categorical_{group_str}.png"
+        plot_categorical_probability_distribution(
+            group_indices, mapping,
+            feature_names=feature_names,
+            save_path=save_path, show=show,
+        )
+        if save_path is not None:
+            written.append(save_path)
+
+    return written
+
+
+__all__ = [
+    "sample_numeric_value",
+    "plot_numerical_priority",
+    "plot_categorical_priority",
+    "plot_priorities",
+    "plot_numerical_probability_distribution",
+    "plot_categorical_probability_distribution",
+    "plot_probability_distributions",
+]

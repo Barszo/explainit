@@ -1,6 +1,5 @@
 from explainit.logging_config import logger
-from explainit.utils.plot_styles import (apply_style, style_numerical_plot, style_categorical_plot, 
-                                        get_line_color, get_bar_color, get_bar_gradient_colors, COLORS)
+from explainit.utils.priority_plots import plot_priorities as _plot_priorities
 # logger.info("This is an info message")
 # logger.debug("This is a debug message with details")
 # logger.warning("This is a warning message")
@@ -9,7 +8,6 @@ from explainit.utils.plot_styles import (apply_style, style_numerical_plot, styl
 import numpy as np
 import random
 from scipy.optimize import minimize
-import matplotlib.pyplot as plt
 from math import factorial
 import itertools
 import copy
@@ -1842,159 +1840,20 @@ class MINLSearchExplainer:
     # Utils
     #################################################################
 
-    def display_priorities(self):
+    def display_priorities(self, *, save_dir=None, show=True, feature_names=None):
+        """Plot the configured priorities (numerical + categorical).
+
+        Delegates to ``explainit.utils.priority_plots.plot_priorities`` so the
+        plotting logic lives in a single reusable place.
         """
-        Display the priority functions and values for both numerical and categorical features.
-        Similar to investigate_probability_distribution but shows the raw priority functions.
-        """
-        # Apply styling
-        apply_style()
-
-        # Display numerical feature priorities
-        for idx, constraint in self.priorities['numerical'].items():
-
-            if isinstance(constraint, dict) and 'function' in constraint:
-                min_val = constraint['min']
-                max_val = constraint['max']
-                f = constraint['function']
-                
-                # Check if this is a non-actionable feature (function=None, min=max)
-                if f is None or min_val == max_val:
-                    print(f'Feature {idx} is non-actionable with fixed value: {min_val}')
-                    continue
-                
-                # Calculate priority function values
-                x_vals = np.linspace(min_val, max_val, 1000)
-                priority_values = np.array([float(f(x)) for x in x_vals])
-
-                # Create enhanced plot with gradient effects
-                fig, ax = plt.subplots(figsize=(12, 8))
-                
-                # Plot priority function with enhanced styling
-                ax.plot(x_vals, priority_values, label='Priority Function', 
-                       color=get_line_color('theoretical'), linewidth=4, alpha=0.9,
-                       solid_capstyle='round')
-                
-                # Add subtle fill under priority curve for depth
-                ax.fill_between(x_vals, priority_values, alpha=0.2, 
-                               color=get_line_color('theoretical'))
-                
-                # Mark the current sample value
-                sample_value = self.sample[idx]
-                if min_val <= sample_value <= max_val:
-                    sample_priority = float(f(sample_value))
-                    ax.plot(sample_value, sample_priority, 'o', 
-                           color=get_line_color('empirical'), markersize=12, 
-                           label=f'Current Sample Value ({sample_value:.3f})',
-                           markeredgecolor=COLORS['dirty_white'], markeredgewidth=2)
-                
-                ax.set_xlabel('Feature Value')
-                ax.set_ylabel('Priority Weight')
-                ax.set_title(f'Priority Function for Numerical Feature {idx}')
-                
-                # Enhanced legend positioned to the right side of title, above plot
-                legend = ax.legend(frameon=True, fancybox=True, shadow=True, 
-                                 facecolor=COLORS['dark_background'], edgecolor=COLORS['dirty_white'],
-                                 fontsize=16, loc='center left', bbox_to_anchor=(1.02, 0.9), ncol=1)
-                legend.get_frame().set_alpha(0.9)
-                # Make legend text dirty white
-                for text in legend.get_texts():
-                    text.set_color(COLORS['dirty_white'])
-                
-                # Apply numerical plot styling
-                style_numerical_plot(ax)
-                
-                # Adjust layout to accommodate legend to the right
-                plt.tight_layout()
-                plt.subplots_adjust(right=0.75)  # Make room for legend on the right
-                plt.show()
-            else:
-                # Old format fallback
-                print(f'Feature {idx} has unexpected format: {constraint}')
-
-        # Display categorical feature priorities
-        for group_indices, possible_values in self.priorities['categorical'].items():
-            
-            # Extract categories and their weights
-            categories = list(possible_values.keys())
-            weights = np.array(list(possible_values.values()), dtype=float)
-            
-            # Create labels for the categories (convert tuples to strings for display)
-            category_labels = [str(cat) if isinstance(cat, tuple) else str(cat) for cat in categories]
-            
-            # Calculate appropriate bar width based on number of categories
-            num_categories = len(category_labels)
-            if num_categories == 1:
-                bar_width = 0.1  # Very narrow for single category
-            elif num_categories == 2:
-                bar_width = 0.4  # Narrow for 2 categories
-            elif num_categories <= 4:
-                bar_width = 0.5  # Narrow for 3-4 categories
-            elif num_categories <= 6:
-                bar_width = 0.6  # Moderate for 5-6 categories
-            else:
-                bar_width = 0.8  # Standard width for many categories
-            
-            # Create bar plot with enhanced styling and gradients
-            fig, ax = plt.subplots(figsize=(12, 8))
-            
-            # Create gradient colors for bars
-            bar_colors = [get_bar_color(i) for i in range(len(category_labels))]
-            
-            bars = ax.bar(range(len(category_labels)), weights, width=bar_width, 
-                         color=bar_colors, edgecolor=COLORS['dirty_white'], linewidth=2.0)
-            
-            # Apply gradient alpha effect to each bar
-            for i, bar in enumerate(bars):
-                # Create depth with alternating alpha and subtle gradients
-                alpha_val = 0.7 + 0.2 * (i % 2)
-                bar.set_alpha(alpha_val)
-                
-                # Add subtle inner border for depth with dark theme
-                height = bar.get_height()
-                if height > 0:
-                    ax.add_patch(plt.Rectangle((bar.get_x() + 0.02, 0.01), 
-                                             bar.get_width() - 0.04, height - 0.02,
-                                             fill=False, edgecolor=COLORS['steel_gray'], 
-                                             linewidth=0.8, alpha=0.6))
-            
-            # Highlight current sample values if they exist in the categories
-            current_sample_combo = tuple(self.sample[idx] for idx in group_indices)
-            if current_sample_combo in categories:
-                current_idx = categories.index(current_sample_combo)
-                bars[current_idx].set_edgecolor(get_line_color('empirical'))
-                bars[current_idx].set_linewidth(4)
-                # Add marker on top of the current sample bar
-                ax.plot(current_idx, weights[current_idx] + max(weights) * 0.05, 'v', 
-                       color=get_line_color('empirical'), markersize=15,
-                       markeredgecolor=COLORS['dirty_white'], markeredgewidth=2)
-            
-            # For single category, adjust x-axis limits to center the bar better
-            if num_categories == 1:
-                ax.set_xlim(-1, 1)
-            
-            # Add value labels with enhanced dark theme styling
-            for i, (bar, weight) in enumerate(zip(bars, weights)):
-                label_text = f'{weight:.3f}'
-                if i == categories.index(current_sample_combo) if current_sample_combo in categories else -1:
-                    label_text += ' (Current)'
-                ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + max(weights) * 0.01, 
-                       label_text, ha='center', va='bottom', fontsize=16,
-                       fontweight='bold', color=COLORS['dirty_white'],
-                       bbox=dict(boxstyle='round,pad=0.4', facecolor=COLORS['dark_background'], 
-                                alpha=0.8, edgecolor=COLORS['dirty_white'], linewidth=1.5))
-            
-            ax.set_xlabel('Category Combinations')
-            ax.set_ylabel('Priority Weight')
-            ax.set_title(f'Priority Weights for Categorical Features {group_indices}')
-            ax.set_xticks(range(len(category_labels)))
-            ax.set_xticklabels(category_labels, rotation=45, ha='right')
-            
-            # Apply categorical plot styling
-            style_categorical_plot(ax, num_categories)
-            
-            plt.tight_layout()
-            plt.show()
+        sample = getattr(self.sample_state, "sample", None)
+        return _plot_priorities(
+            self.priorities_state.priorities,
+            sample=sample,
+            feature_names=feature_names,
+            save_dir=save_dir,
+            show=show,
+        )
 
 
     # def _calculate_target_for_combination(self, combination_id, combo, cat_combinations, 

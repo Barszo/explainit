@@ -58,6 +58,8 @@ def apply_style():
     plt.rcParams['xtick.labelsize'] = 16     # X-tick label size increased
     plt.rcParams['ytick.labelsize'] = 16     # Y-tick label size increased
     plt.rcParams['legend.fontsize'] = 18     # Legend size increased
+    # Ensure minus sign renders on fonts lacking U+2212
+    plt.rcParams['axes.unicode_minus'] = False
     
     # Dark theme colors with dirty white text
     plt.rcParams['axes.edgecolor'] = COLORS['dirty_white']

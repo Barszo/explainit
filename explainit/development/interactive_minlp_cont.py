@@ -72,8 +72,10 @@ if str(PROJECT_ROOT) not in sys.path:
 DEV_DIR = Path(__file__).resolve().parent
 DATA_CONT_DIR = DEV_DIR / "data_cont"
 MODELS_CONT_DIR = DEV_DIR / "models_cont"
+IMAGES_DIR = DEV_DIR / "images"
 DATA_CONT_DIR.mkdir(exist_ok=True)
 MODELS_CONT_DIR.mkdir(exist_ok=True)
+IMAGES_DIR.mkdir(exist_ok=True)
 
 import tensorflow as tf  # noqa: E402
 from sklearn.model_selection import train_test_split  # noqa: E402
@@ -90,6 +92,8 @@ from explainit.development.interactive_minlp import (  # noqa: E402
     PriorityBuilder,
     _as_array,
 )
+from explainit.utils.priority_plots import plot_priorities  # noqa: E402
+from explainit.utils.dataset_analyzer import analyze_dataset  # noqa: E402
 
 
 logger = logging.getLogger("explainit.development.interactive_minlp_cont")
@@ -99,6 +103,13 @@ CONT_DATASETS = ("diabetes", "california_housing", "synthetic")
 
 DATASET_FILE_TEMPLATE = "{key}_cont_data.pkl"
 MODEL_FILE_TEMPLATE = "{key}_cont_model.keras"
+
+
+_TARGET_NAME_BY_DATASET = {
+    "diabetes": "disease_progression",
+    "california_housing": "median_house_value",
+    "synthetic": "synthetic_target",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -339,6 +350,69 @@ def show_sample(ctx: ContDevContext, sample_index: int, max_features: int = 25) 
     return sample
 
 
+def run_dataset_analysis(
+    ctx: ContDevContext,
+    *,
+    output_dir: Optional[Path] = None,
+    sample: Optional[np.ndarray] = None,
+    exemplar: Optional[np.ndarray] = None,
+    use_train: bool = True,
+) -> Path:
+    """Run :func:`analyze_dataset` on the loaded context and return the folder.
+
+    By default the analysis covers the training split (it is larger and
+    therefore yields more reliable distribution estimates). Plots and the
+    textual ``summary.txt`` are written under
+    ``development/images/<dataset_key>_analysis/``.
+    """
+
+    target_dir = Path(output_dir) if output_dir is not None else (
+        IMAGES_DIR / f"{ctx.dataset_key}_analysis"
+    )
+    if use_train:
+        X = ctx.X_train
+        y = ctx.y_train
+    else:
+        X = ctx.X_test
+        y = ctx.y_test
+
+    sample_target_value: Optional[float] = None
+    exemplar_target_value: Optional[float] = None
+    if sample is not None:
+        try:
+            sample_target_value = float(
+                ctx.model.predict(np.asarray(sample, dtype=float).reshape(1, -1), verbose=0)[0, 0]
+            )
+        except Exception as exc:
+            logger.warning("Could not compute sample target value for analysis: %s", exc)
+    if exemplar is not None:
+        try:
+            exemplar_target_value = float(
+                ctx.model.predict(np.asarray(exemplar, dtype=float).reshape(1, -1), verbose=0)[0, 0]
+            )
+        except Exception as exc:
+            logger.warning("Could not compute exemplar target value for analysis: %s", exc)
+
+    logger.info("Running dataset analysis on '%s' -> %s", ctx.dataset_key, target_dir)
+    report = analyze_dataset(
+        X=X,
+        y=y,
+        feature_names=ctx.feature_names,
+        target_name=_TARGET_NAME_BY_DATASET.get(ctx.dataset_key, "target"),
+        dataset_key=ctx.dataset_key,
+        output_dir=target_dir,
+        sample=sample,
+        exemplar=exemplar,
+        sample_target_value=sample_target_value,
+        exemplar_target_value=exemplar_target_value,
+    )
+    logger.info(
+        "Dataset analysis: %d feature(s), %d plot(s), summary at %s",
+        len(report.features), len(report.saved_plots), report.summary_text_path,
+    )
+    return target_dir
+
+
 def find_continuous_target_exemplar(
     ctx: ContDevContext,
     *,
@@ -450,6 +524,46 @@ def describe_cont_cf(
 # ---------------------------------------------------------------------------
 
 
+def save_priority_plots(
+    ctx: ContDevContext,
+    sample: np.ndarray,
+    priorities: Dict[str, Any],
+    *,
+    sample_index: Optional[int] = None,
+    exemplar: Optional[np.ndarray] = None,
+    output_dir: Path = IMAGES_DIR,
+) -> List[Path]:
+    """Render priority plots for ``priorities`` into ``output_dir``.
+
+    The directory defaults to ``development/images/`` and a per-sample
+    sub-folder is used when ``sample_index`` is supplied so re-runs do not
+    overwrite each other.
+    """
+
+    target_dir = Path(output_dir)
+    if sample_index is not None:
+        target_dir = target_dir / f"{ctx.dataset_key}_sample_{sample_index}"
+    target_dir.mkdir(parents=True, exist_ok=True)
+
+    written = plot_priorities(
+        priorities,
+        sample=sample,
+        exemplar=exemplar,
+        feature_matrix=_as_array(ctx.X_train),
+        target_values=np.asarray(ctx.y_train, dtype=float).flatten(),
+        target_name=_TARGET_NAME_BY_DATASET.get(ctx.dataset_key, "target"),
+        feature_names=ctx.feature_names,
+        save_dir=target_dir,
+        show=False,
+    )
+    if written:
+        logger.info("Saved %d priority plot(s) to %s", len(written), target_dir)
+    else:
+        logger.info("No actionable priorities to plot (nothing written to %s).",
+                    target_dir)
+    return written
+
+
 def run_minlp_cont_on_sample(
     ctx: ContDevContext,
     sample_index: int,
@@ -460,6 +574,7 @@ def run_minlp_cont_on_sample(
     target_exemplar_epsilon: float = 0.10,
     shap_approx: bool = True,
     shap_num_samples: int = 200,
+    save_priority_plots_to: Optional[Path] = IMAGES_DIR,
 ) -> Dict[str, Any]:
     """Invoke ``MINLSearchExplainer.find_counterfactuals`` on one sample.
 
@@ -482,7 +597,26 @@ def run_minlp_cont_on_sample(
         epsilon,
     )
 
+    priority_exemplar: Optional[np.ndarray] = None
+    try:
+        priority_exemplar = find_continuous_target_exemplar(
+            ctx, target_y=float(target_y)
+        )
+    except Exception as exc:
+        logger.warning("Could not compute exemplar for priority plots: %s", exc)
+
     describe_priorities(priorities, ctx.feature_names, sample)
+
+    if save_priority_plots_to is not None:
+        try:
+            save_priority_plots(
+                ctx, sample, priorities,
+                sample_index=sample_index,
+                exemplar=priority_exemplar,
+                output_dir=save_priority_plots_to,
+            )
+        except Exception as exc:  # pragma: no cover - plotting is best-effort
+            logger.warning("Failed to save priority plots: %s", exc)
 
     X_train_np = _as_array(ctx.X_train)
     explainer = MINLSearchExplainer(
@@ -664,6 +798,19 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         "--show-sample", type=int, default=None,
         help="Print the values of a specific test sample and exit.",
     )
+    parser.add_argument(
+        "--analyze-dataset", dest="analyze_dataset", action="store_true",
+        default=True,
+        help="Run dataset analysis (plots + summary.txt) before MINLP. Default: on.",
+    )
+    parser.add_argument(
+        "--no-analyze-dataset", dest="analyze_dataset", action="store_false",
+        help="Skip the dataset analysis step.",
+    )
+    parser.add_argument(
+        "--analysis-only", action="store_true",
+        help="Run only the dataset analysis and exit (no MINLP search).",
+    )
     return parser.parse_args(argv)
 
 
@@ -692,6 +839,28 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     )
     if not sample_indices:
         sample_indices = [0]
+
+    if args.analyze_dataset or args.analysis_only:
+        first_idx = int(sample_indices[0])
+        X_test_np = _as_array(ctx.X_test)
+        first_sample = (
+            X_test_np[first_idx].astype(float)
+            if 0 <= first_idx < len(X_test_np) else None
+        )
+        try:
+            exemplar = find_continuous_target_exemplar(
+                ctx, target_y=float(args.target_y),
+            )
+        except Exception as exc:
+            logger.warning("Could not pick exemplar for dataset analysis: %s", exc)
+            exemplar = None
+        run_dataset_analysis(
+            ctx,
+            sample=first_sample,
+            exemplar=exemplar,
+        )
+        if args.analysis_only:
+            return
 
     results = run_minlp_cont_on_samples(
         ctx,

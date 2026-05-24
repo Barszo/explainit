@@ -1,16 +1,13 @@
 
 from explainit.logging_config import logger
-from explainit.utils.plot_styles import (apply_style, style_numerical_plot, style_categorical_plot, 
-                                        get_line_color, get_bar_color, get_bar_gradient_colors, COLORS)
-# logger.info("This is an info message")
-# logger.debug("This is a debug message with details")
-# logger.warning("This is a warning message")
-# logger.error("This is an error message")
+from explainit.utils.priority_plots import (
+    plot_priorities as _plot_priorities,
+    plot_probability_distributions as _plot_probability_distributions,
+    sample_numeric_value as _sample_numeric_value,
+)
 
-import os
 import numpy as np
 import random
-import matplotlib.pyplot as plt
 
 
 class RandomSearchExplainer:
@@ -45,379 +42,47 @@ class RandomSearchExplainer:
         return new_priorities
 
     def sample_numeric_value(self, constraint, max_tries=100):
-        """Uses Monte Carlo sampling to sample a numeric value based on a constraint function.
-        - Rejection Sampling (your primary method)
-        - Inverse Transform Sampling (your fallback, discretized)"""
-
-        min_val = constraint['min']
-        max_val = constraint['max']
-        f = constraint['function']
-
-        # Rejection sampling (works with any shape as long as 0 <= f(x) <= 1)
-        for _ in range(max_tries):
-            rv = np.random.uniform(min_val, max_val)
-            w = float(np.asarray(f(rv)).squeeze())
-            if np.random.random() < w:
-                return rv
-
-        # Fallback: sample proportional to f over a grid (shape-agnostic)
-        xs = np.linspace(min_val, max_val, 256)
-        ws = np.asarray(f(xs)).astype(float).ravel()
-        ws = np.clip(ws, 0.0, None)
-        if ws.sum() == 0 or not np.isfinite(ws).all():
-            return np.random.uniform(min_val, max_val)
-        p = ws / ws.sum()
-        idx = np.random.choice(len(xs), p=p)
-        jitter = (max_val - min_val) / 256 * (np.random.random() - 0.5)
-        return float(np.clip(xs[idx] + jitter, min_val, max_val))
-
-    def investigate_probability_distribution(self, n_samples=10000):
-        # Apply styling
-        apply_style()
-
-        for idx, constraint in self.priorities['numerical'].items():
-
-            if isinstance(constraint, dict) and 'function' in constraint:
-                min_val = constraint['min']
-                max_val = constraint['max']
-                f = constraint['function']
-            else:
-                print('Function for idx: ', idx, ' is unactionable (', constraint, ')')
-                continue
-            def calculate_empirical_distribution(n_samples=10000):
-                accepted_values = []
-                
-                for _ in range(n_samples):
-                    val = self.sample_numeric_value({
-                        'function': f, 
-                        'min': min_val, 
-                        'max': max_val
-                    })
-                    accepted_values.append(val)
-                
-                return np.array(accepted_values)
-
-            # Calculate theoretical distribution
-            x_vals = np.linspace(min_val, max_val, 1000)
-            weights = np.array([float(f(x)) for x in x_vals])
-
-            # Normalize to get probability density
-            prob_density = weights / np.trapezoid(weights, x_vals)
-
-            # Generate samples
-            samples = calculate_empirical_distribution(n_samples)
-
-            # Calculate histogram (probability mass in bins)
-            hist, bin_edges = np.histogram(samples, bins=50, density=True)
-            bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
-
-            # Create enhanced plot with gradient effects
-            fig, ax = plt.subplots(figsize=(12, 8))
-            
-            # Plot theoretical distribution with enhanced styling
-            ax.plot(x_vals, prob_density, label='Theoretical Distribution', 
-                   color=get_line_color('theoretical'), linewidth=4, alpha=0.9,
-                   solid_capstyle='round')
-            
-            # Add subtle fill under theoretical curve for depth
-            ax.fill_between(x_vals, prob_density, alpha=0.2, 
-                           color=get_line_color('theoretical'))
-            
-            # Plot empirical distribution with enhanced dark theme styling
-            bar_colors = get_line_color('empirical')
-            bars = ax.bar(bin_centers, hist, width=np.diff(bin_edges), alpha=0.8, 
-                         label='Empirical Distribution', color=bar_colors,
-                         edgecolor=COLORS['dirty_white'], linewidth=1.5)
-            
-            # Add gradient effect to bars
-            for i, bar in enumerate(bars):
-                # Alternate alpha for gradient effect
-                bar.set_alpha(0.6 + 0.3 * (i % 2 == 0))
-            
-            ax.set_xlabel('Feature Value')
-            ax.set_ylabel('Probability Density')
-            ax.set_title(f'Probability Distribution for Numerical Feature {idx}')
-            
-            # Enhanced legend positioned to the right side of title, above plot
-            legend = ax.legend(frameon=True, fancybox=True, shadow=True, 
-                             facecolor=COLORS['dark_background'], edgecolor=COLORS['dirty_white'],
-                             fontsize=16, loc='center left', bbox_to_anchor=(1.02, 0.9), ncol=1)
-            legend.get_frame().set_alpha(0.9)
-            # Make legend text dirty white
-            for text in legend.get_texts():
-                text.set_color(COLORS['dirty_white'])
-            
-            # Apply numerical plot styling
-            style_numerical_plot(ax)
-            
-            # Adjust layout to accommodate legend to the right
-            plt.tight_layout()
-            plt.subplots_adjust(right=0.75)  # Make room for legend on the right
-            
-            # Save the figure
-            os.makedirs('images', exist_ok=True)
-            plt.savefig(f'images/probability_distribution_feature_{idx}.png', dpi=300, bbox_inches='tight')
-            plt.close()
-
-        for group_indices, possible_values in self.priorities['categorical'].items():
-            
-            # Extract categories and their weights
-            categories = list(possible_values.keys())
-            weights = np.array(list(possible_values.values()), dtype=float)
-            
-            # Filter out forbidden combinations (weight = 0)
-            allowed_mask = weights > 0
-            
-            if not np.any(allowed_mask):
-                print(f'All combinations for categorical group {group_indices} are forbidden (weight = 0)')
-                continue
-            
-            # Keep only allowed combinations
-            allowed_categories = [categories[i] for i in range(len(categories)) if allowed_mask[i]]
-            allowed_weights = weights[allowed_mask]
-            
-            # Normalize weights to probabilities
-            probabilities = allowed_weights / allowed_weights.sum()
-            
-            # Create labels for the categories (convert tuples to strings for display)
-            category_labels = [str(cat) if isinstance(cat, tuple) else str(cat) for cat in allowed_categories]
-            
-            # Calculate appropriate bar width based on number of categories
-            num_categories = len(category_labels)
-            print(num_categories)
-            if num_categories == 1:
-                bar_width = 0.1  # Very narrow for single category
-            elif num_categories == 2:
-                bar_width = 0.4  # Narrow for 2 categories
-            elif num_categories <= 4:
-                bar_width = 0.5  # Narrow for 3-4 categories
-            elif num_categories <= 6:
-                bar_width = 0.6  # Moderate for 5-6 categories
-            else:
-                bar_width = 0.8  # Standard width for many categories
-            
-            # Create bar plot with enhanced styling and gradients
-            fig, ax = plt.subplots(figsize=(12, 8))
-            
-            # Create gradient colors for bars with varying alpha
-            gradient_colors = get_bar_gradient_colors(len(category_labels))
-            bar_colors = [get_bar_color(i) for i in range(len(category_labels))]
-            
-            bars = ax.bar(range(len(category_labels)), probabilities, width=bar_width, 
-                         color=bar_colors, edgecolor=COLORS['dirty_white'], linewidth=2.0)
-            
-            # Apply gradient alpha effect to each bar
-            for i, bar in enumerate(bars):
-                # Create depth with alternating alpha and subtle gradients
-                alpha_val = 0.7 + 0.2 * (i % 2)
-                bar.set_alpha(alpha_val)
-                
-                # Add subtle inner border for depth with dark theme
-                height = bar.get_height()
-                if height > 0:
-                    ax.add_patch(plt.Rectangle((bar.get_x() + 0.02, 0.01), 
-                                             bar.get_width() - 0.04, height - 0.02,
-                                             fill=False, edgecolor=COLORS['steel_gray'], 
-                                             linewidth=0.8, alpha=0.6))
-            
-            # For single category, adjust x-axis limits to center the bar better
-            if num_categories == 1:
-                ax.set_xlim(-1, 1)
-            
-            # Add value labels with enhanced dark theme styling
-            for i, (bar, prob) in enumerate(zip(bars, probabilities)):
-                ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.003, 
-                       f'{prob:.3f}', ha='center', va='bottom', fontsize=16,
-                       fontweight='bold', color=COLORS['dirty_white'],
-                       bbox=dict(boxstyle='round,pad=0.4', facecolor=COLORS['dark_background'], 
-                                alpha=0.8, edgecolor=COLORS['dirty_white'], linewidth=1.5))
-            
-            ax.set_xlabel('Category Combinations')
-            ax.set_ylabel('Probability')
-            ax.set_title(f'Probability Distribution for Categorical Features {group_indices}')
-            ax.set_xticks(range(len(category_labels)))
-            ax.set_xticklabels(category_labels, rotation=45, ha='right')
-            
-            # Apply categorical plot styling
-            style_categorical_plot(ax, num_categories)
-            
-            plt.tight_layout()
-            
-            # Save the figure
-            os.makedirs('images', exist_ok=True)
-            group_str = '_'.join(map(str, group_indices))
-            plt.savefig(f'images/probability_distribution_categorical_{group_str}.png', dpi=300, bbox_inches='tight')
-            plt.close()
-
-    def display_priorities(self, exemplar=None):
+        """Monte-Carlo sampler (rejection + grid fallback). Thin wrapper around
+        :func:`explainit.utils.priority_plots.sample_numeric_value` so the
+        sampling logic stays in lock-step with the distribution plots.
         """
-        Display the priority functions and values for both numerical and categorical features.
-        Similar to investigate_probability_distribution but shows the raw priority functions.
-        
-        Args:
-            exemplar: Optional list of exemplar feature values to display on plots
+        return _sample_numeric_value(constraint, max_tries=max_tries)
+
+    def display_priorities(self, exemplar=None, *, save_dir="images", show=False, feature_names=None):
+        """Plot the configured priorities (numerical + categorical).
+
+        Delegates to ``explainit.utils.priority_plots.plot_priorities``; pass
+        ``save_dir=None`` to skip writing files and ``show=True`` to open the
+        plots interactively.
         """
-        # Apply styling
-        apply_style()
+        return _plot_priorities(
+            self.priorities,
+            sample=self.sample,
+            exemplar=exemplar,
+            feature_names=feature_names,
+            save_dir=save_dir,
+            show=show,
+        )
 
-        # Display numerical feature priorities
-        for idx, constraint in self.priorities['numerical'].items():
+    def investigate_probability_distribution(self, n_samples=10000, *, save_dir="images",
+                                             show=False, feature_names=None):
+        """Render theoretical vs empirical probability distributions for the
+        priorities (numerical) and normalised category probabilities
+        (categorical).
 
-            if isinstance(constraint, dict) and 'function' in constraint:
-                min_val = constraint['min']
-                max_val = constraint['max']
-                f = constraint['function']
-                
-                # Calculate priority function values
-                x_vals = np.linspace(min_val, max_val, 1000)
-                priority_values = np.array([float(f(x)) for x in x_vals])
-
-                # Create enhanced plot with gradient effects
-                fig, ax = plt.subplots(figsize=(12, 8))
-                
-                # Plot priority function with enhanced styling
-                ax.plot(x_vals, priority_values, label='Priority Function', 
-                       color=get_line_color('theoretical'), linewidth=4, alpha=0.9,
-                       solid_capstyle='round')
-                
-                # Add subtle fill under priority curve for depth
-                ax.fill_between(x_vals, priority_values, alpha=0.2, 
-                               color=get_line_color('theoretical'))
-                
-                # Mark the current sample value
-                sample_value = self.sample[idx]
-                if min_val <= sample_value <= max_val:
-                    sample_priority = float(f(sample_value))
-                    ax.plot(sample_value, sample_priority, 'o', 
-                           color=get_line_color('empirical'), markersize=12, 
-                           label=f'Current Sample Value ({sample_value:.3f})',
-                           markeredgecolor=COLORS['dirty_white'], markeredgewidth=2)
-                
-                # Mark the exemplar value if provided
-                if exemplar is not None:
-                    exemplar_value = exemplar[idx]
-                    if min_val <= exemplar_value <= max_val:
-                        exemplar_priority = float(f(exemplar_value))
-                        ax.plot(exemplar_value, exemplar_priority, 's', 
-                               color='#FF6B35', markersize=12, 
-                               label=f'Exemplar Value ({exemplar_value:.3f})',
-                               markeredgecolor=COLORS['dirty_white'], markeredgewidth=2)
-                
-                ax.set_xlabel('Feature Value')
-                ax.set_ylabel('Priority Weight')
-                ax.set_title(f'Priority Function for Numerical Feature {idx}')
-                
-                # Enhanced legend positioned to the right side of title, above plot
-                legend = ax.legend(frameon=True, fancybox=True, shadow=True, 
-                                 facecolor=COLORS['dark_background'], edgecolor=COLORS['dirty_white'],
-                                 fontsize=16, loc='center left', bbox_to_anchor=(1.02, 0.9), ncol=1)
-                legend.get_frame().set_alpha(0.9)
-                # Make legend text dirty white
-                for text in legend.get_texts():
-                    text.set_color(COLORS['dirty_white'])
-                
-                # Apply numerical plot styling
-                style_numerical_plot(ax)
-                
-                # Adjust layout to accommodate legend to the right
-                plt.tight_layout()
-                plt.subplots_adjust(right=0.75)  # Make room for legend on the right
-                
-                # Save the figure
-                os.makedirs('images', exist_ok=True)
-                plt.savefig(f'images/priority_function_feature_{idx}.png', dpi=300, bbox_inches='tight')
-                plt.close()
-            else:
-                print(f'Feature {idx} is unactionable with fixed value: {constraint}')
-
-        # Display categorical feature priorities
-        for group_indices, possible_values in self.priorities['categorical'].items():
-            
-            # Extract categories and their weights
-            categories = list(possible_values.keys())
-            weights = np.array(list(possible_values.values()), dtype=float)
-            
-            # Create labels for the categories (convert tuples to strings for display)
-            category_labels = [str(cat) if isinstance(cat, tuple) else str(cat) for cat in categories]
-            
-            # Calculate appropriate bar width based on number of categories
-            num_categories = len(category_labels)
-            if num_categories == 1:
-                bar_width = 0.1  # Very narrow for single category
-            elif num_categories == 2:
-                bar_width = 0.4  # Narrow for 2 categories
-            elif num_categories <= 4:
-                bar_width = 0.5  # Narrow for 3-4 categories
-            elif num_categories <= 6:
-                bar_width = 0.6  # Moderate for 5-6 categories
-            else:
-                bar_width = 0.8  # Standard width for many categories
-            
-            # Create bar plot with enhanced styling and gradients
-            fig, ax = plt.subplots(figsize=(12, 8))
-            
-            # Create gradient colors for bars
-            bar_colors = [get_bar_color(i) for i in range(len(category_labels))]
-            
-            bars = ax.bar(range(len(category_labels)), weights, width=bar_width, 
-                         color=bar_colors, edgecolor=COLORS['dirty_white'], linewidth=2.0)
-            
-            # Apply gradient alpha effect to each bar
-            for i, bar in enumerate(bars):
-                # Create depth with alternating alpha and subtle gradients
-                alpha_val = 0.7 + 0.2 * (i % 2)
-                bar.set_alpha(alpha_val)
-                
-                # Add subtle inner border for depth with dark theme
-                height = bar.get_height()
-                if height > 0:
-                    ax.add_patch(plt.Rectangle((bar.get_x() + 0.02, 0.01), 
-                                             bar.get_width() - 0.04, height - 0.02,
-                                             fill=False, edgecolor=COLORS['steel_gray'], 
-                                             linewidth=0.8, alpha=0.6))
-            
-            # Highlight current sample values if they exist in the categories
-            current_sample_combo = tuple(self.sample[idx] for idx in group_indices)
-            if current_sample_combo in categories:
-                current_idx = categories.index(current_sample_combo)
-                bars[current_idx].set_edgecolor(get_line_color('empirical'))
-                bars[current_idx].set_linewidth(4)
-                # Add marker on top of the current sample bar
-                ax.plot(current_idx, weights[current_idx] + max(weights) * 0.05, 'v', 
-                       color=get_line_color('empirical'), markersize=15,
-                       markeredgecolor=COLORS['dirty_white'], markeredgewidth=2)
-            
-            # For single category, adjust x-axis limits to center the bar better
-            if num_categories == 1:
-                ax.set_xlim(-1, 1)
-            
-            # Add value labels with enhanced dark theme styling
-            for i, (bar, weight) in enumerate(zip(bars, weights)):
-                label_text = f'{weight:.3f}'
-                if i == categories.index(current_sample_combo) if current_sample_combo in categories else -1:
-                    label_text += ' (Current)'
-                ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + max(weights) * 0.01, 
-                       label_text, ha='center', va='bottom', fontsize=16,
-                       fontweight='bold', color=COLORS['dirty_white'],
-                       bbox=dict(boxstyle='round,pad=0.4', facecolor=COLORS['dark_background'], 
-                                alpha=0.8, edgecolor=COLORS['dirty_white'], linewidth=1.5))
-            
-            ax.set_xlabel('Category Combinations')
-            ax.set_ylabel('Priority Weight')
-            ax.set_title(f'Priority Weights for Categorical Features {group_indices}')
-            ax.set_xticks(range(len(category_labels)))
-            ax.set_xticklabels(category_labels, rotation=45, ha='right')
-            
-            # Apply categorical plot styling
-            style_categorical_plot(ax, num_categories)
-            
-            plt.tight_layout()
-            
-            # Save the figure
-            os.makedirs('images', exist_ok=True)
-            group_str = '_'.join(map(str, group_indices))
-            plt.savefig(f'images/priority_weights_categorical_{group_str}.png', dpi=300, bbox_inches='tight')
-            plt.close()
+        Delegates to
+        :func:`explainit.utils.priority_plots.plot_probability_distributions`,
+        passing this explainer's own ``sample_numeric_value`` so the empirical
+        histogram comes from the exact sampler the search loop uses.
+        """
+        return _plot_probability_distributions(
+            self.priorities,
+            n_samples=n_samples,
+            sampler=self.sample_numeric_value,
+            feature_names=feature_names,
+            save_dir=save_dir,
+            show=show,
+        )
 
     def calculate_preference_score(self, sample):
         """
