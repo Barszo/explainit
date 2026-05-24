@@ -1439,31 +1439,13 @@ class MINLSearchExplainer:
     # Main function to find counterfactuals
     #################################################################
 
-    def find_counterfactuals(self, shap_approx=False, num_samples=200):
-        """
-        Find counterfactual explanations using Mixed-Integer Nonlinear Programming (MINLP) approach.
-        
-        This method uses Shapley values to understand feature importance and then searches for 
-        counterfactual examples that achieve the target prediction while minimizing the total 
-        cost (weight) based on the priority function.
-        
-        Args:
-            shap_approx: If True, uses sampling-based approximation for Shapley value calculation
-            num_samples: Number of samples for Shapley value approximation
-            
-        Returns:
-            list: List of counterfactual examples (modified feature vectors)
-        """
-        
-        logger.info("=" * 78)
-        logger.info("MINLP COUNTERFACTUAL SEARCH | target=%.4f | epsilon=%.4f | "
-                    "shap_approx=%s | num_samples=%d",
-                    float(self.target), float(self.epsilon),
-                    bool(shap_approx), int(num_samples))
-        logger.info("=" * 78)
+    def _stage1_find_exemplar(self):
+        """Locate the dataset row whose prediction is closest to ``target``.
 
-        ############
-        # 1. Finding the target exemplar in the desired target class
+        Sets ``self.sample_state.target_exemplar``. Runs once per
+        ``find_counterfactuals`` call; the exemplar is the fixed anchor
+        every refinement iteration linearises against.
+        """
         logger.info("--- STAGE 1/6: Locate target exemplar in dataset ---")
         logger.info("Goal: pick a real training point whose model prediction is closest "
                     "to the requested target (within target_exemplar_epsilon=%.4f). "
@@ -1474,49 +1456,54 @@ class MINLSearchExplainer:
                     float(self.model_pred([self.sample_state.target_exemplar])[0]),
                     float(self.target))
 
-        ############
-        # 2. Determining bounds for numerical features
+    def _stage2_log_bounds(self):
+        """Surface the numerical bounds used by both LP and SLSQP."""
         logger.info("--- STAGE 2/6: Collect numerical-feature bounds from priorities ---")
         logger.info("These (min, max) pairs constrain how far each numerical feature is "
                     "allowed to move during the LP and SLSQP searches.")
-        bounds = self.priorities_state.bounds
-        logger.info("Bounds for numerical features: %s", bounds)
+        logger.info("Bounds for numerical features: %s", self.priorities_state.bounds)
         logger.info("Non-actionable feature indices (frozen at sample values): %s",
                     self.priorities_state.non_actionable_indices)
 
-        ###########
-        # 3. Calculate SHAP values for the sample
+    def _run_one_pass(self, shap_approx, num_samples):
+        """Execute stages 3, 4 and 5 once for the current ``sample_state.sample``.
+
+        Returns the list of candidate counterfactuals (one per surviving
+        categorical combination). Stage 6 selection is delegated to
+        :meth:`_select_best_candidate` so the iterative loop in
+        :meth:`find_counterfactuals` can reuse both helpers cleanly.
+        """
+        # Stage 3: Shapley values for the (possibly updated) current sample.
         logger.info("--- STAGE 3/6: Compute Shapley values (sample vs. target exemplar) ---")
         logger.info("Shapley values quantify each feature's contribution to the gap "
                     "between the prediction on the sample and on the target exemplar. "
                     "Numerical features get one value each; one-hot categorical groups "
                     "are consolidated into a single value per group.")
-        self.calc_shapley(self.sample_state.sample, use_approximation=shap_approx, num_samples=num_samples)
+        self.calc_shapley(self.sample_state.sample,
+                          use_approximation=shap_approx,
+                          num_samples=num_samples)
         logger.info("Shapley values (numerical): %s",
                     self.sample_state.shapley_values.get('numerical'))
         logger.info("Shapley values (categorical groups): %s",
                     self.sample_state.shapley_values.get('categorical'))
 
-        ###########
-        # 4. Create initial values per categorical combination
+        # Stage 4: warm-start LP per surviving categorical combination.
         logger.info("--- STAGE 4/6: Build initial feasible solutions per categorical combo ---")
         logger.info("For each surviving categorical combination, solve a linear program "
                     "(in the Shapley-linearised model) to find numerical values that "
                     "land within +/- epsilon of the target. These become warm starts "
                     "for the nonlinear SLSQP optimisation in stage 5.")
         init_vals_per_combo = self.confirm_existence_of_solution_for_combo()
-        priorities_for_search = self.sample_state.limited_priorities
         logger.info("Initial values per combination: %s", init_vals_per_combo)
-        logger.info("Limited priorities used for search: %s", priorities_for_search)
+        logger.info("Limited priorities used for search: %s",
+                    self.sample_state.limited_priorities)
 
-
-        ############
-        # 5. For each categorical combination, perform MINLP to find counterfactuals
-        # If there are no categorical features, this loop will run only once
+        # Stage 5: SLSQP per combo. Wrappers and bounds match the original flow.
         logger.info("--- STAGE 5/6: SLSQP optimisation per categorical combination ---")
         logger.info("Minimise the priority cost subject to the Shapley-linear constraint "
                     "h(x) in [target-epsilon, target+epsilon]. One run per categorical "
                     "combination; without categorical features the loop runs once.")
+        bounds = self.priorities_state.bounds
         counterfactuals = []
         for i, values in init_vals_per_combo.items():
             logger.info("[combo %d/%d] Preparing input from initial LP solution and "
@@ -1535,7 +1522,7 @@ class MINLSearchExplainer:
                     ready_input[idx] = x[idx]
 
                 return self.constraint_function(ready_input, shap_dict, sample, target_exemplar, priorities_for_search, basic_prediction)
-            
+
             def objective_wrapper(x, priorities_for_search, ready_input):
                 for idx in self.sample_state.shapley_values['numerical'].keys():
                     ready_input[idx] = x[idx]
@@ -1552,13 +1539,11 @@ class MINLSearchExplainer:
             def upper_constraint(x):
                 return (self.target + self.epsilon) - constraint_fun(x)
 
-            # Constraint definition
             constraints = [
-                {'type': 'ineq', 'fun': lower_constraint},  # h(x) >= target - epsilon
-                {'type': 'ineq', 'fun': upper_constraint}   # h(x) <= target + epsilon
+                {'type': 'ineq', 'fun': lower_constraint},
+                {'type': 'ineq', 'fun': upper_constraint},
             ]
             x0 = np.array([prepared_input[idx] for idx in self.priorities_state.numerical_priorities.keys()])
-            # Convert bounds dictionary to list of tuples in the same order as x0
             bounds_list = [bounds[idx] for idx in self.priorities_state.numerical_priorities.keys()]
             logger.info("[combo %d/%d] Initial numerical x0=%s",
                         i + 1, len(init_vals_per_combo), x0)
@@ -1578,7 +1563,6 @@ class MINLSearchExplainer:
                 constraints=constraints,
             )
 
-            # The optimal solution is in result.x
             complete_solution = prepared_input.copy()
             for j, idx in enumerate(self.sample_state.shapley_values['numerical'].keys()):
                 complete_solution[idx] = result.x[j]
@@ -1597,15 +1581,21 @@ class MINLSearchExplainer:
                          result.x, getattr(result, "message", ""))
             logger.debug("-----")
 
-        # TODO: create a loop to check if found counterfactuals meet the criteria (within epsilon of target) and use found counterfactuals as new samples
+        return counterfactuals
 
-        ####################
-        # 6. Select the best counterfactual based on total weight
-        # if multiple found (only for cases with categorical features)
+    def _select_best_candidate(self, counterfactuals):
+        """Stage 6: pick the candidate with the lowest priority cost.
+
+        With no categorical features there is exactly one candidate so this
+        just returns it. Raises :class:`RuntimeError` if no candidates are
+        available so the iterative loop can mark the iteration as failed.
+        """
         logger.info("--- STAGE 6/6: Pick best counterfactual ---")
         logger.info("Among %d candidate(s), pick the one with the lowest priority "
                     "cost (calculate_total_weight). With no categorical features there "
                     "is exactly one candidate.", len(counterfactuals))
+        if not counterfactuals:
+            raise RuntimeError("No counterfactual candidates produced for selection.")
         if len(counterfactuals) > 1:
             best_counterfactual = None
             best_weight = float('inf')
@@ -1615,17 +1605,197 @@ class MINLSearchExplainer:
                 if weight < best_weight:
                     best_weight = weight
                     best_counterfactual = cf
-            counterfactual = best_counterfactual
             logger.info("Selected candidate weight=%.4f", best_weight)
-        else:
-            counterfactual = counterfactuals[0]
+            return best_counterfactual
+        return counterfactuals[0]
+
+    def _evaluate_candidate(self, cf):
+        """Score ``cf`` against the real model and the Shapley surrogate.
+
+        Returns a dict with:
+          * ``model_pred``: real model output on ``cf``.
+          * ``h_x``: surrogate prediction (Shapley-linear approximation).
+            Falls back to NaN if the surrogate cannot be evaluated yet.
+          * ``distance``: ``|model_pred - target|`` used as the iteration
+            improvement metric.
+        """
+        model_pred = float(self.model_pred([cf])[0])
+        try:
+            h_x = float(self.constraint_function(
+                cf,
+                self.sample_state.shapley_values,
+                self.sample_state.sample,
+                self.sample_state.target_exemplar,
+                self.sample_state.limited_priorities,
+                basic_prediction=self.basic_prediction,
+            ))
+        except Exception:
+            h_x = float("nan")
+        return {
+            "model_pred": model_pred,
+            "h_x": h_x,
+            "distance": abs(model_pred - float(self.target)),
+        }
+
+    def find_counterfactuals(self, shap_approx=False, num_samples=200,
+                             max_iterations=10, patience=5,
+                             return_when_fails=True):
+        """Find a counterfactual via iterative Shapley re-linearisation.
+
+        Stages 1 and 2 (locate target exemplar, gather bounds) run once.
+        Stages 3-6 (Shapley, LP warm starts, SLSQP, candidate selection)
+        run inside a refinement loop: after each pass we evaluate the
+        chosen candidate with the real model. While we are still outside
+        ``epsilon`` of ``target`` we advance the working sample to the
+        new candidate and re-linearise against the same exemplar.
+
+        The loop stops when:
+          * the real model prediction is within ``epsilon`` of ``target``, or
+          * ``max_iterations`` passes have been executed, or
+          * ``patience`` consecutive iterations have failed to beat the
+            best ``|model_pred(cf) - target|`` seen so far, or
+          * an internal pass raised an exception (e.g. infeasible LP).
+
+        Args:
+            shap_approx: If True, use Monte-Carlo Shapley estimation.
+            num_samples: Number of subsets used by the approximate
+                Shapley estimator.
+            max_iterations: Maximum number of refinement passes.
+            patience: Stop after this many consecutive iterations without
+                improving the best distance to target.
+            return_when_fails: If True (default) return the best candidate
+                found even when the target was never reached, with a
+                warning log and full status on
+                ``self.last_search_result``. If False, return ``None``
+                when the target was not reached.
+
+        Returns:
+            list | None: The selected counterfactual feature vector, or
+            ``None`` when the target was not reached and
+            ``return_when_fails`` is False.
+
+        Side effects:
+            Sets ``self.last_search_result`` with keys ``reached_target``,
+            ``distance``, ``iterations_run``, ``stop_reason``,
+            ``best_cf`` and ``history``.
+        """
         logger.info("=" * 78)
-        logger.info("MINLP COUNTERFACTUAL SEARCH DONE | model_pred(cf)=%.4f "
-                    "(target=%.4f, epsilon=%.4f)",
-                    float(self.model_pred([counterfactual])[0]),
-                    float(self.target), float(self.epsilon))
+        logger.info("MINLP COUNTERFACTUAL SEARCH | target=%.4f | epsilon=%.4f | "
+                    "max_iterations=%d | patience=%d | shap_approx=%s | "
+                    "num_samples=%d | return_when_fails=%s",
+                    float(self.target), float(self.epsilon),
+                    int(max_iterations), int(patience),
+                    bool(shap_approx), int(num_samples),
+                    bool(return_when_fails))
         logger.info("=" * 78)
-        return counterfactual
+
+        # Stages 1 and 2 are anchor stages: they only depend on the
+        # original sample/exemplar/priorities, so we run them exactly once.
+        self._stage1_find_exemplar()
+        self._stage2_log_bounds()
+
+        original_sample = list(self.sample_state.sample)
+        best_cf = None
+        best_distance = float("inf")
+        no_progress = 0
+        history = []
+        stop_reason = "max_iterations"
+
+        for iteration in range(int(max_iterations)):
+            logger.info("############ REFINEMENT ITERATION %d/%d ############",
+                        iteration + 1, int(max_iterations))
+            try:
+                candidates = self._run_one_pass(shap_approx, num_samples)
+                cf = self._select_best_candidate(candidates)
+            except Exception as exc:
+                logger.warning("Iteration %d failed during search pass: %s",
+                               iteration + 1, exc)
+                stop_reason = "search_failed"
+                break
+
+            eval_info = self._evaluate_candidate(cf)
+            improved = eval_info["distance"] < best_distance
+            best_so_far = (
+                f"{best_distance:.4f}" if best_distance != float("inf") else "n/a"
+            )
+            logger.info("[Iter %d] model_pred(cf)=%.4f | h(x)=%.4f | "
+                        "distance=%.4f | best_so_far=%s | improved_vs_best=%s",
+                        iteration + 1,
+                        eval_info["model_pred"], eval_info["h_x"],
+                        eval_info["distance"], best_so_far, improved)
+
+            if improved:
+                best_cf = list(cf)
+                best_distance = eval_info["distance"]
+                no_progress = 0
+                logger.info("[Iter %d] New best CF (distance=%.4f).",
+                            iteration + 1, best_distance)
+            else:
+                no_progress += 1
+                logger.info("[Iter %d] No improvement vs best (%d/%d).",
+                            iteration + 1, no_progress, int(patience))
+
+            history.append({
+                "iteration": iteration + 1,
+                "model_pred": eval_info["model_pred"],
+                "h_x": eval_info["h_x"],
+                "distance": eval_info["distance"],
+                "improved_vs_best": improved,
+            })
+
+            if eval_info["distance"] <= self.epsilon:
+                logger.info("[Iter %d] Target reached within epsilon=%.4f.",
+                            iteration + 1, float(self.epsilon))
+                stop_reason = "target_reached"
+                break
+
+            if no_progress >= int(patience):
+                logger.info("Stopping: %d consecutive iterations without improvement.",
+                            int(patience))
+                stop_reason = "patience_exhausted"
+                break
+
+            # Always advance to the latest CF, even when it did not improve;
+            # the next iteration re-linearises against the same exemplar.
+            self.sample_state.sample = list(cf)
+            logger.info("[Iter %d] Advancing: next iteration's sample = current CF.",
+                        iteration + 1)
+
+        # Restore the original sample so explainer state stays consistent
+        # for any caller that inspects sample_state after the search.
+        self.sample_state.sample = original_sample
+
+        reached = (stop_reason == "target_reached")
+        self.last_search_result = {
+            "reached_target": reached,
+            "distance": best_distance,
+            "iterations_run": len(history),
+            "stop_reason": stop_reason,
+            "best_cf": list(best_cf) if best_cf is not None else None,
+            "history": history,
+        }
+
+        logger.info("=" * 78)
+        logger.info("MINLP SEARCH DONE | reached_target=%s | stop_reason=%s | "
+                    "iterations=%d | best_distance=%.4f",
+                    reached, stop_reason, len(history),
+                    best_distance if best_distance != float("inf") else float("nan"))
+        logger.info("=" * 78)
+
+        if reached:
+            return best_cf
+        if return_when_fails:
+            if best_cf is None:
+                logger.warning("No candidate was produced; returning None despite "
+                               "return_when_fails=True.")
+                return None
+            logger.warning("Returning best CF although it did NOT reach target "
+                           "(distance=%.4f > epsilon=%.4f). See "
+                           "self.last_search_result for full status.",
+                           best_distance, float(self.epsilon))
+            return best_cf
+        logger.warning("Target not reached and return_when_fails=False; returning None.")
+        return None
 
     def find_counterfactuals_for_binary(self, target_class=1, threshold=0.5, 
                                        expected_counterfactuals=10, max_iterations=100,
@@ -1854,49 +2024,3 @@ class MINLSearchExplainer:
             save_dir=save_dir,
             show=show,
         )
-
-
-    # def _calculate_target_for_combination(self, combination_id, combo, cat_combinations, 
-    #                                     shap_dict, priorities_for_search, basic_prediction):
-    #     """Helper to calculate target value for a specific categorical combination."""
-    #     try:
-    #         cat_shap = shap_dict['categorical']
-    #         num_shap = shap_dict['numerical']
-            
-    #         # Calculate categorical contribution
-    #         result = 0.0
-    #         if combo:  # If there are categorical features
-    #             max_idx = max(combo.keys()) if combo else 0
-    #             dummy_x = np.zeros(max_idx + 1, dtype=float)
-                
-    #             for idx, val in combo.items():
-    #                 dummy_x[idx] = val
-                
-    #             for feature_indices in priorities_for_search['categorical'].keys():
-    #                 shap_value = cat_shap[feature_indices]
-    #                 current_values = tuple(float(dummy_x[idx]) for idx in feature_indices)
-    #                 sample_values = tuple(float(self.sample[idx]) for idx in feature_indices)
-    #                 target_exemplar_values = tuple(float(self.target_exemplar[idx]) for idx in feature_indices)
-                    
-    #                 if current_values == sample_values:
-    #                     result += 0.0
-    #                 elif current_values == target_exemplar_values:
-    #                     result += shap_value
-    #                 else:
-    #                     return None  # Invalid combination
-            
-    #         # Calculate coefficient times original
-    #         coef_times_original = 0.0
-    #         for key in priorities_for_search['numerical'].keys():
-    #             if key in num_shap:
-    #                 # Use pre-calculated coefficient from shap_coeffs instead of recalculating
-    #                 temp_unit_phi = self.sample_state.shap_coeffs[key]
-    #                 coef_times_original += temp_unit_phi * self.sample[key]
-            
-    #         # Return adjusted target
-    #         return self.target - result - basic_prediction + coef_times_original
-            
-    #     except Exception as e:
-    #         logger.warning(f"Error calculating target for combination {combination_id}: {e}")
-    #         return None
-
