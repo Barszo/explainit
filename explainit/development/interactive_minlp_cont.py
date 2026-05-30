@@ -53,8 +53,10 @@ Two ways to use this file:
 from __future__ import annotations
 
 import argparse
+from datetime import datetime
 import logging
 import pickle
+import re
 import ssl
 import sys
 import time
@@ -73,9 +75,11 @@ DEV_DIR = Path(__file__).resolve().parent
 DATA_CONT_DIR = DEV_DIR / "data_cont"
 MODELS_CONT_DIR = DEV_DIR / "models_cont"
 IMAGES_DIR = DEV_DIR / "images"
+LOGS_DIR = PROJECT_ROOT / "logs"
 DATA_CONT_DIR.mkdir(exist_ok=True)
 MODELS_CONT_DIR.mkdir(exist_ok=True)
 IMAGES_DIR.mkdir(exist_ok=True)
+LOGS_DIR.mkdir(exist_ok=True)
 
 import tensorflow as tf  # noqa: E402
 from sklearn.model_selection import train_test_split  # noqa: E402
@@ -97,6 +101,7 @@ from explainit.utils.dataset_analyzer import analyze_dataset  # noqa: E402
 
 
 logger = logging.getLogger("explainit.development.interactive_minlp_cont")
+workflow_logger = logging.getLogger("explainit.workflow")
 
 
 CONT_DATASETS = ("diabetes", "california_housing", "synthetic")
@@ -630,6 +635,8 @@ def run_minlp_cont_on_sample(
         dataset=X_train_np.copy(),
         target_exemplar_epsilon=float(target_exemplar_epsilon),
         epsilon=float(epsilon),
+        workflow_logger=workflow_logger,
+        feature_names=ctx.feature_names,
     )
 
     started = time.perf_counter()
@@ -740,13 +747,60 @@ def build_my_priorities(ctx: ContDevContext, sample: np.ndarray) -> Dict[str, An
     return pb.build()
 
 
+class _ExecutionFileFormatter(logging.Formatter):
+    _IMPORTANT_PATTERNS = (
+        re.compile(r"--- STAGE \d+/\d+:"),
+        re.compile(r"REFINEMENT ITERATION"),
+        re.compile(r"MINLP COUNTERFACTUAL SEARCH"),
+        re.compile(r"MINLP SEARCH DONE"),
+    )
+
+    def format(self, record: logging.LogRecord) -> str:
+        text = super().format(record)
+        message = record.getMessage()
+        if any(p.search(message) for p in self._IMPORTANT_PATTERNS):
+            return "\n\n" + text
+        return text
+
+
 def _configure_logging(verbose: bool) -> None:
+    for old_file in LOGS_DIR.glob("execution_logs_*.log"):
+        old_file.unlink(missing_ok=True)
+    for old_file in LOGS_DIR.glob("workflow_logs_*.log"):
+        old_file.unlink(missing_ok=True)
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    execution_log_path = LOGS_DIR / f"execution_logs_{timestamp}.log"
+    workflow_log_path = LOGS_DIR / f"workflow_logs_{timestamp}.log"
+
     logging.basicConfig(
         level=logging.DEBUG if verbose else logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
         force=True,
     )
+    execution_handler = logging.FileHandler(execution_log_path, mode="w", encoding="utf-8")
+    execution_handler.setLevel(logging.DEBUG if verbose else logging.INFO)
+    execution_handler.setFormatter(_ExecutionFileFormatter(
+        fmt="%(asctime)s %(levelname)s %(name)s %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    ))
+    logging.getLogger().addHandler(execution_handler)
+
+    workflow_logger.handlers.clear()
+    workflow_handler = logging.FileHandler(workflow_log_path, mode="w", encoding="utf-8")
+    workflow_handler.setLevel(logging.INFO)
+    workflow_handler.setFormatter(logging.Formatter(
+        fmt="%(asctime)s %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    ))
+    workflow_logger.addHandler(workflow_handler)
+    workflow_logger.setLevel(logging.INFO)
+    workflow_logger.propagate = False
+
+    logger.info("Execution logs file: %s", execution_log_path)
+    logger.info("Workflow logs file: %s", workflow_log_path)
+
     logging.getLogger("matplotlib").setLevel(logging.WARNING)
     logging.getLogger("tensorflow").setLevel(logging.WARNING)
 

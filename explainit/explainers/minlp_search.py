@@ -15,7 +15,7 @@ from scipy.optimize import linprog
 import warnings
 from dataclasses import dataclass, field
 import numpy as np
-from typing import Dict, Any
+from typing import Dict, Any, Optional, Sequence
 
 @dataclass
 class SampleState:
@@ -92,7 +92,9 @@ class MINLSearchExplainer:
                 target, 
                 dataset, 
                 target_exemplar_epsilon=0.01, 
-                epsilon=0.01):
+                epsilon=0.01,
+                workflow_logger=None,
+                feature_names: Optional[Sequence[str]] = None):
         self.sample_state = SampleState(
             sample = sample
         )
@@ -106,6 +108,52 @@ class MINLSearchExplainer:
         self.target = target
         self.dataset = dataset
         self.epsilon = epsilon
+        self.workflow_logger = workflow_logger
+        self.feature_names = list(feature_names) if feature_names is not None else None
+
+    def _workflow_log(self, message, *args):
+        if self.workflow_logger is not None:
+            self.workflow_logger.info(message, *args)
+
+    def _feature_label(self, idx: int) -> str:
+        if self.feature_names is not None and 0 <= idx < len(self.feature_names):
+            return str(self.feature_names[idx])
+        return f"feature_{idx}"
+
+    def _log_workflow_initial_and_bounds(self):
+        initial_prediction = float(self.model_pred([self.sample_state.sample])[0])
+        self._workflow_log("")
+        self._workflow_log("==== MINLP WORKFLOW SUMMARY ====")
+        self._workflow_log("1) Initial prediction: %.6f", initial_prediction)
+        self._workflow_log("2) Target: %.6f", float(self.target))
+        self._workflow_log("")
+        self._workflow_log("3) Bounds per feature vs dataset min/max:")
+
+        for idx in sorted(self.priorities_state.numerical_priorities.keys()):
+            dataset_min = float(np.min(self.dataset[:, idx]))
+            dataset_max = float(np.max(self.dataset[:, idx]))
+            bounds_min, bounds_max = self.priorities_state.bounds[idx]
+
+            allowed_min = dataset_min if bounds_min is None else float(bounds_min)
+            allowed_max = dataset_max if bounds_max is None else float(bounds_max)
+            dataset_span = dataset_max - dataset_min
+            allowed_span = allowed_max - allowed_min
+            coverage_pct = (
+                100.0
+                if abs(dataset_span) < 1e-12
+                else (allowed_span / dataset_span) * 100.0
+            )
+
+            self._workflow_log(
+                "   - %s (idx=%d): bounds=[%.6f, %.6f] | dataset=[%.6f, %.6f] | allowed space=%.2f%%",
+                self._feature_label(idx),
+                idx,
+                allowed_min,
+                allowed_max,
+                dataset_min,
+                dataset_max,
+                coverage_pct,
+            )
     
     ################################################################
     # Finds element in dataset which prediction is closest to target
@@ -1567,15 +1615,28 @@ class MINLSearchExplainer:
             for j, idx in enumerate(self.sample_state.shapley_values['numerical'].keys()):
                 complete_solution[idx] = result.x[j]
             counterfactuals.append(complete_solution)
+            model_prediction = float(self.model_pred([complete_solution])[0])
+            abs_gap = abs(model_prediction - float(self.target))
             logger.info("[combo %d/%d] SLSQP done: success=%s | iterations=%s | "
                         "model_pred(cf)=%.4f | constraint h(x)=%.4f | "
                         "objective(weight)=%.4f",
                         i + 1, len(init_vals_per_combo),
                         getattr(result, "success", None),
                         getattr(result, "nit", "?"),
-                        float(self.model_pred([complete_solution])[0]),
+                        model_prediction,
                         float(constraint_fun(result.x)),
                         float(-result.fun))
+            iter_no = getattr(self, "_workflow_iteration", None)
+            if iter_no is None:
+                self._workflow_log(
+                    "4) Proposition combo=%d: prediction=%.6f | target=%.6f | |gap|=%.6f",
+                    i + 1, model_prediction, float(self.target), abs_gap,
+                )
+            else:
+                self._workflow_log(
+                    "4) Iteration %d proposition combo=%d: prediction=%.6f | target=%.6f | |gap|=%.6f",
+                    int(iter_no), i + 1, model_prediction, float(self.target), abs_gap,
+                )
             logger.debug("[combo %d/%d] Optimal x=%s | message=%s",
                          i + 1, len(init_vals_per_combo),
                          result.x, getattr(result, "message", ""))
@@ -1693,6 +1754,7 @@ class MINLSearchExplainer:
         # original sample/exemplar/priorities, so we run them exactly once.
         self._stage1_find_exemplar()
         self._stage2_log_bounds()
+        self._log_workflow_initial_and_bounds()
 
         original_sample = list(self.sample_state.sample)
         best_cf = None
@@ -1704,6 +1766,7 @@ class MINLSearchExplainer:
         for iteration in range(int(max_iterations)):
             logger.info("############ REFINEMENT ITERATION %d/%d ############",
                         iteration + 1, int(max_iterations))
+            self._workflow_iteration = iteration + 1
             try:
                 candidates = self._run_one_pass(shap_approx, num_samples)
                 cf = self._select_best_candidate(candidates)
@@ -1764,6 +1827,7 @@ class MINLSearchExplainer:
         # Restore the original sample so explainer state stays consistent
         # for any caller that inspects sample_state after the search.
         self.sample_state.sample = original_sample
+        self._workflow_iteration = None
 
         reached = (stop_reason == "target_reached")
         self.last_search_result = {
