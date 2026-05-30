@@ -128,11 +128,15 @@ class MINLSearchExplainer:
         self._workflow_log("2) Target: %.6f", float(self.target))
         self._workflow_log("")
         self._workflow_log("3) Bounds per feature vs dataset min/max:")
+        n_rows = int(self.dataset.shape[0])
+        global_allowed_mask = np.ones(n_rows, dtype=bool)
 
         for idx in sorted(self.priorities_state.numerical_priorities.keys()):
             dataset_min = float(np.min(self.dataset[:, idx]))
             dataset_max = float(np.max(self.dataset[:, idx]))
+            cfg = self.priorities_state.numerical_priorities.get(idx, {})
             bounds_min, bounds_max = self.priorities_state.bounds[idx]
+            allowed_intervals = cfg.get("allowed_intervals") if isinstance(cfg, dict) else None
 
             allowed_min = dataset_min if bounds_min is None else float(bounds_min)
             allowed_max = dataset_max if bounds_max is None else float(bounds_max)
@@ -143,9 +147,21 @@ class MINLSearchExplainer:
                 if abs(dataset_span) < 1e-12
                 else (allowed_span / dataset_span) * 100.0
             )
+            if allowed_intervals:
+                feature_allowed_mask = np.array([
+                    self._in_allowed_intervals(float(v), allowed_intervals)
+                    for v in self.dataset[:, idx]
+                ], dtype=bool)
+            else:
+                feature_allowed_mask = np.logical_and(
+                    self.dataset[:, idx] >= allowed_min,
+                    self.dataset[:, idx] <= allowed_max,
+                )
+            feature_allowed_pct = 100.0 * float(np.sum(feature_allowed_mask)) / float(n_rows) if n_rows else 0.0
+            global_allowed_mask = np.logical_and(global_allowed_mask, feature_allowed_mask)
 
             self._workflow_log(
-                "   - %s (idx=%d): bounds=[%.6f, %.6f] | dataset=[%.6f, %.6f] | allowed space=%.2f%%",
+                "   - %s (idx=%d): bounds=[%.6f, %.6f] | dataset=[%.6f, %.6f] | allowed space=%.2f%% | allowed points=%.2f%%",
                 self._feature_label(idx),
                 idx,
                 allowed_min,
@@ -153,6 +169,122 @@ class MINLSearchExplainer:
                 dataset_min,
                 dataset_max,
                 coverage_pct,
+                feature_allowed_pct,
+            )
+        global_allowed_pct = 100.0 * float(np.sum(global_allowed_mask)) / float(n_rows) if n_rows else 0.0
+        self._workflow_log("")
+        self._workflow_log(
+            "Global allowed samples (all numerical-feature bounds simultaneously): %.2f%% (%d/%d)",
+            global_allowed_pct,
+            int(np.sum(global_allowed_mask)),
+            n_rows,
+        )
+
+    @staticmethod
+    def _in_allowed_intervals(value: float, intervals: list, tol: float = 1e-12) -> bool:
+        if not intervals:
+            return False
+        for lo, hi in intervals:
+            if (value >= lo - tol) and (value <= hi + tol):
+                return True
+        return False
+
+    @staticmethod
+    def _allowed_interval_constraint_value(value: float, intervals: list) -> float:
+        if not intervals:
+            return -1.0
+        return max(min(value - lo, hi - value) for lo, hi in intervals)
+
+    @staticmethod
+    def _project_to_allowed_intervals(value: float, intervals: list) -> float:
+        if not intervals:
+            return value
+        if MINLSearchExplainer._in_allowed_intervals(value, intervals):
+            return value
+        candidates = []
+        for lo, hi in intervals:
+            candidates.append(lo)
+            candidates.append(hi)
+        return float(min(candidates, key=lambda c: abs(c - value)))
+
+    @staticmethod
+    def _extract_positive_intervals(x_grid: np.ndarray, y_grid: np.ndarray, positive_eps: float = 1e-12) -> list:
+        mask = np.asarray(y_grid, dtype=float) > float(positive_eps)
+        intervals = []
+        i = 0
+        n = len(x_grid)
+        while i < n:
+            if not mask[i]:
+                i += 1
+                continue
+            start = i
+            while i + 1 < n and mask[i + 1]:
+                i += 1
+            end = i
+            intervals.append((float(x_grid[start]), float(x_grid[end])))
+            i += 1
+        return intervals
+
+    def _derive_bounds_and_intervals_from_priorities(self, grid_size: int = 2000):
+        logger.info("--- STAGE 0/6: Derive numerical bounds from priority functions ---")
+        logger.info("For each numerical feature, infer feasible ranges from where "
+                    "priority function > 0 over dataset support; this overrides user "
+                    "min/max and excludes internal zero-priority gaps.")
+
+        for idx, cfg in self.priorities_state.numerical_priorities.items():
+            if not isinstance(cfg, dict):
+                continue
+            fn = cfg.get("function")
+            dmin = float(np.min(self.dataset[:, idx]))
+            dmax = float(np.max(self.dataset[:, idx]))
+
+            # Non-actionable features remain fixed at their configured value.
+            if fn is None:
+                fixed_val = float(cfg.get("min", self.sample_state.sample[idx]))
+                cfg["min"] = fixed_val
+                cfg["max"] = fixed_val
+                cfg["allowed_intervals"] = [(fixed_val, fixed_val)]
+                continue
+
+            if abs(dmax - dmin) < 1e-12:
+                cfg["min"] = dmin
+                cfg["max"] = dmax
+                cfg["allowed_intervals"] = [(dmin, dmax)]
+                continue
+
+            x_grid = np.linspace(dmin, dmax, int(grid_size))
+            y_values = []
+            for x in x_grid:
+                try:
+                    y = float(fn(float(x)))
+                except Exception:
+                    y = 0.0
+                if not np.isfinite(y):
+                    y = 0.0
+                y_values.append(y)
+            y_grid = np.array(y_values, dtype=float)
+            y_grid[~np.isfinite(y_grid)] = 0.0
+
+            intervals = self._extract_positive_intervals(x_grid, y_grid, positive_eps=1e-12)
+            if not intervals:
+                raise ValueError(
+                    f"Feature {idx} has no positive-priority region on dataset range "
+                    f"[{dmin}, {dmax}]. Cannot derive feasible bounds."
+                )
+
+            derived_min = float(intervals[0][0])
+            derived_max = float(intervals[-1][1])
+            cfg["min"] = max(dmin, derived_min)
+            cfg["max"] = min(dmax, derived_max)
+            cfg["allowed_intervals"] = intervals
+
+            logger.info(
+                "[Stage 0] Feature %s (idx=%d): derived bounds=[%.6f, %.6f] "
+                "| dataset=[%.6f, %.6f] | allowed_intervals=%s",
+                self._feature_label(idx), idx,
+                float(cfg["min"]), float(cfg["max"]),
+                dmin, dmax,
+                intervals,
             )
     
     ################################################################
@@ -265,6 +397,16 @@ class MINLSearchExplainer:
                 data_np = data_np[data_np[:, idx] <= max_val]
             if data_np.size == 0:
                 raise Exception("There are no elements fulfilling the requirements")
+            cfg = self.priorities_state.numerical_priorities.get(idx, {})
+            allowed_intervals = cfg.get("allowed_intervals") if isinstance(cfg, dict) else None
+            if allowed_intervals:
+                in_interval_mask = np.array([
+                    self._in_allowed_intervals(float(v), allowed_intervals)
+                    for v in data_np[:, idx]
+                ], dtype=bool)
+                data_np = data_np[in_interval_mask]
+                if data_np.size == 0:
+                    raise Exception("There are no elements fulfilling the requirements")
         logger.info("[Stage 1.1b] After numerical bound filtering: %d rows remain.",
                     data_np.shape[0])
 
@@ -1450,6 +1592,12 @@ class MINLSearchExplainer:
                     
                     if current_value < min_val or current_value > max_val:
                         raise ValueError(f"Value {current_value} at index {feature_id} is outside allowed range [{min_val}, {max_val}]")
+                    allowed_intervals = feature_config.get('allowed_intervals')
+                    if allowed_intervals and not self._in_allowed_intervals(float(current_value), allowed_intervals):
+                        raise ValueError(
+                            f"Value {current_value} at index {feature_id} is in a zero-priority gap; "
+                            f"allowed intervals: {allowed_intervals}"
+                        )
                     
                     # Apply the weight function
                     weight = function(current_value)
@@ -1574,7 +1722,10 @@ class MINLSearchExplainer:
             def objective_wrapper(x, priorities_for_search, ready_input):
                 for idx in self.sample_state.shapley_values['numerical'].keys():
                     ready_input[idx] = x[idx]
-                return self.calculate_total_weight(ready_input)
+                try:
+                    return self.calculate_total_weight(ready_input)
+                except ValueError:
+                    return -1e12
 
             constraint_fun = lambda x: constraint_wrapper(x, self.sample_state.shapley_values, self.sample_state.sample, self.sample_state.target_exemplar, self.sample_state.limited_priorities, basic_prediction=self.basic_prediction, ready_input=prepared_input.copy())
             objective_fun = lambda x: -objective_wrapper(x, self.sample_state.limited_priorities, prepared_input.copy())
@@ -1591,8 +1742,21 @@ class MINLSearchExplainer:
                 {'type': 'ineq', 'fun': lower_constraint},
                 {'type': 'ineq', 'fun': upper_constraint},
             ]
-            x0 = np.array([prepared_input[idx] for idx in self.priorities_state.numerical_priorities.keys()])
-            bounds_list = [bounds[idx] for idx in self.priorities_state.numerical_priorities.keys()]
+            numerical_indices = list(self.priorities_state.numerical_priorities.keys())
+            x0 = np.array([prepared_input[idx] for idx in numerical_indices])
+            bounds_list = [bounds[idx] for idx in numerical_indices]
+            for j, feature_idx in enumerate(numerical_indices):
+                cfg = self.priorities_state.numerical_priorities.get(feature_idx, {})
+                allowed_intervals = cfg.get("allowed_intervals") if isinstance(cfg, dict) else None
+                if allowed_intervals:
+                    x0[j] = self._project_to_allowed_intervals(float(x0[j]), allowed_intervals)
+                    constraints.append({
+                        'type': 'ineq',
+                        'fun': (
+                            lambda x, _j=j, _intervals=allowed_intervals:
+                            self._allowed_interval_constraint_value(float(x[_j]), _intervals)
+                        ),
+                    })
             logger.info("[combo %d/%d] Initial numerical x0=%s",
                         i + 1, len(init_vals_per_combo), x0)
             logger.debug("[combo %d/%d] Constraints (bounded): h(x) in [%.4f, %.4f]",
@@ -1749,6 +1913,9 @@ class MINLSearchExplainer:
                     bool(shap_approx), int(num_samples),
                     bool(return_when_fails))
         logger.info("=" * 78)
+
+        # Stage 0: infer bounds directly from priority functions.
+        self._derive_bounds_and_intervals_from_priorities()
 
         # Stages 1 and 2 are anchor stages: they only depend on the
         # original sample/exemplar/priorities, so we run them exactly once.
@@ -1913,6 +2080,7 @@ class MINLSearchExplainer:
         self.epsilon = max(0.1, abs(self.target - threshold))
         
         logger.info(f"Set internal target to {self.target} with epsilon {self.epsilon}")
+        self._derive_bounds_and_intervals_from_priorities()
         
         # Run the standard MINLP pipeline
         try:
@@ -1988,7 +2156,10 @@ class MINLSearchExplainer:
                 for i, idx in enumerate(numerical_indices):
                     if i < len(x):
                         temp_input[idx] = x[i]
-                return self.calculate_total_weight(temp_input)
+                try:
+                    return self.calculate_total_weight(temp_input)
+                except ValueError:
+                    return -1e12
             
             # For binary classification, use direct model prediction instead of Shapley approximation
             def classification_constraint(x):
@@ -2008,6 +2179,18 @@ class MINLSearchExplainer:
             
             x0 = np.array([prepared_input[idx] for idx in numerical_indices])
             bounds_list = [bounds[idx] for idx in numerical_indices]
+            for j, feature_idx in enumerate(numerical_indices):
+                cfg = self.priorities_state.numerical_priorities.get(feature_idx, {})
+                allowed_intervals = cfg.get("allowed_intervals") if isinstance(cfg, dict) else None
+                if allowed_intervals:
+                    x0[j] = self._project_to_allowed_intervals(float(x0[j]), allowed_intervals)
+                    constraints.append({
+                        'type': 'ineq',
+                        'fun': (
+                            lambda x, _j=j, _intervals=allowed_intervals:
+                            self._allowed_interval_constraint_value(float(x[_j]), _intervals)
+                        ),
+                    })
             
             logger.info(f"Starting optimization for combination {combo_id}...")
             logger.debug(f"Initial values: {x0}")
