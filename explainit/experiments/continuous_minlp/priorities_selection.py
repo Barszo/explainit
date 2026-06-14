@@ -14,7 +14,7 @@ All outputs land under
 folder when multiple (sample, target) pairs are requested.
 
 Workflow: edit the ``USER_*`` constants near the top, run the file, look
-at the plots, tweak the priority builder in ``priority_sets.py``, run
+at the plots, tweak the priority set in ``priority_sets.py``, run
 again.
 """
 
@@ -33,10 +33,10 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from explainit.utils.priorities_analyser import analyse_priorities  # noqa: E402
-from explainit.experiments.continuos_minlp._context import load_context  # noqa: E402
-from explainit.experiments.continuos_minlp.priority_sets import (  # noqa: E402
+from explainit.experiments.continuous_minlp._context import load_context  # noqa: E402
+from explainit.experiments.continuous_minlp.priority_sets import (  # noqa: E402
     ExperimentContext,
-    get_priority_set,
+    build_priorities,
 )
 
 
@@ -75,11 +75,9 @@ def _analysis_dir_for(dataset_key: str, sample_idx: int, target_y: float) -> Pat
 def _build_priorities_for(
     ctx: ExperimentContext,
     sample: np.ndarray,
-    target_y: float,
     priority_set: str,
 ):
-    builder = get_priority_set(ctx.dataset_key, priority_set)
-    return builder(ctx, sample, float(target_y))
+    return build_priorities(ctx, priority_set, sample)
 
 
 def run_selection(
@@ -116,7 +114,7 @@ def run_selection(
                 ctx.dataset_key, int(sample_idx), float(target_y), priority_set,
             )
             priorities = _build_priorities_for(
-                ctx, sample, float(target_y), priority_set,
+                ctx, sample, priority_set,
             )
             if combined_priorities is None:
                 combined_priorities = priorities

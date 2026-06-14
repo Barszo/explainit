@@ -1,0 +1,417 @@
+# Continuous-target MINLP experiment
+
+This experiment runs `MINLSearchExplainer.find_counterfactuals` against
+regression models (continuous target). It is split into small,
+single-purpose stages so a dataset, model, or priority configuration can
+be iterated on without touching the rest of the pipeline.
+
+The `random_runner.py` script reproduces the same configuration with
+`RandomSearchExplainer` so MINLP results can be compared against a
+random-search baseline on identical priorities.
+
+## Directory layout
+
+```
+explainit/experiments/continuous_minlp/
+├── README.md                     <- this file
+├── __init__.py
+├── data_setup.py                 <- stage 1: dataset pickles
+├── model_setup.py                <- stage 2: trained Keras models
+├── priority_sets.py              <- stage 3: declarative priority sets (edit me)
+├── priorities_selection.py       <- stage 4: workbench for analyser plots
+├── minlp_test_config.yaml        <- stage 5: experiment configuration
+├── minlp_runner.py               <- stage 6: MINLP search runner
+├── random_runner.py              <- stage 7: random-search baseline runner
+│
+├── data/<dataset_key>/data.pkl
+├── models/<dataset_key>/model.keras
+├── analysis/<dataset_key>/<sample_idx>_<target>/{coverage.txt, dataset/, priorities/, analysis_summary.txt}
+└── results/<dataset_key>/<sample_idx>_<target>/{minlp.json, random.json}
+```
+
+## End-to-end flow
+
+### 1. Prepare datasets
+
+```bash
+python -m explainit.experiments.continuous_minlp.data_setup
+# or just one:
+python -m explainit.experiments.continuous_minlp.data_setup --datasets diabetes
+# overwrite existing pickles:
+python -m explainit.experiments.continuous_minlp.data_setup --force
+```
+
+If you prefer running by file path, this also works from the repo root:
+
+```bash
+python explainit/experiments/continuous_minlp/data_setup.py --force
+```
+
+Each dataset gets:
+
+* `X_train` / `X_test` where **numerical** columns are standard-scaled and
+  **categorical** columns are one-hot encoded (one column per category,
+  e.g. `sex` becomes `sex=0` / `sex=1`),
+* a MinMax-scaled `y_train` / `y_test` (target lives in `[0, 1]`),
+* the fitted `x_scaler` (numerical only) and `y_scaler` to invert
+  predictions later,
+* `numerical_features` and `categorical_groups` metadata (column indices,
+  category codes, source values) used by the priority builder,
+* persisted to `data/<dataset_key>/data.pkl`.
+
+Add a new dataset by registering a loader in `DATASETS` inside
+`data_setup.py`.
+
+#### Declaring categorical features
+
+By default every column is treated as numerical. To make a feature
+categorical (one-hot encoded, never scaled), add it to
+`CATEGORICAL_FEATURES` in `data_setup.py`:
+
+```python
+CATEGORICAL_FEATURES = {
+    "diabetes": ["sex"],   # 'sex' is one-hot encoded, the rest stay numerical
+}
+```
+
+After changing this registry (or any priority set that touches
+categoricals) you **must regenerate** the data and model, because the
+feature layout changes:
+
+```bash
+python -m explainit.experiments.continuous_minlp.data_setup  --datasets diabetes --force
+python -m explainit.experiments.continuous_minlp.model_setup --datasets diabetes --force
+```
+
+### 2. Train models
+
+```bash
+python -m explainit.experiments.continuous_minlp.model_setup
+python -m explainit.experiments.continuous_minlp.model_setup --datasets diabetes --epochs 80
+python -m explainit.experiments.continuous_minlp.model_setup --force
+```
+
+Models land at `models/<dataset_key>/model.keras`. The default
+architecture is a two-layer MLP; add a custom builder by registering it
+in `MODEL_BUILDERS` inside `model_setup.py`.
+
+### 3. Author priorities
+
+`priority_sets.py` is where you declare **how desirable** each feature
+value is when searching for a counterfactual. You do **not** write any
+search logic -- you only describe, per feature, either a *priority
+function* (numerical features) or a *weights mapping* (categorical
+features).
+
+#### The structure
+
+`PRIORITY_SETS` is a nested dictionary:
+
+```
+dataset name  ->  set name  ->  "numerical"   ->  feature name  ->  function
+                                "categorical" ->  feature name  ->  {code: weight}
+```
+
+Features are keyed by their **logical** name (`sex`), not by the one-hot
+column names (`sex=0`, `sex=1`) -- the builder expands them for you.
+
+For example:
+
+```python
+PRIORITY_SETS = {
+    "diabetes": {                 # dataset key (matches data_setup.py)
+        "default": {              # set name (referenced by the config/CLI)
+            "numerical": {
+                "bmi": linear_priority(x0=2.0, x1=-2.0, increasing=False),
+                "age": constant_priority(0.5),
+                # ... one entry per remaining numerical feature ...
+            },
+            "categorical": {
+                "sex": {0: 1.0, 1: 0.5},   # code 0 preferred over code 1
+            },
+        },
+    },
+}
+```
+
+To add another configuration for the same dataset, add a sibling set:
+
+```python
+"diabetes": {
+    "default": { ... },
+    "aggressive": { "numerical": { ... }, "categorical": { ... } },
+}
+```
+
+#### Numerical features: a function `value -> [0, 1]`
+
+A numerical priority is any function that takes a feature value and
+returns a preference in `[0, 1]` (`1.0` = most preferred, `0.0` =
+unacceptable). Ready-made helpers cover the common shapes:
+
+```python
+from explainit.experiments.continuous_minlp.priority_sets import (
+    linear_priority, exponential_priority, constant_priority,
+    interval_priority, numerical_entry, NON_ACTIONABLE,
+)
+
+# Ramp: 0 below x0, rising to 1 at x1 (then stays 1).
+linear_priority(x0=10, x1=50, increasing=True)
+
+# Decreasing ramp: 1 below x0, falling to 0 at x1.
+linear_priority(x0=10, x1=50, increasing=False)
+
+# Same idea but with a steeper exponential transition.
+exponential_priority(x0=10, x1=50, increasing=True, a=5.0)
+
+# Flat preference everywhere (no opinion, free to move).
+constant_priority(0.5)
+
+# Box: weight inside [low, high], 0 outside ("only this band is acceptable").
+interval_priority(low=10, high=50, weight=1.0)
+```
+
+You can also write your own. Anything callable works, e.g. a lambda that
+"increases from 0 at 10 to 1 at 50 and is 0 elsewhere":
+
+```python
+"some_feature": lambda v: 1.0 if 10 <= v <= 50 else 0.0,
+```
+
+> Note: diabetes features are standard-scaled, so their values sit roughly
+> in `[-3, 3]` rather than raw units like "age in years". Look at
+> `coverage.txt` / the dataset plots (stage 4) to choose sensible numbers.
+
+#### Search bounds (min / max)
+
+Each numerical feature is searched within `[min, max]`. By default these
+come from the dataset column min/max, so you usually do **not** set them.
+To override, wrap the function with `numerical_entry`:
+
+```python
+"bmi": numerical_entry(
+    linear_priority(x0=2.0, x1=-2.0, increasing=False),
+    min_val=-1.0,            # optional lower bound
+    max_val=1.5,             # optional upper bound
+    use_dataset_bounds=True, # default
+),
+```
+
+* With `use_dataset_bounds=True` (default), the dataset min/max take
+  priority on conflict: the final bounds are the *intersection* of your
+  bounds and the dataset range (e.g. if the dataset min is higher than
+  your `min_val`, the dataset min wins).
+* Set `use_dataset_bounds=False` to use your `min_val`/`max_val` verbatim.
+* Independently of bounds, **a value where the function returns 0 is
+  rejected** -- so `interval_priority` / a function that drops to 0 is the
+  way to carve out forbidden ranges inside the bounds.
+
+#### Categorical features: a `{code: weight}` mapping
+
+A categorical feature must first be declared in
+`CATEGORICAL_FEATURES` (see section 1) so `data_setup.py` one-hot encodes
+it. In the priority set, list **every** category code and its relative
+weight (`0` = forbidden, higher = more preferred):
+
+```python
+"categorical": {
+    "profession": {0: 0.0, 1: 0.5, 2: 1.0},   # unemployed / teacher / accountant
+},
+```
+
+The codes are the original (pre-one-hot) integer values. The builder
+expands them into one-hot states and the search keeps **exactly one**
+category active at a time (it never produces e.g. `sex=0` and `sex=1`
+both set). The diabetes `default` set uses this for `sex`:
+
+```python
+"categorical": {
+    "sex": {0: 1.0, 1: 0.5},   # both allowed; code 0 preferred
+},
+```
+
+You must list all codes; a missing or unknown code raises a clear error.
+To forbid a category entirely, give it weight `0`.
+
+#### Non-actionable features (leave a feature unchanged)
+
+**Every feature in the dataset must appear exactly once** in the set
+(under `numerical` or `categorical`). If one is missing you get a clear
+error naming it. To declare that a feature must keep its original value
+(the search may not change it), set it to `NON_ACTIONABLE`:
+
+```python
+"numerical": {
+    "age": NON_ACTIONABLE,   # fixed at the sample's value
+    ...
+}
+```
+
+(Equivalently, `numerical_entry(None)` marks it non-actionable too.) For a
+categorical feature, the equivalent of "leave it unchanged" is to give
+every other code weight `0`, or simply rely on the search keeping the
+sample's category when it has no incentive to switch.
+
+### 4. Inspect priorities + dataset
+
+After editing `priority_sets.py`, run `priorities_selection.py` to see
+what your new priorities imply before running expensive MINLP search.
+
+You can configure this script in two ways:
+
+* **Option 1 (edit defaults in file):** open `priorities_selection.py`
+  and change:
+
+```python
+USER_DATASET = "diabetes"
+USER_PRIORITY_SET = "default"
+USER_SAMPLE_INDICES = (0, 5)
+USER_TARGETS_SCALED = (0.25, 0.75)
+```
+
+* **Option 2 (leave file unchanged, override from CLI):**
+
+```bash
+python -m explainit.experiments.continuous_minlp.priorities_selection \
+    --dataset diabetes --priority-set default \
+    --sample 0 --sample 5 --target 0.25 --target 0.75
+```
+
+You can combine both (set general defaults in file, override specific
+samples/targets from CLI while experimenting).
+
+#### Practical run examples
+
+Run one `(sample, target)` pair:
+
+```bash
+python -m explainit.experiments.continuous_minlp.priorities_selection \
+    --dataset diabetes --priority-set linear_v1 \
+    --sample 3 --target 0.6
+```
+
+Compare two samples at one target:
+
+```bash
+python -m explainit.experiments.continuous_minlp.priorities_selection \
+    --dataset diabetes --priority-set linear_v1 \
+    --sample 3 --sample 15 --target 0.6
+```
+
+Compare one sample against two targets:
+
+```bash
+python -m explainit.experiments.continuous_minlp.priorities_selection \
+    --dataset diabetes --priority-set linear_v1 \
+    --sample 3 --target 0.3 --target 0.8
+```
+
+Outputs land under
+`analysis/<dataset_key>/<sample_idx>_<target>/`:
+
+* `coverage.txt` — the same per-feature bounds table the MINLP workflow
+  log emits (bounds, dataset min/max, allowed space %, allowed points %).
+* `dataset/` — feature/target distribution plots (delegated to
+  `explainit.utils.dataset_analyzer.analyze_dataset`).
+* `priorities/` — priority surface plots (delegated to
+  `explainit.utils.priority_plots.plot_priorities`).
+* `analysis_summary.txt` — coverage + closest-exemplar summary.
+
+When multiple `(sample, target)` pairs are configured, an extra folder
+`analysis/<dataset_key>/combined/` shows all of them overlaid on the same
+priority plots (samples and exemplars share a colour and are linked by a
+translucent connector).
+
+How to interpret outputs quickly:
+
+* `coverage.txt`: check if bounds are too tight/too loose (look at
+  allowed space % and allowed points %).
+* `priorities/` plots: verify the preference shape matches your intent
+  (monotonic up/down, flat, steepness).
+* `analysis_summary.txt`: inspect which exemplar was chosen for each
+  target and whether it makes sense.
+
+Recommended iteration loop:
+
+1. Edit the priority set in `priority_sets.py`.
+2. Run `priorities_selection.py` for a small set of pairs.
+3. Check `coverage.txt` + plots.
+4. Repeat until priorities look right.
+5. Only then run `minlp_runner.py`.
+
+### 5. Configure the experiment
+
+Edit `minlp_test_config.yaml`. The top-level structure is:
+
+```yaml
+defaults:
+  epsilon: 0.05
+  ...
+
+experiments:
+  - dataset: diabetes
+    priority_set: default
+    samples: [0, 5, 12]
+    targets: [0.25, 0.75]
+    n_counterfactuals: 1
+```
+
+Each experiment runs every cartesian `(sample, target)` pair. Per-entry
+keys override the `defaults` block.
+
+### 6. Run MINLP search
+
+```bash
+python -m explainit.experiments.continuous_minlp.minlp_runner
+python -m explainit.experiments.continuous_minlp.minlp_runner --config minlp_test_config.yaml
+python -m explainit.experiments.continuous_minlp.minlp_runner --dataset diabetes
+```
+
+Each pair produces `results/<dataset_key>/<sample_idx>_<target>/minlp.json`
+with the headline metrics (validity, iterations, time) plus the resulting
+counterfactual vector and the full per-iteration history.
+
+### 7. Run random-search baseline
+
+```bash
+python -m explainit.experiments.continuous_minlp.random_runner
+```
+
+Writes `results/<dataset_key>/<sample_idx>_<target>/random.json` next to
+the MINLP result, so the two files can be diffed directly.
+
+## Persisted metrics (today)
+
+Each result JSON includes (at minimum):
+
+* `dataset`, `priority_set`, `sample_index`, `target_scaled`, `epsilon`
+* `original_prediction`, `counterfactual`, `counterfactual_prediction`
+* `validity` — `True` when the counterfactual lies within `epsilon` of
+  the target
+* `iterations` — refinement iterations (MINLP) or iteration index when
+  the best CF was found (random search)
+* `time_seconds`
+* MINLP-only: `reached_target`, `stop_reason`, `history`
+* Random-only: `iterations_per_cf`, `n_counterfactuals_found`,
+  `preference_score`
+
+More metrics can be added later without breaking the existing JSON keys.
+
+## Adding a new dataset (recipe)
+
+1. Add a raw loader to `data_setup.py` and register it in `DATASETS`
+   (and `TARGET_NAMES` if you want a friendly target label).
+2. If the dataset has categorical features, list them in
+   `CATEGORICAL_FEATURES` in `data_setup.py` so they are one-hot encoded
+   (and excluded from scaling).
+3. Optionally register a custom model builder in `model_setup.py`
+   (`MODEL_BUILDERS`); otherwise the default MLP is used.
+4. Add a priority set under `PRIORITY_SETS[<dataset_key>]["default"]` in
+   `priority_sets.py` (one entry per logical feature: a
+   function/`NON_ACTIONABLE` under `numerical`, or a `{code: weight}`
+   mapping under `categorical`).
+5. Add an entry to `experiments:` in `minlp_test_config.yaml`.
+6. `data_setup` → `model_setup` → `priorities_selection` →
+   `minlp_runner` → `random_runner`. Re-run `data_setup --force` and
+   `model_setup --force` whenever you change `CATEGORICAL_FEATURES` (the
+   feature layout changes).

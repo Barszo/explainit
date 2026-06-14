@@ -1,21 +1,21 @@
-"""Stage 7: run random search as a baseline using the same priority sets.
+"""Stage 6: run MINLP search using the registered priority sets.
 
 Reads ``minlp_test_config.yaml`` and, for each (experiment * sample *
-target) combination, invokes ``RandomSearchExplainer.generate_random_samples``
-with the priority builder selected from ``priority_sets.py``.
+target) combination, invokes ``MINLSearchExplainer.find_counterfactuals``
+with the priority set selected from ``priority_sets.py``.
+
+The metrics persisted per pair (one JSON file each) are intentionally
+small for now -- validity, time, iterations -- and structured so more
+metrics can be appended later without breaking consumers.
 
 Output paths::
 
-    results/<dataset_key>/<sample_idx>_<target>/random.json
-
-The persisted metrics mirror ``minlp.json``: validity, time, iterations.
-``iterations`` is the iteration count at which the best counterfactual
-was found; the full per-CF iteration list is also recorded so finer
-post-hoc analysis stays possible.
+    results/<dataset_key>/<sample_idx>_<target>/minlp.json
 
 CLI usage::
 
-    python -m explainit.experiments.continuos_minlp.random_runner
+    python -m explainit.experiments.continuos_minlp.minlp_runner
+    python -m explainit.experiments.continuos_minlp.minlp_runner --config minlp_test_config.yaml
 """
 
 from __future__ import annotations
@@ -35,12 +35,12 @@ PROJECT_ROOT = Path(__file__).resolve().parents[3]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from explainit.explainers.random_search import RandomSearchExplainer  # noqa: E402
+from explainit.explainers.minlp_search import MINLSearchExplainer  # noqa: E402
 
-from explainit.experiments.continuos_minlp._context import load_context  # noqa: E402
-from explainit.experiments.continuos_minlp.priority_sets import (  # noqa: E402
+from explainit.experiments.continuous_minlp._context import load_context  # noqa: E402
+from explainit.experiments.continuous_minlp.priority_sets import (  # noqa: E402
     ExperimentContext,
-    get_priority_set,
+    build_priorities,
 )
 
 
@@ -48,16 +48,27 @@ EXPERIMENT_DIR = Path(__file__).resolve().parent
 RESULTS_DIR = EXPERIMENT_DIR / "results"
 DEFAULT_CONFIG = EXPERIMENT_DIR / "minlp_test_config.yaml"
 
-logger = logging.getLogger("explainit.experiments.continuos_minlp.random_runner")
+logger = logging.getLogger("explainit.experiments.continuos_minlp.minlp_runner")
+workflow_logger = logging.getLogger("explainit.workflow")
 
 
-def _model_predict_fn(model):
-    def _predict(X):
-        arr = np.asarray(X, dtype=float)
-        if arr.ndim == 1:
-            arr = arr.reshape(1, -1)
-        return model.predict(arr, verbose=0).flatten()
-    return _predict
+# ---------------------------------------------------------------------------
+# Config handling
+# ---------------------------------------------------------------------------
+
+
+def _load_config(path: Path) -> Dict[str, Any]:
+    if not path.exists():
+        raise FileNotFoundError(f"Config file not found: {path}")
+    with open(path, "r") as handle:
+        cfg = yaml.safe_load(handle) or {}
+    return cfg
+
+
+def _merge_defaults(experiment: Dict[str, Any], defaults: Dict[str, Any]) -> Dict[str, Any]:
+    merged: Dict[str, Any] = dict(defaults)
+    merged.update(experiment)
+    return merged
 
 
 def _format_target(value: float) -> str:
@@ -70,20 +81,21 @@ def _result_path(dataset_key: str, sample_idx: int, target_y: float, filename: s
     return RESULTS_DIR / dataset_key / sub / filename
 
 
-def _load_config(path: Path) -> Dict[str, Any]:
-    if not path.exists():
-        raise FileNotFoundError(f"Config file not found: {path}")
-    with open(path, "r") as handle:
-        return yaml.safe_load(handle) or {}
+# ---------------------------------------------------------------------------
+# Single (sample, target) run
+# ---------------------------------------------------------------------------
 
 
-def _merge_defaults(experiment: Dict[str, Any], defaults: Dict[str, Any]) -> Dict[str, Any]:
-    merged = dict(defaults)
-    merged.update(experiment)
-    return merged
+def _model_predict_fn(model):
+    def _predict(X):
+        arr = np.asarray(X, dtype=float)
+        if arr.ndim == 1:
+            arr = arr.reshape(1, -1)
+        return model.predict(arr, verbose=0).flatten()
+    return _predict
 
 
-def run_random_pair(
+def run_minlp_pair(
     ctx: ExperimentContext,
     sample_idx: int,
     target_y: float,
@@ -91,52 +103,58 @@ def run_random_pair(
     settings: Dict[str, Any],
 ) -> Dict[str, Any]:
     sample = ctx.X_test[int(sample_idx)].astype(float)
-    builder = get_priority_set(ctx.dataset_key, priority_set)
-    priorities = builder(ctx, sample, float(target_y))
+    priorities = build_priorities(ctx, priority_set, sample)
 
     original_pred = float(_model_predict_fn(ctx.model)(sample.reshape(1, -1))[0])
 
-    explainer = RandomSearchExplainer(
+    explainer = MINLSearchExplainer(
         model_pred=_model_predict_fn(ctx.model),
         priorities=priorities,
         sample=sample.tolist(),
         target=float(target_y),
+        dataset=ctx.X_train.copy(),
+        target_exemplar_epsilon=float(settings.get("target_exemplar_epsilon", 0.10)),
+        epsilon=float(settings.get("epsilon", 0.05)),
+        workflow_logger=workflow_logger,
+        feature_names=ctx.feature_names,
     )
 
     started = time.perf_counter()
+    cf: Optional[np.ndarray] = None
     error: Optional[str] = None
-    samples_out: List[np.ndarray] = []
-    preds_out: List[float] = []
-    scores_out: List[float] = []
-    iters_out: List[int] = []
     try:
-        samples_out, preds_out, scores_out, iters_out = (
-            explainer.generate_random_samples(
-                expected_counterfactuals=int(settings.get("n_counterfactuals", 1)),
-                max_iterations=int(settings.get("random_max_iterations", 10000)),
-                epsilon=float(settings.get("epsilon", 0.05)),
-                random_seed=settings.get("random_seed", None),
-                use_monte_carlo=bool(settings.get("use_monte_carlo", True)),
-            )
+        cf_raw = explainer.find_counterfactuals(
+            shap_approx=bool(settings.get("shap_approx", True)),
+            num_samples=int(settings.get("shap_num_samples", 200)),
+            max_iterations=int(settings.get("max_iterations", 10)),
+            patience=int(settings.get("patience", 5)),
         )
+        if cf_raw is not None:
+            cf = np.asarray(cf_raw, dtype=float).flatten()
     except Exception as exc:
-        logger.exception(
-            "Random search failed for sample=%d target=%.4f: %s",
-            int(sample_idx), float(target_y), exc,
-        )
+        logger.exception("MINLP search failed for sample=%d target=%.4f: %s",
+                         int(sample_idx), float(target_y), exc)
         error = str(exc)
     elapsed = time.perf_counter() - started
 
-    best_cf = (
-        np.asarray(samples_out[0], dtype=float).flatten().tolist()
-        if samples_out else None
-    )
-    best_pred = float(preds_out[0]) if preds_out else None
-    best_iter = int(iters_out[0]) if iters_out else 0
+    reached = False
+    cf_pred: Optional[float] = None
+    history: List[Dict[str, Any]] = []
+    iterations_run = 0
+    stop_reason = "unknown"
+
+    last = getattr(explainer, "last_search_result", None) or {}
+    reached = bool(last.get("reached_target", False))
+    iterations_run = int(last.get("iterations_run", 0))
+    stop_reason = str(last.get("stop_reason", "unknown"))
+    history = list(last.get("history", []))
+
+    if cf is not None:
+        cf_pred = float(_model_predict_fn(ctx.model)(cf.reshape(1, -1))[0])
 
     validity = bool(
-        best_pred is not None
-        and abs(best_pred - float(target_y)) <= float(settings.get("epsilon", 0.05))
+        cf_pred is not None
+        and abs(cf_pred - float(target_y)) <= float(settings.get("epsilon", 0.05))
     )
 
     return {
@@ -146,14 +164,15 @@ def run_random_pair(
         "target_scaled": float(target_y),
         "epsilon": float(settings.get("epsilon", 0.05)),
         "original_prediction": original_pred,
-        "counterfactual": best_cf,
-        "counterfactual_prediction": best_pred,
-        "preference_score": float(scores_out[0]) if scores_out else None,
-        "validity": validity,
-        "iterations": best_iter,
-        "iterations_per_cf": [int(v) for v in iters_out],
-        "n_counterfactuals_found": len(samples_out),
+        "counterfactual": cf.tolist() if cf is not None else None,
+        "counterfactual_prediction": cf_pred,
+        "validity": bool(validity and reached),
+        "validity_within_epsilon": validity,
+        "reached_target": reached,
+        "stop_reason": stop_reason,
+        "iterations": iterations_run,
         "time_seconds": float(elapsed),
+        "history": history,
         "error": error,
     }
 
@@ -181,11 +200,11 @@ def run_experiment(
             logger.warning("Sample index %s out of range; skipping.", sample_idx)
             continue
         for target_y in targets:
-            result = run_random_pair(
+            result = run_minlp_pair(
                 ctx, int(sample_idx), float(target_y), priority_set, settings,
             )
             path = _result_path(
-                ctx.dataset_key, int(sample_idx), float(target_y), "random.json",
+                ctx.dataset_key, int(sample_idx), float(target_y), "minlp.json",
             )
             path.parent.mkdir(parents=True, exist_ok=True)
             with open(path, "w") as handle:
@@ -198,6 +217,11 @@ def run_experiment(
                 path,
             )
     return written
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
 
 
 def _configure_logging(verbose: bool) -> None:
@@ -243,7 +267,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         except Exception as exc:
             logger.error("Experiment failed (%s): %s", exp.get("dataset"), exc)
 
-    logger.info("Random runner done. Wrote %d result file(s).", total)
+    logger.info("MINLP runner done. Wrote %d result file(s).", total)
 
 
 if __name__ == "__main__":

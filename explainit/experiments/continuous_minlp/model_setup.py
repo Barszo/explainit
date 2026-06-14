@@ -30,7 +30,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 import tensorflow as tf  # noqa: E402
 
-from explainit.experiments.continuos_minlp.data_setup import (  # noqa: E402
+from explainit.experiments.continuous_minlp.data_setup import (  # noqa: E402
     DATASETS,
     load_dataset,
 )

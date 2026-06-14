@@ -17,14 +17,14 @@ PROJECT_ROOT = Path(__file__).resolve().parents[3]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from explainit.experiments.continuos_minlp.data_setup import (  # noqa: E402
+from explainit.experiments.continuous_minlp.data_setup import (  # noqa: E402
     load_dataset,
     TARGET_NAMES,
 )
-from explainit.experiments.continuos_minlp.model_setup import (  # noqa: E402
+from explainit.experiments.continuous_minlp.model_setup import (  # noqa: E402
     load_model,
 )
-from explainit.experiments.continuos_minlp.priority_sets import (  # noqa: E402
+from explainit.experiments.continuous_minlp.priority_sets import (  # noqa: E402
     ExperimentContext,
 )
 
@@ -45,6 +45,8 @@ def load_context(dataset_key: str) -> ExperimentContext:
     y_test = np.asarray(data["y_test"], dtype=float).flatten()
     feature_names = [str(n) for n in data["feature_names"]]
     target_name = str(data.get("target_name", TARGET_NAMES.get(dataset_key, "target")))
+    numerical_features = [str(n) for n in data.get("numerical_features", [])]
+    categorical_groups = dict(data.get("categorical_groups", {}) or {})
     return ExperimentContext(
         dataset_key=dataset_key,
         model=model,
@@ -54,6 +56,8 @@ def load_context(dataset_key: str) -> ExperimentContext:
         y_train=y_train,
         y_test=y_test,
         target_name=target_name,
+        numerical_features=numerical_features,
+        categorical_groups=categorical_groups,
     )
 
 
