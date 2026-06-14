@@ -74,6 +74,62 @@ _SAMPLE_COLOR = "#FF6B35"
 _EXEMPLAR_COLOR = COLORS["moss_green"]
 
 
+_PAIR_PALETTE: Tuple[str, ...] = (
+    "#FF6B35",
+    "#FFD166",
+    "#06D6A0",
+    "#118AB2",
+    "#9D4EDD",
+    "#EF476F",
+    "#26C485",
+    "#F4A261",
+)
+
+
+def _pair_color(i: int) -> str:
+    return _PAIR_PALETTE[i % len(_PAIR_PALETTE)]
+
+
+def _to_vector_list(
+    vectors: Optional[Any],
+) -> Optional[List[np.ndarray]]:
+    """Normalise input to ``None`` or a list of 1D vectors."""
+
+    if vectors is None:
+        return None
+    arr = np.asarray(vectors, dtype=float)
+    if arr.ndim == 0:
+        return None
+    if arr.ndim == 1:
+        return [arr]
+    if arr.ndim == 2:
+        return [arr[i] for i in range(arr.shape[0])]
+    raise ValueError(
+        f"Expected None, 1D vector or 2D array; got ndim={arr.ndim}"
+    )
+
+
+def _to_value_list(
+    values: Optional[Any], n_expected: int
+) -> Optional[List[Optional[float]]]:
+    if values is None:
+        return None
+    if isinstance(values, (int, float, np.integer, np.floating)):
+        return [float(values)] * max(n_expected, 1)
+    seq = list(values)
+    out: List[Optional[float]] = []
+    for i in range(max(n_expected, len(seq))):
+        if i >= len(seq) or seq[i] is None:
+            out.append(None)
+            continue
+        try:
+            f = float(seq[i])
+            out.append(f if math.isfinite(f) else None)
+        except (TypeError, ValueError):
+            out.append(None)
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Dataclasses describing the analysis
 # ---------------------------------------------------------------------------
@@ -470,8 +526,8 @@ def _plot_continuous(
     xlabel: str,
     ylabel: str,
     out_path: Path,
-    sample_value: Optional[float] = None,
-    exemplar_value: Optional[float] = None,
+    sample_values: Optional[Sequence[Optional[float]]] = None,
+    exemplar_values: Optional[Sequence[Optional[float]]] = None,
 ) -> Path:
     apply_style()
     fig, ax = plt.subplots(figsize=(10, 6))
@@ -487,18 +543,39 @@ def _plot_continuous(
         finite, bins=n_bins, color=get_bar_color(0),
         edgecolor=COLORS["dirty_white"], alpha=0.85,
     )
-    if sample_value is not None and np.isfinite(sample_value):
-        ax.axvline(sample_value, color=_SAMPLE_COLOR, linewidth=3.0,
-                   linestyle="--",
-                   label=f"Sample ({sample_value:.3g})")
-    if exemplar_value is not None and np.isfinite(exemplar_value):
-        ax.axvline(exemplar_value, color=_EXEMPLAR_COLOR, linewidth=3.0,
-                   linestyle=":",
-                   label=f"Exemplar ({exemplar_value:.3g})")
+
+    sample_values = list(sample_values) if sample_values is not None else []
+    exemplar_values = list(exemplar_values) if exemplar_values is not None else []
+    n_pairs = max(len(sample_values), len(exemplar_values))
+    multi = n_pairs > 1
+
+    def _label(prefix: str, i: int, value: float) -> str:
+        if multi:
+            return f"{prefix} #{i + 1} ({value:.3g})"
+        return f"{prefix} ({value:.3g})"
+
+    y_top = ax.get_ylim()[1]
+    has_legend = False
+    for i in range(n_pairs):
+        color = _pair_color(i)
+        s_val = sample_values[i] if i < len(sample_values) else None
+        e_val = exemplar_values[i] if i < len(exemplar_values) else None
+        if s_val is not None and np.isfinite(s_val):
+            ax.axvline(s_val, color=color, linewidth=2.5, linestyle="--",
+                       label=_label("Sample", i, s_val))
+            has_legend = True
+        if e_val is not None and np.isfinite(e_val):
+            ax.axvline(e_val, color=color, linewidth=2.5, linestyle=":",
+                       label=_label("Exemplar", i, e_val))
+            has_legend = True
+        if (s_val is not None and e_val is not None
+                and np.isfinite(s_val) and np.isfinite(e_val)):
+            ax.plot([s_val, e_val], [y_top * 0.95, y_top * 0.95],
+                    color=color, alpha=0.35, linewidth=2.0, linestyle="-")
     ax.set_title(title)
     ax.set_xlabel(xlabel)
     ax.set_ylabel(ylabel)
-    if sample_value is not None or exemplar_value is not None:
+    if has_legend:
         legend = ax.legend(
             frameon=True, fancybox=True, facecolor=COLORS["dark_background"],
             edgecolor=COLORS["dirty_white"], fontsize=14,
@@ -517,8 +594,8 @@ def _plot_categorical(
     xlabel: str,
     ylabel: str,
     out_path: Path,
-    sample_value: Optional[Any] = None,
-    exemplar_value: Optional[Any] = None,
+    sample_values: Optional[Sequence[Any]] = None,
+    exemplar_values: Optional[Sequence[Any]] = None,
 ) -> Path:
     apply_style()
     fig, ax = plt.subplots(figsize=(10, 6))
@@ -550,33 +627,55 @@ def _plot_categorical(
                     return i
         return None
 
-    sample_idx = _match(sample_value)
-    if sample_idx is not None:
-        bars[sample_idx].set_edgecolor(_SAMPLE_COLOR)
-        bars[sample_idx].set_linewidth(4.0)
-        ax.plot(
-            sample_idx, heights[sample_idx] + max(heights) * 0.04, "v",
-            color=_SAMPLE_COLOR, markersize=14,
-            markeredgecolor=COLORS["dirty_white"], markeredgewidth=2,
-            label=f"Sample ({sample_value})",
-        )
-    exemplar_idx = _match(exemplar_value)
-    if exemplar_idx is not None:
-        bars[exemplar_idx].set_edgecolor(_EXEMPLAR_COLOR)
-        bars[exemplar_idx].set_linewidth(4.0)
-        ax.plot(
-            exemplar_idx, heights[exemplar_idx] + max(heights) * 0.10, "s",
-            color=_EXEMPLAR_COLOR, markersize=14,
-            markeredgecolor=COLORS["dirty_white"], markeredgewidth=2,
-            label=f"Exemplar ({exemplar_value})",
-        )
+    sample_values = list(sample_values) if sample_values is not None else []
+    exemplar_values = list(exemplar_values) if exemplar_values is not None else []
+    n_pairs = max(len(sample_values), len(exemplar_values))
+    multi = n_pairs > 1
+    has_marker = False
+    max_h = max(heights) if heights else 0.0
+
+    def _label(prefix: str, i: int, value: Any) -> str:
+        if multi:
+            return f"{prefix} #{i + 1} ({value})"
+        return f"{prefix} ({value})"
+
+    for i in range(n_pairs):
+        color = _pair_color(i)
+        s_val = sample_values[i] if i < len(sample_values) else None
+        e_val = exemplar_values[i] if i < len(exemplar_values) else None
+        s_idx = _match(s_val)
+        e_idx = _match(e_val)
+        if s_idx is not None and e_idx is not None and s_idx != e_idx:
+            y_top = max(heights[s_idx], heights[e_idx]) + max_h * 0.18
+            ax.plot([s_idx, e_idx], [y_top, y_top],
+                    color=color, alpha=0.35, linewidth=2.0, linestyle="--")
+        if s_idx is not None:
+            bars[s_idx].set_edgecolor(color)
+            bars[s_idx].set_linewidth(4.0)
+            ax.plot(
+                s_idx, heights[s_idx] + max_h * 0.04, "v",
+                color=color, markersize=14,
+                markeredgecolor=COLORS["dirty_white"], markeredgewidth=2,
+                label=_label("Sample", i, s_val),
+            )
+            has_marker = True
+        if e_idx is not None:
+            bars[e_idx].set_edgecolor(color)
+            bars[e_idx].set_linewidth(4.0)
+            ax.plot(
+                e_idx, heights[e_idx] + max_h * 0.10, "s",
+                color=color, markersize=14,
+                markeredgecolor=COLORS["dirty_white"], markeredgewidth=2,
+                label=_label("Exemplar", i, e_val),
+            )
+            has_marker = True
 
     ax.set_xticks(range(len(labels)))
     ax.set_xticklabels(labels, rotation=45, ha="right")
     ax.set_title(title)
     ax.set_xlabel(xlabel)
     ax.set_ylabel(ylabel)
-    if sample_idx is not None or exemplar_idx is not None:
+    if has_marker:
         legend = ax.legend(
             frameon=True, fancybox=True, facecolor=COLORS["dark_background"],
             edgecolor=COLORS["dirty_white"], fontsize=14,
@@ -682,10 +781,10 @@ def _plot_feature_target_relationship(
     target_type: str,
     target_name: str,
     out_path: Path,
-    sample_feature_value: Optional[float],
-    exemplar_feature_value: Optional[float],
-    sample_target_value: Optional[float],
-    exemplar_target_value: Optional[float],
+    sample_feature_values: Optional[Sequence[Optional[float]]],
+    exemplar_feature_values: Optional[Sequence[Optional[float]]],
+    sample_target_values: Optional[Sequence[Optional[float]]],
+    exemplar_target_values: Optional[Sequence[Optional[float]]],
 ) -> Optional[Path]:
     ftype = feature_summary.inferred_type
     if ftype in (T_CONSTANT, T_UNKNOWN) or target_type in (T_CONSTANT, T_UNKNOWN):
@@ -701,6 +800,22 @@ def _plot_feature_target_relationship(
     t = target_values[mask]
     apply_style()
     fig, ax = plt.subplots(figsize=(10, 6))
+
+    sample_feature_values = list(sample_feature_values) if sample_feature_values is not None else []
+    exemplar_feature_values = list(exemplar_feature_values) if exemplar_feature_values is not None else []
+    sample_target_values = list(sample_target_values) if sample_target_values is not None else []
+    exemplar_target_values = list(exemplar_target_values) if exemplar_target_values is not None else []
+    n_pairs = max(
+        len(sample_feature_values), len(exemplar_feature_values),
+        len(sample_target_values), len(exemplar_target_values),
+    )
+    multi = n_pairs > 1
+
+    def _pl(prefix: str, i: int) -> str:
+        return f"{prefix} #{i + 1}" if multi else prefix
+
+    def _get(arr: List[Any], i: int) -> Any:
+        return arr[i] if i < len(arr) else None
 
     # continuous feature vs continuous target: 2D histogram
     if ftype == T_CONTINUOUS and target_type == T_CONTINUOUS:
@@ -721,24 +836,31 @@ def _plot_feature_target_relationship(
         cbar = fig.colorbar(h[3], ax=ax)
         cbar.ax.tick_params(colors=COLORS["dirty_white"])
         cbar.set_label("density", color=COLORS["dirty_white"])
-        if sample_feature_value is not None and sample_target_value is not None:
-            ax.scatter(
-                [sample_feature_value], [sample_target_value], s=120, marker="v",
-                color=_SAMPLE_COLOR, edgecolors=COLORS["dirty_white"], linewidths=1.5,
-                label="Sample",
-            )
-        if exemplar_feature_value is not None and exemplar_target_value is not None:
-            ax.scatter(
-                [exemplar_feature_value], [exemplar_target_value], s=120, marker="s",
-                color=_EXEMPLAR_COLOR, edgecolors=COLORS["dirty_white"], linewidths=1.5,
-                label="Exemplar",
-            )
+        has_marker = False
+        for i in range(n_pairs):
+            color = _pair_color(i)
+            sfv = _get(sample_feature_values, i)
+            stv = _get(sample_target_values, i)
+            efv = _get(exemplar_feature_values, i)
+            etv = _get(exemplar_target_values, i)
+            if (sfv is not None and stv is not None
+                    and efv is not None and etv is not None):
+                ax.plot([sfv, efv], [stv, etv],
+                        color=color, alpha=0.35, linewidth=2.0, linestyle="--")
+            if sfv is not None and stv is not None:
+                ax.scatter([sfv], [stv], s=120, marker="v", color=color,
+                           edgecolors=COLORS["dirty_white"], linewidths=1.5,
+                           label=_pl("Sample", i))
+                has_marker = True
+            if efv is not None and etv is not None:
+                ax.scatter([efv], [etv], s=120, marker="s", color=color,
+                           edgecolors=COLORS["dirty_white"], linewidths=1.5,
+                           label=_pl("Exemplar", i))
+                has_marker = True
         ax.set_xlabel(feature_summary.name)
         ax.set_ylabel(target_name)
         ax.set_title(f"{feature_summary.name} vs {target_name} (2D density)")
-        if (sample_feature_value is not None and sample_target_value is not None) or (
-            exemplar_feature_value is not None and exemplar_target_value is not None
-        ):
+        if has_marker:
             legend = ax.legend(frameon=True, fancybox=True,
                                facecolor=COLORS["dark_background"],
                                edgecolor=COLORS["dirty_white"], fontsize=14)
@@ -766,12 +888,16 @@ def _plot_feature_target_relationship(
                 color=get_bar_color(i), edgecolor=COLORS["dirty_white"], linewidth=1.0,
                 label=f"{target_name}={cls}",
             )
-        if sample_feature_value is not None:
-            ax.axvline(sample_feature_value, color=_SAMPLE_COLOR, linewidth=3.0,
-                       linestyle="--", label="Sample feature value")
-        if exemplar_feature_value is not None:
-            ax.axvline(exemplar_feature_value, color=_EXEMPLAR_COLOR, linewidth=3.0,
-                       linestyle=":", label="Exemplar feature value")
+        for i in range(n_pairs):
+            color = _pair_color(i)
+            sfv = _get(sample_feature_values, i)
+            efv = _get(exemplar_feature_values, i)
+            if sfv is not None:
+                ax.axvline(sfv, color=color, linewidth=2.5,
+                           linestyle="--", label=f"{_pl('Sample', i)} feature")
+            if efv is not None:
+                ax.axvline(efv, color=color, linewidth=2.5,
+                           linestyle=":", label=f"{_pl('Exemplar', i)} feature")
         ax.set_xlabel(feature_summary.name)
         ax.set_ylabel("density")
         ax.set_title(f"{feature_summary.name} distribution by {target_name} class")
@@ -813,26 +939,32 @@ def _plot_feature_target_relationship(
         for med in bp["medians"]:
             med.set_color(COLORS["dirty_white"])
             med.set_linewidth(2.0)
-        sidx = _find_category_index(categories, sample_feature_value)
-        if sidx is not None and sample_target_value is not None:
-            ax.scatter(
-                [sidx + 1], [sample_target_value], marker="v", s=120,
-                color=_SAMPLE_COLOR, edgecolors=COLORS["dirty_white"], linewidths=1.5,
-                label="Sample",
-            )
-        eidx = _find_category_index(categories, exemplar_feature_value)
-        if eidx is not None and exemplar_target_value is not None:
-            ax.scatter(
-                [eidx + 1], [exemplar_target_value], marker="s", s=120,
-                color=_EXEMPLAR_COLOR, edgecolors=COLORS["dirty_white"], linewidths=1.5,
-                label="Exemplar",
-            )
+        has_marker = False
+        for i in range(n_pairs):
+            color = _pair_color(i)
+            sfv = _get(sample_feature_values, i)
+            stv = _get(sample_target_values, i)
+            efv = _get(exemplar_feature_values, i)
+            etv = _get(exemplar_target_values, i)
+            sidx = _find_category_index(categories, sfv)
+            eidx = _find_category_index(categories, efv)
+            if sidx is not None and eidx is not None and stv is not None and etv is not None:
+                ax.plot([sidx + 1, eidx + 1], [stv, etv],
+                        color=color, alpha=0.35, linewidth=2.0, linestyle="--")
+            if sidx is not None and stv is not None:
+                ax.scatter([sidx + 1], [stv], marker="v", s=120, color=color,
+                           edgecolors=COLORS["dirty_white"], linewidths=1.5,
+                           label=_pl("Sample", i))
+                has_marker = True
+            if eidx is not None and etv is not None:
+                ax.scatter([eidx + 1], [etv], marker="s", s=120, color=color,
+                           edgecolors=COLORS["dirty_white"], linewidths=1.5,
+                           label=_pl("Exemplar", i))
+                has_marker = True
         ax.set_xlabel(feature_summary.name)
         ax.set_ylabel(target_name)
         ax.set_title(f"{target_name} distribution by {feature_summary.name}")
-        if (sidx is not None and sample_target_value is not None) or (
-            eidx is not None and exemplar_target_value is not None
-        ):
+        if has_marker:
             legend = ax.legend(frameon=True, fancybox=True, facecolor=COLORS["dark_background"],
                                edgecolor=COLORS["dirty_white"], fontsize=12)
             for text in legend.get_texts():
@@ -865,20 +997,34 @@ def _plot_feature_target_relationship(
             for j in range(len(t_cats)):
                 ax.text(j, i, int(counts[i, j]), ha="center", va="center",
                         color=COLORS["dirty_white"], fontsize=10)
-        sfx = _find_category_index(f_cats, sample_feature_value)
-        sty = _find_category_index(t_cats, sample_target_value)
-        if sfx is not None and sty is not None:
-            ax.scatter(sty, sfx, marker="v", s=150, color=_SAMPLE_COLOR,
-                       edgecolors=COLORS["dirty_white"], linewidths=1.5, label="Sample")
-        efx = _find_category_index(f_cats, exemplar_feature_value)
-        ety = _find_category_index(t_cats, exemplar_target_value)
-        if efx is not None and ety is not None:
-            ax.scatter(ety, efx, marker="s", s=150, color=_EXEMPLAR_COLOR,
-                       edgecolors=COLORS["dirty_white"], linewidths=1.5, label="Exemplar")
+        has_marker = False
+        for i in range(n_pairs):
+            color = _pair_color(i)
+            sfv = _get(sample_feature_values, i)
+            stv = _get(sample_target_values, i)
+            efv = _get(exemplar_feature_values, i)
+            etv = _get(exemplar_target_values, i)
+            sfx = _find_category_index(f_cats, sfv)
+            sty = _find_category_index(t_cats, stv)
+            efx = _find_category_index(f_cats, efv)
+            ety = _find_category_index(t_cats, etv)
+            if sfx is not None and sty is not None and efx is not None and ety is not None:
+                ax.plot([sty, ety], [sfx, efx],
+                        color=color, alpha=0.35, linewidth=2.0, linestyle="--")
+            if sfx is not None and sty is not None:
+                ax.scatter(sty, sfx, marker="v", s=150, color=color,
+                           edgecolors=COLORS["dirty_white"], linewidths=1.5,
+                           label=_pl("Sample", i))
+                has_marker = True
+            if efx is not None and ety is not None:
+                ax.scatter(ety, efx, marker="s", s=150, color=color,
+                           edgecolors=COLORS["dirty_white"], linewidths=1.5,
+                           label=_pl("Exemplar", i))
+                has_marker = True
         ax.set_xlabel(target_name)
         ax.set_ylabel(feature_summary.name)
         ax.set_title(f"{feature_summary.name} vs {target_name} contingency")
-        if (sfx is not None and sty is not None) or (efx is not None and ety is not None):
+        if has_marker:
             legend = ax.legend(frameon=True, fancybox=True, facecolor=COLORS["dark_background"],
                                edgecolor=COLORS["dirty_white"], fontsize=12)
             for text in legend.get_texts():
@@ -1102,6 +1248,16 @@ def analyze_dataset(
     target_type: Optional[str] = None
     saved_plots: List[Path] = []
 
+    sample_vec_list = _to_vector_list(sample)
+    exemplar_vec_list = _to_vector_list(exemplar)
+    n_pairs = max(
+        len(sample_vec_list) if sample_vec_list is not None else 0,
+        len(exemplar_vec_list) if exemplar_vec_list is not None else 0,
+        0,
+    )
+    sample_target_list = _to_value_list(sample_target_value, n_pairs) or []
+    exemplar_target_list = _to_value_list(exemplar_target_value, n_pairs) or []
+
     if y_arr is not None and y_arr.size:
         target_summary = _summarise_target(y_arr)
         target_type = target_summary.inferred_type
@@ -1113,8 +1269,8 @@ def analyze_dataset(
                     xlabel=resolved_target_name,
                     ylabel="count",
                     out_path=out / "target_distribution.png",
-                    sample_value=sample_target_value,
-                    exemplar_value=exemplar_target_value,
+                    sample_values=sample_target_list,
+                    exemplar_values=exemplar_target_list,
                 )
                 saved_plots.append(p)
             elif target_summary.class_counts:
@@ -1124,19 +1280,15 @@ def analyze_dataset(
                     xlabel="class",
                     ylabel="count",
                     out_path=out / "target_distribution.png",
-                    sample_value=sample_target_value,
-                    exemplar_value=exemplar_target_value,
+                    sample_values=sample_target_list,
+                    exemplar_values=exemplar_target_list,
                 )
                 saved_plots.append(p)
         except Exception as exc:
             logger.warning("Failed to plot target distribution: %s", exc)
 
-    sample_arr: Optional[np.ndarray] = None
-    exemplar_arr: Optional[np.ndarray] = None
-    if sample is not None:
-        sample_arr = np.asarray(sample, dtype=float).flatten()
-    if exemplar is not None:
-        exemplar_arr = np.asarray(exemplar, dtype=float).flatten()
+    sample_arr = sample_vec_list[0] if sample_vec_list else None
+    exemplar_arr = exemplar_vec_list[0] if exemplar_vec_list else None
 
     feature_summaries: List[FeatureSummary] = []
     feature_dir = out / "features"
@@ -1157,12 +1309,21 @@ def analyze_dataset(
         if not plot_features:
             continue
         try:
-            sval = (float(sample_arr[j])
-                    if sample_arr is not None and j < sample_arr.size
-                    else None)
-            eval_ = (float(exemplar_arr[j])
-                     if exemplar_arr is not None and j < exemplar_arr.size
-                     else None)
+            def _vec_value(vec_list: Optional[List[np.ndarray]], i: int) -> Optional[float]:
+                if vec_list is None or i >= len(vec_list):
+                    return None
+                v = vec_list[i]
+                if j >= v.size:
+                    return None
+                val = float(v[j])
+                return val if math.isfinite(val) else None
+
+            feature_sample_vals: List[Optional[float]] = [
+                _vec_value(sample_vec_list, i) for i in range(n_pairs)
+            ]
+            feature_exemplar_vals: List[Optional[float]] = [
+                _vec_value(exemplar_vec_list, i) for i in range(n_pairs)
+            ]
             base = f"{fs.index:03d}_{_safe_filename(fs.name)}"
             if fs.inferred_type == T_CONTINUOUS:
                 col_finite = col[np.isfinite(col.astype(float, copy=False))]
@@ -1172,8 +1333,8 @@ def analyze_dataset(
                     xlabel=fs.name,
                     ylabel="count",
                     out_path=feature_dir / f"{base}.png",
-                    sample_value=sval,
-                    exemplar_value=eval_,
+                    sample_values=feature_sample_vals,
+                    exemplar_values=feature_exemplar_vals,
                 )
                 saved_plots.append(p)
             elif fs.inferred_type in (T_BINARY, T_CATEGORICAL) and fs.top_categories:
@@ -1183,8 +1344,8 @@ def analyze_dataset(
                     xlabel="value",
                     ylabel="count",
                     out_path=feature_dir / f"{base}.png",
-                    sample_value=sval,
-                    exemplar_value=eval_,
+                    sample_values=feature_sample_vals,
+                    exemplar_values=feature_exemplar_vals,
                 )
                 saved_plots.append(p)
 
@@ -1196,10 +1357,10 @@ def analyze_dataset(
                     target_type=target_type,
                     target_name=resolved_target_name,
                     out_path=feature_target_dir / f"{base}.png",
-                    sample_feature_value=sval,
-                    exemplar_feature_value=eval_,
-                    sample_target_value=sample_target_value,
-                    exemplar_target_value=exemplar_target_value,
+                    sample_feature_values=feature_sample_vals,
+                    exemplar_feature_values=feature_exemplar_vals,
+                    sample_target_values=sample_target_list,
+                    exemplar_target_values=exemplar_target_list,
                 )
                 if p_rel is not None:
                     saved_plots.append(p_rel)

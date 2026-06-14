@@ -58,6 +58,76 @@ from explainit.utils.plot_styles import (
 PathLike = Union[str, os.PathLike]
 
 
+PAIR_COLORS: Tuple[str, ...] = (
+    "#FF6B35",
+    "#FFD166",
+    "#06D6A0",
+    "#118AB2",
+    "#9D4EDD",
+    "#EF476F",
+    "#26C485",
+    "#F4A261",
+)
+
+
+def _pair_color(i: int) -> str:
+    return PAIR_COLORS[i % len(PAIR_COLORS)]
+
+
+def _normalize_vectors(vectors: Optional[Any]) -> Optional[List[np.ndarray]]:
+    """Normalise ``sample``/``exemplar`` to a list of 1D vectors.
+
+    Accepts None, a single 1D vector, or a 2D array / list-of-vectors.
+    Returns None if input is None, otherwise a list of 1D ``np.ndarray``.
+    """
+
+    if vectors is None:
+        return None
+    arr = np.asarray(vectors, dtype=float)
+    if arr.ndim == 0:
+        return None
+    if arr.ndim == 1:
+        return [arr]
+    if arr.ndim == 2:
+        return [arr[i] for i in range(arr.shape[0])]
+    raise ValueError(
+        f"Expected 1D or 2D array for sample/exemplar, got ndim={arr.ndim}"
+    )
+
+
+def _normalize_target_values(
+    values: Optional[Any], n_pairs: int
+) -> Optional[List[Optional[float]]]:
+    """Normalise scalar or list-of-scalars target values to length ``n_pairs``.
+
+    Returns ``None`` for inputs that are ``None``. A scalar input is
+    broadcast to a length-``n_pairs`` list. Shorter lists are right-padded
+    with ``None``; longer lists are truncated.
+    """
+
+    if values is None:
+        return None
+    if isinstance(values, (int, float, np.integer, np.floating)):
+        return [float(values)] * n_pairs
+    arr = list(values)
+    out: List[Optional[float]] = []
+    for i in range(n_pairs):
+        if i >= len(arr) or arr[i] is None:
+            out.append(None)
+        else:
+            try:
+                out.append(float(arr[i]))
+            except (TypeError, ValueError):
+                out.append(None)
+    return out
+
+
+def _pair_label(prefix: str, idx: int, total: int) -> str:
+    if total <= 1:
+        return prefix
+    return f"{prefix} #{idx + 1}"
+
+
 def _ensure_dir(directory: Optional[PathLike]) -> Optional[Path]:
     if directory is None:
         return None
@@ -188,8 +258,10 @@ def plot_numerical_priority(
     idx: int,
     constraint: Mapping[str, Any],
     *,
-    sample: Optional[Sequence[float]] = None,
-    exemplar: Optional[Sequence[float]] = None,
+    sample: Optional[Any] = None,
+    exemplar: Optional[Any] = None,
+    sample_target_value: Optional[Any] = None,
+    exemplar_target_value: Optional[Any] = None,
     feature_values: Optional[Sequence[float]] = None,
     target_values: Optional[Sequence[float]] = None,
     target_name: str = "target",
@@ -200,6 +272,11 @@ def plot_numerical_priority(
     show: bool = False,
 ) -> Optional[plt.Figure]:
     """Plot the priority weight curve for a single numerical feature.
+
+    ``sample`` and ``exemplar`` can be either a single 1D feature vector or a
+    list/2D-array of such vectors. When multiple pairs are passed, each
+    sample/exemplar pair is rendered with a distinct colour and connected
+    by a translucent line so the pairing remains visible.
 
     Returns the figure (or ``None`` if the feature is non-actionable and was
     skipped). When ``save_dir`` is provided a default filename is used.
@@ -218,12 +295,34 @@ def plot_numerical_priority(
     priority_values = np.array([float(f(x)) for x in x_vals])
     title_name = feature_name if feature_name else f"Feature {idx}"
 
-    sample_value = None
-    if sample is not None and idx < len(sample):
-        sample_value = float(sample[idx])
-    exemplar_value = None
-    if exemplar is not None and idx < len(exemplar):
-        exemplar_value = float(exemplar[idx])
+    samples_list = _normalize_vectors(sample)
+    exemplars_list = _normalize_vectors(exemplar)
+    n_pairs = max(
+        len(samples_list) if samples_list is not None else 0,
+        len(exemplars_list) if exemplars_list is not None else 0,
+        0,
+    )
+    sample_target_list = _normalize_target_values(sample_target_value, n_pairs)
+    exemplar_target_list = _normalize_target_values(exemplar_target_value, n_pairs)
+
+    def _val_at(vec_list: Optional[List[np.ndarray]], i: int) -> Optional[float]:
+        if vec_list is None or i >= len(vec_list):
+            return None
+        vec = vec_list[i]
+        if idx >= vec.size:
+            return None
+        v = float(vec[idx])
+        return v if np.isfinite(v) else None
+
+    sample_values: List[Optional[float]] = [
+        _val_at(samples_list, i) for i in range(n_pairs)
+    ]
+    exemplar_values: List[Optional[float]] = [
+        _val_at(exemplars_list, i) for i in range(n_pairs)
+    ]
+    # Back-compat shortcuts for legacy single-pair code paths.
+    sample_value = sample_values[0] if sample_values else None
+    exemplar_value = exemplar_values[0] if exemplar_values else None
 
     has_target_distribution = feature_values is not None and target_values is not None
     if has_target_distribution:
@@ -247,20 +346,32 @@ def plot_numerical_priority(
             x_vals, priority_values, alpha=0.2, color=get_line_color("theoretical")
         )
 
-        if sample_value is not None and min_val <= sample_value <= max_val:
-            ax.plot(
-                sample_value, float(f(sample_value)), "o",
-                color=get_line_color("empirical"), markersize=12,
-                label=f"Current Sample Value ({sample_value:.3f})",
-                markeredgecolor=COLORS["dirty_white"], markeredgewidth=2,
-            )
-        if exemplar_value is not None and min_val <= exemplar_value <= max_val:
-            ax.plot(
-                exemplar_value, float(f(exemplar_value)), "s",
-                color="#FF6B35", markersize=12,
-                label=f"Exemplar Value ({exemplar_value:.3f})",
-                markeredgecolor=COLORS["dirty_white"], markeredgewidth=2,
-            )
+        for i in range(n_pairs):
+            color = _pair_color(i)
+            s_val = sample_values[i]
+            e_val = exemplar_values[i]
+            s_y = e_y = None
+            if s_val is not None and min_val <= s_val <= max_val:
+                s_y = float(f(s_val))
+            if e_val is not None and min_val <= e_val <= max_val:
+                e_y = float(f(e_val))
+            if s_y is not None and e_y is not None:
+                ax.plot(
+                    [s_val, e_val], [s_y, e_y],
+                    color=color, alpha=0.35, linewidth=2.0, linestyle="--",
+                )
+            if s_y is not None:
+                ax.plot(
+                    s_val, s_y, "v", color=color, markersize=12,
+                    label=f"{_pair_label('Sample', i, n_pairs)} ({s_val:.3f})",
+                    markeredgecolor=COLORS["dirty_white"], markeredgewidth=2,
+                )
+            if e_y is not None:
+                ax.plot(
+                    e_val, e_y, "s", color=color, markersize=12,
+                    label=f"{_pair_label('Exemplar', i, n_pairs)} ({e_val:.3f})",
+                    markeredgecolor=COLORS["dirty_white"], markeredgewidth=2,
+                )
 
         ax.set_xlabel("Feature Value")
         ax.set_ylabel("Priority Weight")
@@ -384,20 +495,38 @@ def plot_numerical_priority(
                         color=COLORS["dirty_white"],
                         fontsize=26,
                     )
-                if sample_value is not None:
-                    m = np.where(np.isclose(ordered_vals, sample_value, atol=1e-9))[0]
-                    if m.size:
-                        i = int(m[0])
-                        ax_bottom.plot(i, pvals[i], "v", color=get_line_color("empirical"),
-                                       markersize=12, markeredgecolor=COLORS["dirty_white"],
-                                       markeredgewidth=1.5, label="Sample")
-                if exemplar_value is not None:
-                    m = np.where(np.isclose(ordered_vals, exemplar_value, atol=1e-9))[0]
-                    if m.size:
-                        i = int(m[0])
-                        ax_bottom.plot(i, pvals[i], "s", color="#FF6B35",
-                                       markersize=12, markeredgecolor=COLORS["dirty_white"],
-                                       markeredgewidth=1.5, label="Exemplar")
+                for pi in range(n_pairs):
+                    color = _pair_color(pi)
+                    s_v = sample_values[pi]
+                    e_v = exemplar_values[pi]
+                    s_idx = e_idx = None
+                    if s_v is not None:
+                        m = np.where(np.isclose(ordered_vals, s_v, atol=1e-9))[0]
+                        if m.size:
+                            s_idx = int(m[0])
+                    if e_v is not None:
+                        m = np.where(np.isclose(ordered_vals, e_v, atol=1e-9))[0]
+                        if m.size:
+                            e_idx = int(m[0])
+                    if s_idx is not None and e_idx is not None:
+                        ax_bottom.plot(
+                            [s_idx, e_idx], [pvals[s_idx], pvals[e_idx]],
+                            color=color, alpha=0.35, linewidth=2.0, linestyle="--",
+                        )
+                    if s_idx is not None:
+                        ax_bottom.plot(
+                            s_idx, pvals[s_idx], "v", color=color,
+                            markersize=12, markeredgecolor=COLORS["dirty_white"],
+                            markeredgewidth=1.5,
+                            label=_pair_label("Sample", pi, n_pairs),
+                        )
+                    if e_idx is not None:
+                        ax_bottom.plot(
+                            e_idx, pvals[e_idx], "s", color=color,
+                            markersize=12, markeredgecolor=COLORS["dirty_white"],
+                            markeredgewidth=1.5,
+                            label=_pair_label("Exemplar", pi, n_pairs),
+                        )
                 ax_bottom.set_xticks(range(len(ordered_vals)))
                 ax_bottom.set_xticklabels([f"{v:.3f}" for v in ordered_vals], rotation=30, ha="right")
                 ax_bottom.set_ylim(-0.02, 1.02)
@@ -457,21 +586,40 @@ def plot_numerical_priority(
                         label=f"{target_name} threshold ({float(target_threshold):.3f})",
                     )
 
-                if sample_value is not None and np.isfinite(sample_value):
-                    yv = float(np.median(target_arr))
-                    ax_top.scatter(
-                        [sample_value], [yv], marker="v", s=130,
-                        color=get_line_color("empirical"),
-                        edgecolors=COLORS["dirty_white"], linewidths=1.5,
-                        label=f"sample x={sample_value:.3f}",
+                median_y = float(np.median(target_arr))
+                for pi in range(n_pairs):
+                    color = _pair_color(pi)
+                    s_v = sample_values[pi]
+                    e_v = exemplar_values[pi]
+                    s_t = (
+                        sample_target_list[pi]
+                        if sample_target_list is not None else None
                     )
-                if exemplar_value is not None and np.isfinite(exemplar_value):
-                    yv = float(np.median(target_arr))
-                    ax_top.scatter(
-                        [exemplar_value], [yv], marker="s", s=130, color="#FF6B35",
-                        edgecolors=COLORS["dirty_white"], linewidths=1.5,
-                        label=f"exemplar x={exemplar_value:.3f}",
+                    e_t = (
+                        exemplar_target_list[pi]
+                        if exemplar_target_list is not None else None
                     )
+                    s_y = s_t if s_t is not None else median_y
+                    e_y = e_t if e_t is not None else median_y
+                    if (s_v is not None and np.isfinite(s_v)
+                            and e_v is not None and np.isfinite(e_v)):
+                        ax_top.plot(
+                            [s_v, e_v], [s_y, e_y],
+                            color=color, alpha=0.35, linewidth=2.0,
+                            linestyle="--",
+                        )
+                    if s_v is not None and np.isfinite(s_v):
+                        ax_top.scatter(
+                            [s_v], [s_y], marker="v", s=130, color=color,
+                            edgecolors=COLORS["dirty_white"], linewidths=1.5,
+                            label=f"{_pair_label('sample', pi, n_pairs)} x={s_v:.3f}",
+                        )
+                    if e_v is not None and np.isfinite(e_v):
+                        ax_top.scatter(
+                            [e_v], [e_y], marker="s", s=130, color=color,
+                            edgecolors=COLORS["dirty_white"], linewidths=1.5,
+                            label=f"{_pair_label('exemplar', pi, n_pairs)} x={e_v:.3f}",
+                        )
 
                 ax_top.set_ylabel(target_name)
                 ax_top.set_xlabel("Feature Value", labelpad=10)
@@ -503,20 +651,33 @@ def plot_numerical_priority(
                 ax_bottom.fill_between(
                     x_vals, priority_values, alpha=0.2, color=get_line_color("theoretical")
                 )
-                if sample_value is not None and min_val <= sample_value <= max_val:
-                    ax_bottom.plot(
-                        sample_value, float(f(sample_value)), "o",
-                        color=get_line_color("empirical"), markersize=10,
-                        label=f"Current Sample Value ({sample_value:.3f})",
-                        markeredgecolor=COLORS["dirty_white"], markeredgewidth=1.5,
-                    )
-                if exemplar_value is not None and min_val <= exemplar_value <= max_val:
-                    ax_bottom.plot(
-                        exemplar_value, float(f(exemplar_value)), "s",
-                        color="#FF6B35", markersize=10,
-                        label=f"Exemplar Value ({exemplar_value:.3f})",
-                        markeredgecolor=COLORS["dirty_white"], markeredgewidth=1.5,
-                    )
+                for pi in range(n_pairs):
+                    color = _pair_color(pi)
+                    s_v = sample_values[pi]
+                    e_v = exemplar_values[pi]
+                    s_y = e_y = None
+                    if s_v is not None and min_val <= s_v <= max_val:
+                        s_y = float(f(s_v))
+                    if e_v is not None and min_val <= e_v <= max_val:
+                        e_y = float(f(e_v))
+                    if s_y is not None and e_y is not None:
+                        ax_bottom.plot(
+                            [s_v, e_v], [s_y, e_y],
+                            color=color, alpha=0.35, linewidth=2.0,
+                            linestyle="--",
+                        )
+                    if s_y is not None:
+                        ax_bottom.plot(
+                            s_v, s_y, "v", color=color, markersize=10,
+                            label=f"{_pair_label('Sample', pi, n_pairs)} ({s_v:.3f})",
+                            markeredgecolor=COLORS["dirty_white"], markeredgewidth=1.5,
+                        )
+                    if e_y is not None:
+                        ax_bottom.plot(
+                            e_v, e_y, "s", color=color, markersize=10,
+                            label=f"{_pair_label('Exemplar', pi, n_pairs)} ({e_v:.3f})",
+                            markeredgecolor=COLORS["dirty_white"], markeredgewidth=1.5,
+                        )
                 # Show the same boundary symbols on the bottom plot
                 if not is_constant:
                     for level in levels:
@@ -568,20 +729,33 @@ def plot_numerical_priority(
             ax2.set_ylabel("Priority Weight", color=COLORS["dirty_white"])
             ax2.tick_params(axis="y", colors=COLORS["dirty_white"])
 
-            if sample_value is not None and min_val <= sample_value <= max_val:
-                ax2.plot(
-                    sample_value, float(f(sample_value)), "o",
-                    color=get_line_color("empirical"), markersize=10,
-                    markeredgecolor=COLORS["dirty_white"], markeredgewidth=1.5,
-                    label=f"sample ({sample_value:.3f})",
-                )
-            if exemplar_value is not None and min_val <= exemplar_value <= max_val:
-                ax2.plot(
-                    exemplar_value, float(f(exemplar_value)), "s",
-                    color="#FF6B35", markersize=10,
-                    markeredgecolor=COLORS["dirty_white"], markeredgewidth=1.5,
-                    label=f"exemplar ({exemplar_value:.3f})",
-                )
+            for pi in range(n_pairs):
+                color = _pair_color(pi)
+                s_v = sample_values[pi]
+                e_v = exemplar_values[pi]
+                s_y = e_y = None
+                if s_v is not None and min_val <= s_v <= max_val:
+                    s_y = float(f(s_v))
+                if e_v is not None and min_val <= e_v <= max_val:
+                    e_y = float(f(e_v))
+                if s_y is not None and e_y is not None:
+                    ax2.plot(
+                        [s_v, e_v], [s_y, e_y],
+                        color=color, alpha=0.35, linewidth=2.0,
+                        linestyle="--",
+                    )
+                if s_y is not None:
+                    ax2.plot(
+                        s_v, s_y, "v", color=color, markersize=10,
+                        markeredgecolor=COLORS["dirty_white"], markeredgewidth=1.5,
+                        label=f"{_pair_label('sample', pi, n_pairs)} ({s_v:.3f})",
+                    )
+                if e_y is not None:
+                    ax2.plot(
+                        e_v, e_y, "s", color=color, markersize=10,
+                        markeredgecolor=COLORS["dirty_white"], markeredgewidth=1.5,
+                        label=f"{_pair_label('exemplar', pi, n_pairs)} ({e_v:.3f})",
+                    )
 
             ax.set_title(f"Priority + class-wise distribution for {title_name}")
             h1, l1 = ax.get_legend_handles_labels()
@@ -612,7 +786,8 @@ def plot_categorical_priority(
     group_indices: Tuple[int, ...],
     mapping: Mapping[Tuple[Any, ...], float],
     *,
-    sample: Optional[Sequence[float]] = None,
+    sample: Optional[Any] = None,
+    exemplar: Optional[Any] = None,
     feature_matrix: Optional[Sequence[Sequence[float]]] = None,
     target_values: Optional[Sequence[float]] = None,
     target_name: str = "target",
@@ -621,7 +796,12 @@ def plot_categorical_priority(
     save_dir: Optional[PathLike] = None,
     show: bool = False,
 ) -> Optional[plt.Figure]:
-    """Plot a bar chart with the priority weights of a categorical group."""
+    """Plot a bar chart with the priority weights of a categorical group.
+
+    ``sample`` and ``exemplar`` may be a single 1D feature vector or a
+    list/2D-array of vectors. Multiple pairs are highlighted with distinct
+    colours and a translucent connector arc.
+    """
 
     if not mapping:
         return None
@@ -633,6 +813,35 @@ def plot_categorical_priority(
     category_labels = [str(cat) for cat in categories]
     num_categories = len(category_labels)
     bar_width = _bar_width_for(num_categories)
+
+    samples_list_cat = _normalize_vectors(sample)
+    exemplars_list_cat = _normalize_vectors(exemplar)
+    n_pairs_cat = max(
+        len(samples_list_cat) if samples_list_cat is not None else 0,
+        len(exemplars_list_cat) if exemplars_list_cat is not None else 0,
+        0,
+    )
+
+    def _combo_for(vec: np.ndarray) -> Optional[Tuple[Any, ...]]:
+        try:
+            return tuple(float(vec[gi]) for gi in group_indices)
+        except (IndexError, TypeError, ValueError):
+            return None
+
+    def _combo_idx(combo: Optional[Tuple[Any, ...]]) -> Optional[int]:
+        if combo is None:
+            return None
+        for i, cat in enumerate(categories):
+            try:
+                if all(
+                    math.isclose(float(a), float(b), abs_tol=1e-9)
+                    for a, b in zip(combo, cat)
+                ):
+                    return i
+            except (TypeError, ValueError):
+                if combo == cat:
+                    return i
+        return None
 
     has_target_distribution = feature_matrix is not None and target_values is not None
     if has_target_distribution:
@@ -730,31 +939,49 @@ def plot_categorical_priority(
                 linewidth=0.8, alpha=0.6,
             ))
 
-    current_sample_combo: Optional[Tuple[Any, ...]] = None
-    if sample is not None and all(idx < len(sample) for idx in group_indices):
-        current_sample_combo = tuple(sample[idx] for idx in group_indices)
-        if current_sample_combo in categories:
-            current_idx = categories.index(current_sample_combo)
-            bars[current_idx].set_edgecolor(get_line_color("empirical"))
-            bars[current_idx].set_linewidth(4)
+    weights_max = float(max(weights)) if num_categories else 0.0
+    sample_indices_by_pair: List[Optional[int]] = []
+    exemplar_indices_by_pair: List[Optional[int]] = []
+    for pi in range(n_pairs_cat):
+        color = _pair_color(pi)
+        s_vec = samples_list_cat[pi] if samples_list_cat is not None and pi < len(samples_list_cat) else None
+        e_vec = exemplars_list_cat[pi] if exemplars_list_cat is not None and pi < len(exemplars_list_cat) else None
+        s_idx = _combo_idx(_combo_for(s_vec)) if s_vec is not None else None
+        e_idx = _combo_idx(_combo_for(e_vec)) if e_vec is not None else None
+        sample_indices_by_pair.append(s_idx)
+        exemplar_indices_by_pair.append(e_idx)
+        if s_idx is not None and e_idx is not None and s_idx != e_idx:
+            y_top = max(weights[s_idx], weights[e_idx]) + (weights_max * 0.18 + 0.05)
             ax.plot(
-                current_idx, weights[current_idx] + max(weights) * 0.05, "v",
-                color=get_line_color("empirical"), markersize=15,
+                [s_idx, e_idx], [y_top, y_top],
+                color=color, alpha=0.35, linewidth=2.0, linestyle="--",
+            )
+        if s_idx is not None:
+            bars[s_idx].set_edgecolor(color)
+            bars[s_idx].set_linewidth(4)
+            ax.plot(
+                s_idx, weights[s_idx] + (weights_max * 0.05 + 0.02), "v",
+                color=color, markersize=15,
                 markeredgecolor=COLORS["dirty_white"], markeredgewidth=2,
+                label=_pair_label("Sample", pi, n_pairs_cat),
+            )
+        if e_idx is not None:
+            bars[e_idx].set_edgecolor(color)
+            bars[e_idx].set_linewidth(4)
+            ax.plot(
+                e_idx, weights[e_idx] + (weights_max * 0.12 + 0.04), "s",
+                color=color, markersize=15,
+                markeredgecolor=COLORS["dirty_white"], markeredgewidth=2,
+                label=_pair_label("Exemplar", pi, n_pairs_cat),
             )
 
     if num_categories == 1:
         ax.set_xlim(-1, 1)
 
-    current_idx_for_label = (
-        categories.index(current_sample_combo)
-        if current_sample_combo is not None and current_sample_combo in categories
-        else -1
-    )
-    weights_max = float(max(weights)) if num_categories else 0.0
+    current_indices = {i for i in sample_indices_by_pair if i is not None}
     for i, (bar, weight) in enumerate(zip(bars, weights)):
         label_text = f"{weight:.3f}"
-        if i == current_idx_for_label:
+        if i in current_indices:
             label_text += " (Current)"
         ax.text(
             bar.get_x() + bar.get_width() / 2,
@@ -781,8 +1008,22 @@ def plot_categorical_priority(
     ax.set_xticks(range(num_categories))
     ax.set_xticklabels(category_labels, rotation=45, ha="right")
 
+    handles, labels_leg = ax.get_legend_handles_labels()
+    if handles:
+        legend = ax.legend(
+            handles, labels_leg,
+            frameon=True, fancybox=True, shadow=True,
+            facecolor=COLORS["dark_background"], edgecolor=COLORS["dirty_white"],
+            fontsize=12, loc="center left", bbox_to_anchor=(1.02, 0.9), ncol=1,
+        )
+        legend.get_frame().set_alpha(0.9)
+        for text in legend.get_texts():
+            text.set_color(COLORS["dirty_white"])
+
     style_categorical_plot(ax, num_categories)
     plt.tight_layout()
+    if handles:
+        plt.subplots_adjust(right=0.75)
 
     if save_path is None and save_dir is not None:
         directory = _ensure_dir(save_dir)
@@ -796,8 +1037,10 @@ def plot_categorical_priority(
 def plot_priorities(
     priorities: Mapping[str, Any],
     *,
-    sample: Optional[Sequence[float]] = None,
-    exemplar: Optional[Sequence[float]] = None,
+    sample: Optional[Any] = None,
+    exemplar: Optional[Any] = None,
+    sample_target_value: Optional[Any] = None,
+    exemplar_target_value: Optional[Any] = None,
     feature_matrix: Optional[Sequence[Sequence[float]]] = None,
     target_values: Optional[Sequence[float]] = None,
     target_name: str = "target",
@@ -807,6 +1050,10 @@ def plot_priorities(
     show: bool = False,
 ) -> List[Path]:
     """Plot every actionable priority in a priorities dict.
+
+    ``sample`` and ``exemplar`` accept either a single 1D vector or a list /
+    2D array of vectors so several sample/exemplar pairs can be overlaid on
+    each plot.
 
     Returns the list of paths written when ``save_dir`` is provided.
     """
@@ -838,6 +1085,8 @@ def plot_priorities(
         plot_numerical_priority(
             idx, constraint,
             sample=sample, exemplar=exemplar,
+            sample_target_value=sample_target_value,
+            exemplar_target_value=exemplar_target_value,
             feature_values=column,
             target_values=target_values,
             target_name=target_name,
@@ -858,6 +1107,7 @@ def plot_priorities(
         plot_categorical_priority(
             group_indices, mapping,
             sample=sample,
+            exemplar=exemplar,
             feature_matrix=feature_matrix,
             target_values=target_values,
             target_name=target_name,

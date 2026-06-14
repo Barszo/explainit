@@ -1,0 +1,33 @@
+# Configuration for the continuous-target MINLP experiment.
+#
+# Used by:
+#   * minlp_runner.py    -- MINLP search via MINLSearchExplainer
+#   * random_runner.py   -- random search via RandomSearchExplainer
+#
+# Each experiment entry is the cross-product of (samples x targets) -- one
+# JSON result file per (sample, target) pair lands under:
+#   results/<dataset>/<sample_idx>_<target>/{minlp.json, random.json}
+
+defaults:
+  # MINLP-specific
+  epsilon: 0.05
+  target_exemplar_epsilon: 0.10
+  max_iterations: 10
+  patience: 5
+  shap_approx: true
+  shap_num_samples: 200
+
+  # Random-search-specific
+  random_max_iterations: 10000
+  random_seed: 42
+
+  # Shared
+  n_counterfactuals: 1
+  use_monte_carlo: true
+
+experiments:
+  - dataset: diabetes
+    priority_set: default
+    samples: [0, 5, 12]
+    targets: [0.25, 0.75]
+    n_counterfactuals: 1
