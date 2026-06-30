@@ -24,6 +24,7 @@ explainit/experiments/continuous_minlp/
 ├── random_runner.py              <- stage 7: random-search baseline runner
 │
 ├── data/<dataset_key>/data.pkl
+├── data_analysis/<dataset_key>/{numerical_features.csv, categorical_features.csv}
 ├── models/<dataset_key>/model.keras
 ├── analysis/<dataset_key>/<sample_idx>_<target>/{coverage.txt, dataset/, priorities/, analysis_summary.txt}
 └── results/<dataset_key>/<sample_idx>_<target>/{minlp.json, random.json}
@@ -57,22 +58,45 @@ Each dataset gets:
   predictions later,
 * `numerical_features` and `categorical_groups` metadata (column indices,
   category codes, source values) used by the priority builder,
+* automatic feature-type analysis CSVs under
+  `data_analysis/<dataset_key>/`,
 * persisted to `data/<dataset_key>/data.pkl`.
 
 Add a new dataset by registering a loader in `DATASETS` inside
 `data_setup.py`.
 
-#### Declaring categorical features
+#### Automatic categorical detection + manual overrides
 
-By default every column is treated as numerical. To make a feature
-categorical (one-hot encoded, never scaled), add it to
-`CATEGORICAL_FEATURES` in `data_setup.py`:
+`data_setup.py` now infers categorical features automatically and logs
+for each feature why it was classified as categorical or numerical.
+Heuristics:
+
+* non-numeric dtype -> categorical,
+* boolean dtype -> categorical,
+* numeric + integer-like + low cardinality (`<=20` unique values and
+  unique/non-null ratio `<=5%`) -> categorical.
+
+After automatic detection, `CATEGORICAL_FEATURES` in `data_setup.py`
+still works as a manual override and is applied on top:
 
 ```python
 CATEGORICAL_FEATURES = {
-    "diabetes": ["sex"],   # 'sex' is one-hot encoded, the rest stay numerical
+    "diabetes": ["sex"],   # force these columns to categorical
 }
 ```
+
+During setup, two CSV files are written to
+`data_analysis/<dataset_key>/`:
+
+* `numerical_features.csv` with: feature name, whether auto-detected as
+  categorical, unique/all/non-null counts, non-null %, min, max, mean,
+  median, std.
+* `categorical_features.csv` with: feature name, unique/all/non-null
+  counts, non-null %, and top-20 most frequent values with percentages.
+
+At the end of preprocessing, the terminal log explicitly asks you to
+review these CSVs and update `CATEGORICAL_FEATURES` if you want to
+override the automatic decisions.
 
 After changing this registry (or any priority set that touches
 categoricals) you **must regenerate** the data and model, because the
@@ -94,6 +118,8 @@ python -m explainit.experiments.continuous_minlp.model_setup --force
 Models land at `models/<dataset_key>/model.keras`. The default
 architecture is a two-layer MLP; add a custom builder by registering it
 in `MODEL_BUILDERS` inside `model_setup.py`.
+
+The measures of each model are saved in `model_analysis/model_analysis.csv`
 
 ### 3. Author priorities
 
@@ -208,10 +234,10 @@ To override, wrap the function with `numerical_entry`:
 
 #### Categorical features: a `{code: weight}` mapping
 
-A categorical feature must first be declared in
-`CATEGORICAL_FEATURES` (see section 1) so `data_setup.py` one-hot encodes
-it. In the priority set, list **every** category code and its relative
-weight (`0` = forbidden, higher = more preferred):
+A categorical feature must be classified as categorical by
+`data_setup.py` (automatic detection, optionally forced with
+`CATEGORICAL_FEATURES`). In the priority set, list **every** category
+code and its relative weight (`0` = forbidden, higher = more preferred):
 
 ```python
 "categorical": {
@@ -401,9 +427,10 @@ More metrics can be added later without breaking the existing JSON keys.
 
 1. Add a raw loader to `data_setup.py` and register it in `DATASETS`
    (and `TARGET_NAMES` if you want a friendly target label).
-2. If the dataset has categorical features, list them in
-   `CATEGORICAL_FEATURES` in `data_setup.py` so they are one-hot encoded
-   (and excluded from scaling).
+2. Run `data_setup.py` and inspect
+   `data_analysis/<dataset_key>/{numerical_features.csv,categorical_features.csv}`.
+   Then add manual overrides in `CATEGORICAL_FEATURES` only where you
+   want to force a different categorical decision.
 3. Optionally register a custom model builder in `model_setup.py`
    (`MODEL_BUILDERS`); otherwise the default MLP is used.
 4. Add a priority set under `PRIORITY_SETS[<dataset_key>]["default"]` in

@@ -25,7 +25,7 @@ import pickle
 import ssl
 import sys
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -41,6 +41,8 @@ from sklearn.preprocessing import MinMaxScaler, StandardScaler  # noqa: E402
 EXPERIMENT_DIR = Path(__file__).resolve().parent
 DATA_DIR = EXPERIMENT_DIR / "data"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
+DATA_ANALYSIS_DIR = EXPERIMENT_DIR / "data_analysis"
+DATA_ANALYSIS_DIR.mkdir(parents=True, exist_ok=True)
 
 logger = logging.getLogger("explainit.experiments.continuos_minlp.data_setup")
 
@@ -112,12 +114,17 @@ TARGET_NAMES: Dict[str, str] = {
 }
 
 
-# Categorical features per dataset (by raw column name). Listed columns are
-# one-hot encoded (and excluded from standard scaling); everything else is
-# treated as numerical. ``sex`` in the diabetes dataset is binary.
+# Manual categorical overrides per dataset (by raw column name). These names
+# are always treated as categorical and override automatic detection.
 CATEGORICAL_FEATURES: Dict[str, List[str]] = {
     "diabetes": ["sex"],
 }
+
+
+AUTO_CATEGORICAL_MAX_UNIQUE_VALUES = 20
+AUTO_CATEGORICAL_MAX_UNIQUE_VALUES_NON_INTEGER = 5
+AUTO_CATEGORICAL_MAX_UNIQUE_RATIO = 0.05
+MISSING_CATEGORY_TOKEN = "__MISSING__"
 
 
 # ---------------------------------------------------------------------------
@@ -129,7 +136,15 @@ def _one_hot_frame(
     series: pd.Series, code_map: Dict[object, int], n_categories: int, col_name: str,
 ) -> Tuple[pd.DataFrame, List[str]]:
     """One-hot encode ``series`` (mapped through ``code_map``) into 0/1 columns."""
-    codes = series.map(code_map).to_numpy()
+    normalized = series.astype(object).where(series.notna(), MISSING_CATEGORY_TOKEN)
+    codes = normalized.map(code_map).to_numpy()
+    missing_mask = pd.isna(codes)
+    if np.any(missing_mask):
+        unknown = sorted({str(v) for v in normalized[missing_mask].tolist()})
+        raise ValueError(
+            f"Categorical column '{col_name}' has unknown value(s) not seen in raw fit set: {unknown}."
+        )
+    codes = codes.astype(int, copy=False)
     data: Dict[str, np.ndarray] = {}
     names: List[str] = []
     for i in range(n_categories):
@@ -137,6 +152,145 @@ def _one_hot_frame(
         data[name] = (codes == i).astype(float)
         names.append(name)
     return pd.DataFrame(data, index=series.index), names
+
+
+def _sorted_unique_categorical_values(series: pd.Series) -> List[Any]:
+    normalized = series.astype(object).where(series.notna(), MISSING_CATEGORY_TOKEN)
+    values = list(pd.unique(normalized))
+    try:
+        return sorted(values)
+    except TypeError:
+        return sorted(values, key=lambda v: str(v))
+
+
+def _is_integer_like(series: pd.Series) -> bool:
+    non_na = series.dropna()
+    if non_na.empty:
+        return False
+    arr = non_na.to_numpy(dtype=float)
+    return bool(np.all(np.isclose(arr, np.round(arr), rtol=0.0, atol=1e-9)))
+
+
+def _detect_categorical_features(
+    X_raw: pd.DataFrame, feature_names: List[str], manual_overrides: Sequence[str],
+) -> Tuple[List[str], Dict[str, str], List[str], List[Dict[str, object]], List[Dict[str, object]]]:
+    manual_set = set(manual_overrides)
+    categorical: List[str] = []
+    reasoning: Dict[str, str] = {}
+    auto_categorical: List[str] = []
+    numerical_summary_rows: List[Dict[str, object]] = []
+    categorical_summary_rows: List[Dict[str, object]] = []
+
+    for col in feature_names:
+        series = X_raw[col]
+        n_all = int(len(series))
+        non_na = series.dropna()
+        n_non_na = int(non_na.size)
+        n_unique = int(non_na.nunique(dropna=True))
+        pct_non_na = (100.0 * n_non_na / n_all) if n_all else 0.0
+        is_numeric = bool(pd.api.types.is_numeric_dtype(series))
+        is_bool = bool(pd.api.types.is_bool_dtype(series))
+        integer_like = is_numeric and _is_integer_like(series)
+        unique_ratio = (float(n_unique) / float(n_non_na)) if n_non_na else 0.0
+
+        auto_reason = "manual review required"
+        auto_is_categorical = False
+        if not is_numeric:
+            auto_is_categorical = True
+            auto_reason = f"non-numeric dtype ({series.dtype})"
+        elif is_bool:
+            auto_is_categorical = True
+            auto_reason = "boolean feature"
+        elif (
+            n_unique <= AUTO_CATEGORICAL_MAX_UNIQUE_VALUES
+            and unique_ratio <= AUTO_CATEGORICAL_MAX_UNIQUE_RATIO
+            and (
+                integer_like
+                or n_unique <= AUTO_CATEGORICAL_MAX_UNIQUE_VALUES_NON_INTEGER
+            )
+        ):
+            auto_is_categorical = True
+            auto_reason = (
+                "low cardinality numeric "
+                f"(unique={n_unique}, unique/non-nan={unique_ratio:.2%}, "
+                f"integer_like={integer_like}, thresholds<={AUTO_CATEGORICAL_MAX_UNIQUE_VALUES} "
+                f"(or <= {AUTO_CATEGORICAL_MAX_UNIQUE_VALUES_NON_INTEGER} for non-integer-like) "
+                f"and <={AUTO_CATEGORICAL_MAX_UNIQUE_RATIO:.2%})"
+            )
+        else:
+            auto_reason = (
+                "kept numerical "
+                f"(dtype={series.dtype}, integer_like={integer_like}, unique={n_unique}, unique/non-nan={unique_ratio:.2%})"
+            )
+
+        final_is_categorical = auto_is_categorical or (col in manual_set)
+        if col in manual_set:
+            reason = f"manual override in CATEGORICAL_FEATURES (auto: {auto_reason})"
+        else:
+            reason = f"automatic detection: {auto_reason}"
+
+        if final_is_categorical:
+            categorical.append(col)
+        if auto_is_categorical:
+            auto_categorical.append(col)
+        reasoning[col] = reason
+
+        if is_numeric:
+            num_arr = non_na.to_numpy(dtype=float) if n_non_na else np.array([], dtype=float)
+            numerical_summary_rows.append(
+                {
+                    "feature_name": col,
+                    "auto_considered_categorical": "yes" if auto_is_categorical else "no",
+                    "number_of_unique_values": n_unique,
+                    "number_of_all_values": n_all,
+                    "number_of_not_nan_values": n_non_na,
+                    "percentage_of_not_nan_values": pct_non_na,
+                    "min": float(np.min(num_arr)) if n_non_na else np.nan,
+                    "max": float(np.max(num_arr)) if n_non_na else np.nan,
+                    "average": float(np.mean(num_arr)) if n_non_na else np.nan,
+                    "median": float(np.median(num_arr)) if n_non_na else np.nan,
+                    "standard_deviation": float(np.std(num_arr)) if n_non_na else np.nan,
+                }
+            )
+
+        if final_is_categorical:
+            counts = non_na.value_counts(dropna=True)
+            row: Dict[str, object] = {
+                "feature_name": col,
+                "number_of_unique_values": n_unique,
+                "number_of_all_values": n_all,
+                "number_of_all_not_nan_values": n_non_na,
+                "percentage_of_all_not_nan_values": pct_non_na,
+            }
+            for idx in range(20):
+                rank = idx + 1
+                if idx < len(counts):
+                    value = counts.index[idx]
+                    count = int(counts.iloc[idx])
+                    pct = (100.0 * count / n_non_na) if n_non_na else 0.0
+                    row[f"most_popular_value_{rank}"] = str(value)
+                    row[f"percentage_of_most_popular_value_{rank}"] = pct
+                else:
+                    row[f"most_popular_value_{rank}"] = ""
+                    row[f"percentage_of_most_popular_value_{rank}"] = ""
+            categorical_summary_rows.append(row)
+
+    return categorical, reasoning, auto_categorical, numerical_summary_rows, categorical_summary_rows
+
+
+def _save_feature_analysis_csvs(
+    key: str,
+    numerical_summary_rows: List[Dict[str, object]],
+    categorical_summary_rows: List[Dict[str, object]],
+) -> Tuple[Path, Path]:
+    dataset_analysis_dir = DATA_ANALYSIS_DIR / key
+    dataset_analysis_dir.mkdir(parents=True, exist_ok=True)
+    numerical_path = dataset_analysis_dir / "numerical_features.csv"
+    categorical_path = dataset_analysis_dir / "categorical_features.csv"
+
+    pd.DataFrame(numerical_summary_rows).to_csv(numerical_path, index=False)
+    pd.DataFrame(categorical_summary_rows).to_csv(categorical_path, index=False)
+    return numerical_path, categorical_path
 
 
 def _prepare_dataset(
@@ -151,40 +305,57 @@ def _prepare_dataset(
         )
 
     logger.info("[%s] Starting preprocessing pipeline.", key)
-    logger.info("[%s] Step 1/5: load raw dataset.", key)
+    logger.info("[%s] Step 1/6: load raw dataset.", key)
     X_raw, y_raw, feature_names = DATASETS[key]()
     logger.info(
-        "[%s] Step 1/5 done: loaded raw shape X=%s, y=%s, features=%d.",
+        "[%s] Step 1/6 done: loaded raw shape X=%s, y=%s, features=%d.",
         key, X_raw.shape, y_raw.shape, len(feature_names),
     )
 
-    cat_cols = list(CATEGORICAL_FEATURES.get(key, []))
-    for col in cat_cols:
+    manual_cat_cols = list(CATEGORICAL_FEATURES.get(key, []))
+    for col in manual_cat_cols:
         if col not in feature_names:
             raise KeyError(
                 f"Categorical feature '{col}' for dataset '{key}' is not a known "
                 f"column. Known columns: {feature_names}"
             )
-    num_cols = [c for c in feature_names if c not in cat_cols]
+
+    cat_cols, feature_reasoning, auto_cat_cols, numerical_summary_rows, categorical_summary_rows = _detect_categorical_features(
+        X_raw, feature_names, manual_cat_cols
+    )
+    num_cols = [c for c in feature_names if c not in set(cat_cols)]
     logger.info(
-        "[%s] Step 2/5: feature typing -> numerical=%s | categorical=%s.",
+        "[%s] Step 2/6: automatic feature typing -> numerical=%s | categorical=%s.",
         key, num_cols, cat_cols,
+    )
+    logger.info("[%s] Feature typing details:", key)
+    for col in feature_names:
+        logger.info(
+            "[%s]   - %s: %s",
+            key, col, feature_reasoning[col],
+        )
+    numerical_csv_path, categorical_csv_path = _save_feature_analysis_csvs(
+        key, numerical_summary_rows, categorical_summary_rows
+    )
+    logger.info(
+        "[%s] Saved feature analysis CSVs: numerical=%s | categorical=%s.",
+        key, numerical_csv_path, categorical_csv_path,
     )
 
     logger.info(
-        "[%s] Step 3/5: train/test split (test_size=%.2f, random_state=%d).",
+        "[%s] Step 3/6: train/test split (test_size=%.2f, random_state=%d).",
         key, float(test_size), int(random_state),
     )
     X_train_raw, X_test_raw, y_train_raw, y_test_raw = train_test_split(
         X_raw, y_raw, test_size=test_size, random_state=random_state,
     )
     logger.info(
-        "[%s] Step 3/5 done: X_train=%s X_test=%s.",
+        "[%s] Step 3/6 done: X_train=%s X_test=%s.",
         key, X_train_raw.shape, X_test_raw.shape,
     )
 
     # Standard-scale numerical columns only.
-    logger.info("[%s] Step 4/5: scale numerical features + one-hot encode categoricals.", key)
+    logger.info("[%s] Step 4/6: scale numerical features + one-hot encode categoricals.", key)
     x_scaler = StandardScaler()
     if num_cols:
         train_num = pd.DataFrame(
@@ -204,7 +375,7 @@ def _prepare_dataset(
     train_cat: Dict[str, pd.DataFrame] = {}
     test_cat: Dict[str, pd.DataFrame] = {}
     for col in cat_cols:
-        source_values = sorted(pd.unique(X_raw[col]))
+        source_values = _sorted_unique_categorical_values(X_raw[col])
         code_map = {v: i for i, v in enumerate(source_values)}
         tr_df, names = _one_hot_frame(X_train_raw[col], code_map, len(source_values), col)
         te_df, _ = _one_hot_frame(X_test_raw[col], code_map, len(source_values), col)
@@ -212,7 +383,7 @@ def _prepare_dataset(
         test_cat[col] = te_df
         cat_meta[col] = {
             "categories": list(range(len(source_values))),
-            "source_values": [float(v) for v in source_values],
+            "source_values": [str(v) for v in source_values],
             "columns": names,
         }
         logger.info(
@@ -255,11 +426,11 @@ def _prepare_dataset(
     y_train = y_scaler.fit_transform(y_train_raw.reshape(-1, 1)).flatten()
     y_test = y_scaler.transform(y_test_raw.reshape(-1, 1)).flatten()
     logger.info(
-        "[%s] Step 4/5 done: final features=%d (%s).",
+        "[%s] Step 4/6 done: final features=%d (%s).",
         key, len(final_names), final_names,
     )
     logger.info(
-        "[%s] Step 5/5: target scaling done with MinMaxScaler to [0, 1].",
+        "[%s] Step 5/6: target scaling done with MinMaxScaler to [0, 1].",
         key,
     )
 
@@ -271,7 +442,15 @@ def _prepare_dataset(
         "y_test": y_test,
         "feature_names": final_names,
         "numerical_features": list(num_cols),
+        "categorical_features": list(cat_cols),
+        "auto_categorical_features": list(auto_cat_cols),
+        "manual_categorical_overrides": list(manual_cat_cols),
         "categorical_groups": categorical_groups,
+        "feature_analysis": {
+            "numerical_csv": str(numerical_csv_path),
+            "categorical_csv": str(categorical_csv_path),
+            "classification_reasons": feature_reasoning,
+        },
         "x_scaler": x_scaler,
         "y_scaler": y_scaler,
         "raw_target_min": float(np.min(y_raw)),
@@ -312,6 +491,33 @@ def setup_dataset(key: str, *, force: bool = False) -> Path:
         tuple(data["X_test"].shape),  # type: ignore[index]
         len(data["y_train"]),  # type: ignore[arg-type,index]
         len(data["y_test"]),  # type: ignore[arg-type,index]
+    )
+    auto_cat = list(data.get("auto_categorical_features", []))
+    manual_overrides = list(data.get("manual_categorical_overrides", []))
+    feature_analysis = data.get("feature_analysis", {})
+    if isinstance(feature_analysis, dict):
+        numerical_csv = feature_analysis.get("numerical_csv", "numerical_features.csv")
+        categorical_csv = feature_analysis.get("categorical_csv", "categorical_features.csv")
+    else:
+        numerical_csv = "numerical_features.csv"
+        categorical_csv = "categorical_features.csv"
+    logger.info("[%s] Step 6/6: review automatic categorical decisions.", key)
+    logger.warning(
+        "[%s] Automatic categorical candidates: %s",
+        key,
+        auto_cat,
+    )
+    logger.warning(
+        "[%s] Manual categorical overrides currently configured: %s",
+        key,
+        manual_overrides,
+    )
+    logger.warning(
+        "[%s] Please review %s and %s, then update CATEGORICAL_FEATURES in data_setup.py "
+        "to override any automatic decisions you do not want.",
+        key,
+        numerical_csv,
+        categorical_csv,
     )
     return path
 
