@@ -28,8 +28,12 @@ class RandomSearchExplainer:
 
         # Numerical: replace None or 0 with sample value
         for idx, val in self.priorities['numerical'].items():
-            if val is None or val == 0:
+            if val is None or (isinstance(val, (int, float)) and val == 0):
                 new_priorities['numerical'][idx] = self.sample[idx]
+            elif isinstance(val, dict) and val.get('function') is None:
+                # Non-actionable feature: fixed at its configured value
+                # (falls back to the sample value).
+                new_priorities['numerical'][idx] = val.get('min', self.sample[idx])
             else:
                 new_priorities['numerical'][idx] = val
 
@@ -98,7 +102,7 @@ class RandomSearchExplainer:
         
         # Calculate scores for numerical features
         for idx, constraint in self.priorities['numerical'].items():
-            if isinstance(constraint, dict) and 'function' in constraint:
+            if isinstance(constraint, dict) and constraint.get('function') is not None:
                 # Get weight from preference function
                 weight = float(np.asarray(constraint['function'](sample[idx])).squeeze())
                 scores.append(weight)
@@ -137,7 +141,7 @@ class RandomSearchExplainer:
         
         # Calculate scores for numerical features
         for idx, constraint in self.priorities['numerical'].items():
-            if isinstance(constraint, dict) and 'function' in constraint:
+            if isinstance(constraint, dict) and constraint.get('function') is not None:
                 # Get weight from preference function
                 weight = float(np.asarray(constraint['function'](sample[idx])).squeeze())
                 breakdown['numerical'][idx] = {
@@ -146,7 +150,11 @@ class RandomSearchExplainer:
                     'actionable': True
                 }
                 all_scores.append(weight)
-            elif constraint is None or (isinstance(constraint, (int, float)) and constraint == 0):
+            elif (
+                constraint is None
+                or (isinstance(constraint, (int, float)) and constraint == 0)
+                or (isinstance(constraint, dict) and constraint.get('function') is None)
+            ):
                 # Unactionable feature - fixed at sample value, doesn't affect preference score
                 breakdown['numerical'][idx] = {
                     'value': sample[idx],

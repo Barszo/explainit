@@ -1521,13 +1521,16 @@ class MINLSearchExplainer:
 
         result = basic_prediction
 
-        for i, key in enumerate(priorities_for_search['numerical'].keys()):
-            # Use pre-calculated coefficient from shap_coeffs instead of recalculating
+        for key in priorities_for_search['numerical'].keys():
+            # Use pre-calculated coefficient from shap_coeffs instead of recalculating.
+            # ``x`` is always the full-length feature vector, so index by the
+            # feature's actual column index (numerical indices may be
+            # non-contiguous when categorical one-hot columns are present).
             temp_unit_phi = self.sample_state.shap_coeffs[key]
-            
-            result += temp_unit_phi * (x[i] - sample[key])
-        
-        for i, key in enumerate(priorities_for_search['categorical'].keys()):
+
+            result += temp_unit_phi * (x[key] - sample[key])
+
+        for key in priorities_for_search['categorical'].keys():
             feature_indices = key
             shap_value = cat_shap[feature_indices]
             
@@ -1714,14 +1717,17 @@ class MINLSearchExplainer:
             logger.debug("Prepared input: %s", prepared_input)
 
             def constraint_wrapper(x, shap_dict, sample, target_exemplar, priorities_for_search, basic_prediction, ready_input):
-                for idx in shap_dict['numerical'].keys():
-                    ready_input[idx] = x[idx]
+                # ``x`` is the compact SLSQP vector (one entry per numerical
+                # feature, ordered like ``shap_dict['numerical']``); map each
+                # position back onto its original column in the full vector.
+                for j, idx in enumerate(shap_dict['numerical'].keys()):
+                    ready_input[idx] = x[j]
 
                 return self.constraint_function(ready_input, shap_dict, sample, target_exemplar, priorities_for_search, basic_prediction)
 
             def objective_wrapper(x, priorities_for_search, ready_input):
-                for idx in self.sample_state.shapley_values['numerical'].keys():
-                    ready_input[idx] = x[idx]
+                for j, idx in enumerate(self.sample_state.shapley_values['numerical'].keys()):
+                    ready_input[idx] = x[j]
                 try:
                     return self.calculate_total_weight(ready_input)
                 except ValueError:
