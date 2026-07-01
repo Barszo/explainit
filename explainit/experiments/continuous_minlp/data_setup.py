@@ -440,6 +440,14 @@ def _prepare_dataset(
         "X_test": X_test,
         "y_train": y_train,
         "y_test": y_test,
+        # Raw (pre-scaling, pre-one-hot) views, row-aligned with the
+        # preprocessed splits above. Categorical columns keep their original
+        # source values; the target is unscaled.
+        "X_train_raw": X_train_raw.copy(),
+        "X_test_raw": X_test_raw.copy(),
+        "y_train_raw": np.asarray(y_train_raw, dtype=float).flatten(),
+        "y_test_raw": np.asarray(y_test_raw, dtype=float).flatten(),
+        "raw_feature_names": list(feature_names),
         "feature_names": final_names,
         "numerical_features": list(num_cols),
         "categorical_features": list(cat_cols),
