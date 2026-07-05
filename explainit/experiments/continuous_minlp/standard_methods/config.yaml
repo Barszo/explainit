@@ -1,0 +1,69 @@
+# Configuration for the standard-methods stage of the continuous-target
+# counterfactual experiment.
+#
+# Pipeline:
+#   1. predicted_dataset_setup.py  -> predicted-target dataset
+#   2. predicted_dataset_explorer.ipynb (manual inspection)
+#   3. runner.py                   -> runs the methods below and writes results
+#
+# Targets are expressed in the MinMax-scaled [0, 1] space. For each selected
+# sample the target is (model_prediction + target_offset); samples whose
+# resulting target falls outside configured skip thresholds are skipped.
+
+defaults:
+  epsilon: 0.05
+  # Default number of counterfactuals to request per method. Can be overridden
+  # per method with an `n_cfs` key. Methods that cannot produce multiple
+  # distinct counterfactuals are automatically clamped to 1.
+  n_cfs: 5
+
+experiments:
+  - dataset: diabetes
+
+    selection:
+      # Strategy options:
+      # - indices: use explicit `sample_indices` below (in listed order)
+      # - random:  use `n_samples` + `seed`
+      strategy: indices
+      sample_indices: [60, 2, 52, 18, 27, 26, 38, 50, 24, 33]
+      # n_samples: 10
+      # seed: 42
+      target_offset: -0.3
+      skip_if_target_below: 0.0
+
+    actionability:
+      # 'sex' (one-hot) must not change.
+      immutable: [sex]
+      bounds:
+        # 'age' may only increase, never above the dataset maximum.
+        age: {direction: increasing}
+      # All other features are free to change without bounds.
+
+    # `n_cfs` per method controls how many distinct counterfactuals to keep.
+    # Multi-start / pooled search is used to diversify results; methods return
+    # fewer than requested when not enough valid counterfactuals are found.
+    methods:
+      - name: dice
+        n_cfs: 5
+        params: {total_cfs: 5, method: genetic, backend: sklearn}
+      - name: wachter
+        n_cfs: 5
+        params: {learning_rate: 0.1, max_iterations: 1000, proximity_weight: 0.005, seed: 42}
+      - name: sparse_wachter
+        n_cfs: 5
+        params: {learning_rate: 0.1, max_iterations: 1000, proximity_weight: 0.005, l1_weight: 0.005, seed: 42}
+      - name: prototype
+        n_cfs: 5
+        params: {learning_rate: 0.1, max_iterations: 500, n_prototypes: 5, prototype_weight: 0.02, seed: 42}
+      - name: growing_spheres
+        n_cfs: 5
+        params: {n_per_shell: 100, max_shells: 30, step: 0.25, seed: 42}
+      - name: nelder_mead
+        n_cfs: 5
+        params: {max_iterations: 500, proximity_weight: 0.01, seed: 42}
+      - name: bayesian_optimization
+        n_cfs: 5
+        params: {n_init: 10, n_iter: 40, proximity_weight: 0.05, seed: 42}
+      - name: random_search
+        n_cfs: 5
+        params: {max_iterations: 3000, seed: 42}

@@ -9,6 +9,18 @@ The `random_runner.py` script reproduces the same configuration with
 `RandomSearchExplainer` so MINLP results can be compared against a
 random-search baseline on identical priorities.
 
+There are now **two branches** after a model is trained (stage 2):
+
+* the **priority / MINLP branch** (stages 3-7 below), which is where our own
+  `MINLSearchExplainer` runs against declarative priority sets, and
+* the **standard-methods baseline branch** under `standard_methods/`, which
+  runs well-known regression counterfactual algorithms (DiCE, Wachter, sparse
+  Wachter, prototype-guided, growing spheres, Nelder-Mead, Bayesian
+  optimisation, random search) against a *predicted-target* dataset and
+  persists comparable metrics. This branch is documented in
+  ["Standard-methods baseline stage"](#standard-methods-baseline-stage-predicted-target-dataset)
+  right after stage 2 and is independent of the priority sets.
+
 ## Directory layout
 
 ```
@@ -22,6 +34,17 @@ explainit/experiments/continuous_minlp/
 ├── minlp_test_config.yaml        <- stage 5: experiment configuration
 ├── minlp_runner.py               <- stage 6: MINLP search runner
 ├── random_runner.py              <- stage 7: random-search baseline runner
+│
+├── standard_methods/             <- baseline branch (runs after stage 2)
+│   ├── predicted_dataset_setup.py       <- stage 2b: predicted-target dataset
+│   ├── predicted_dataset_explorer.ipynb <- notebook: inspect predicted dataset
+│   ├── selection.py                     <- sample/target + actionability logic
+│   ├── methods.py                       <- regression CF method registry
+│   ├── config.yaml                      <- standard-methods configuration
+│   ├── runner.py                        <- runs the methods + writes results
+│   ├── predicted_data/<dataset_key>/data.pkl
+│   └── results/<dataset_key>/{samples.csv, counterfactuals.csv,
+│                              metrics_summary.csv, summary.json}
 │
 ├── data/<dataset_key>/data.pkl
 ├── data_analysis/<dataset_key>/{numerical_features.csv, categorical_features.csv}
@@ -120,6 +143,171 @@ architecture is a two-layer MLP; add a custom builder by registering it
 in `MODEL_BUILDERS` inside `model_setup.py`.
 
 The measures of each model are saved in `model_analysis/model_analysis.csv`
+
+## Standard-methods baseline stage (predicted-target dataset)
+
+Everything under `standard_methods/` is a **self-contained baseline branch**
+that runs *after stage 2* and is completely independent of the priority sets
+and MINLP flow (stages 3-7). It targets the **model's own predictions** (not
+the ground-truth labels) and runs a battery of well-known regression
+counterfactual (CF) methods so their metrics can be compared later against
+`MINLSearchExplainer`.
+
+The full flow is: **2b build predicted-target dataset → explore it →
+configure → run methods**.
+
+### 2b. Build the predicted-target dataset
+
+Counterfactual search targets the *model*, so this stage loads the stage-1
+dataset and stage-2 model, predicts the (scaled) target for every row, and
+writes a new dataset pickle where `y_train` / `y_test` are the **model
+predictions**. Everything else (feature matrix, scalers, categorical
+metadata) is carried over unchanged, and the original labels are kept under
+`y_train_true` / `y_test_true`.
+
+```bash
+python -m explainit.experiments.continuous_minlp.standard_methods.predicted_dataset_setup
+# or one dataset / overwrite:
+python -m explainit.experiments.continuous_minlp.standard_methods.predicted_dataset_setup --datasets diabetes --force
+```
+
+Output: `standard_methods/predicted_data/<dataset_key>/data.pkl`.
+
+Re-run this with `--force` whenever you retrain the model, so the predicted
+target reflects the current model.
+
+### 2c. Explore the predicted-target dataset
+
+`predicted_dataset_explorer.ipynb` loads the predicted dataset and plots the
+predicted-target distribution (train/test), predicted-vs-true, and each
+feature against the predicted target. Set `DATASET = "diabetes"` in the first
+cell and run all cells. Use it to sanity-check the target range before
+choosing sample/target offsets in the config.
+
+### 2d. Configure the run (`standard_methods/config.yaml`)
+
+Targets are expressed in the MinMax-scaled `[0, 1]` space. For each selected
+sample the desired target is `model_prediction + target_offset`; samples
+whose resulting target falls below `skip_if_target_below` are skipped.
+
+```yaml
+defaults:
+  epsilon: 0.05
+
+experiments:
+  - dataset: diabetes
+
+    selection:
+      strategy: indices         # "indices" or "random"
+      sample_indices: [60, 2, 52, 18, 27, 26, 38, 50, 24, 33]
+      # n_samples: 10           # only for random strategy
+      # seed: 42                # only for random strategy
+      target_offset: -0.3       # target = prediction - 0.3 (scaled)
+      skip_if_target_below: 0.0 # drop samples whose target would be < 0
+
+    actionability:
+      immutable: [sex]          # logical feature name -> all one-hot cols pinned
+      bounds:
+        age: {direction: increasing}   # age may only rise, capped at dataset max
+      # every other feature is free to change without bounds
+
+    methods:
+      - name: dice
+        params: {total_cfs: 5, method: genetic, backend: sklearn}
+      - name: wachter
+        params: {learning_rate: 0.1, max_iterations: 1000, proximity_weight: 0.005}
+      - name: random_search
+        params: {max_iterations: 3000, seed: 42}
+      # ... other methods ...
+```
+
+Selection keys:
+
+* `strategy: indices`
+  * requires `sample_indices: [...]`.
+  * uses the provided test-set indices in the listed order.
+* `strategy: random`
+  * uses `n_samples` and `seed`.
+  * draws a random permutation of the test set and keeps the first valid rows.
+* `target_offset`, `skip_if_target_below` (and optional `skip_if_target_above`)
+  are applied in both strategies.
+
+Random-strategy example:
+
+```yaml
+selection:
+  strategy: random
+  n_samples: 10
+  seed: 42
+  target_offset: -0.3
+  skip_if_target_below: 0.0
+```
+
+Actionability keys:
+
+* `immutable`: logical feature names that must not change. A categorical
+  feature (e.g. `sex`) pins **all** of its one-hot columns.
+* `bounds`: per logical feature, one of
+  * `{direction: increasing}` → `lo = sample value`, `hi = dataset max`
+    (feature may only increase),
+  * `{direction: decreasing}` → `lo = dataset min`, `hi = sample value`,
+  * `{min: <v>, max: <v>}` → an explicit box.
+* Any feature not listed under `immutable`/`bounds` is free to move (no
+  bounds; samplers fall back to the dataset column range).
+
+### 2e. Run the standard methods
+
+```bash
+python -m explainit.experiments.continuous_minlp.standard_methods.runner
+python -m explainit.experiments.continuous_minlp.standard_methods.runner --dataset diabetes
+python -m explainit.experiments.continuous_minlp.standard_methods.runner --config standard_methods/config.yaml
+```
+
+For each `(sample, method)` pair the runner records the CF, checks validity
+(`|prediction - target| <= epsilon`), and computes proximity / sparsity /
+timing metrics.
+
+#### Available methods
+
+Referenced by `name` in the config (`methods.py` registry):
+
+| name | description |
+| --- | --- |
+| `dice` | Official `dice-ml`, regression mode (`desired_range`), model-agnostic search (default `genetic`). |
+| `wachter` | Gradient descent: prediction MSE + L2 proximity. |
+| `sparse_wachter` | Wachter with an added L1 (elastic-net) term for sparser edits. |
+| `prototype` | Gradient descent pulled toward training points whose prediction is near the target. |
+| `growing_spheres` | Model-agnostic: expanding L2 shells around the sample. |
+| `nelder_mead` | Gradient-free simplex search (scipy). |
+| `bayesian_optimization` | scikit-learn Gaussian-process surrogate with Expected-Improvement acquisition. |
+| `random_search` | Uniform random sampling within the box; keeps the closest valid CF. |
+
+All methods honour `immutable` features and the per-feature bounds. Gradient
+methods need the Keras model; the model-agnostic ones only call `predict`.
+
+### Outputs
+
+Written to `standard_methods/results/<dataset_key>/`:
+
+* `samples.csv` — one row per selected sample: `sample_id`,
+  `original_prediction`, `target`, and every feature value. This is the
+  **link key** for the other tables.
+* `counterfactuals.csv` — one row per `(sample_id, method)`: the generated CF
+  (`cf__<feature>` columns) plus per-CF metrics: `cf_prediction`, `validity`,
+  `abs_pred_error`, `l1`, `l2`, `n_changed`, `sparsity_fraction`,
+  `iterations`, `time_seconds`, `error`.
+* `metrics_summary.csv` — per-method averages: `validity_rate`,
+  `avg_abs_pred_error`, `avg_l1`, `avg_l2`, `avg_n_changed`,
+  `avg_sparsity_fraction`, `avg_iterations`, `avg_time_seconds` (distance /
+  sparsity averages are taken over the *valid* CFs only).
+* `summary.json` — the same per-method summary in machine-readable form.
+
+Join `counterfactuals.csv` to `samples.csv` on `sample_id` to compare each CF
+against its original instance.
+
+> Metrics are computed in the scaled feature space and are intentionally a
+> superset of the MINLP result metrics, so the two branches can be compared
+> later. New metrics can be appended without breaking the existing columns.
 
 ### 3. Author priorities
 
