@@ -1,0 +1,49 @@
+# Configuration for the priority branch (MINLP + random-search baseline).
+#
+# Pipeline:
+#   priority_sets.py        -> declare the priorities (edited elsewhere)
+#   priorities_explorer.ipynb (manual inspection of a sample's priorities)
+#   runner.py               -> runs the methods below and writes results
+#   results_explorer.ipynb  -> explore the run results (incl. priority score)
+#
+# Targets live in the MinMax-scaled [0, 1] space. For each selected sample the
+# target is (model_prediction + target_offset); samples whose resulting target
+# falls outside the configured skip thresholds are dropped.
+
+defaults:
+  epsilon: 0.05
+  # Default number of counterfactuals to request per method. Overridable per
+  # method with an `n_cfs` key. MINLP is single-shot and always clamped to 1.
+  n_cfs: 5
+
+experiments:
+  - dataset: diabetes
+    # Which priority set from priority_sets.py to use (e.g. set1 / set2).
+    priority_set: set1
+
+    selection:
+      # Strategy options:
+      # - indices: use explicit `sample_indices` below (in listed order)
+      # - random:  use `n_samples` + `seed`
+      strategy: indices
+      sample_indices: [60, 2, 52, 18, 27, 26, 38, 50, 24, 33]
+      # n_samples: 10
+      # seed: 42
+      target_offset: -0.3
+      skip_if_target_below: 0.0
+
+    methods:
+      - name: minlp
+        n_cfs: 1               # MINLP is single-shot
+        params:
+          shap_approx: true
+          shap_num_samples: 200
+          max_iterations: 10
+          patience: 5
+          target_exemplar_epsilon: 0.10
+      - name: random_search
+        n_cfs: 5
+        params:
+          max_iterations: 10000
+          use_monte_carlo: true
+          seed: 42

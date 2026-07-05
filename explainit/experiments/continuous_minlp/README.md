@@ -9,10 +9,18 @@ The `random_runner.py` script reproduces the same configuration with
 `RandomSearchExplainer` so MINLP results can be compared against a
 random-search baseline on identical priorities.
 
-There are now **two branches** after a model is trained (stage 2):
+There are now **three branches** after a model is trained (stage 2):
 
 * the **priority / MINLP branch** (stages 3-7 below), which is where our own
-  `MINLSearchExplainer` runs against declarative priority sets, and
+  `MINLSearchExplainer` runs against declarative priority sets and writes one
+  JSON result per `(sample, target)` pair,
+* the **priority-methods branch** under `priority_methods/`, a self-contained
+  package that mirrors the `standard_methods/` structure (selection → methods
+  → runner → config → results explorer) but runs the **priority** methods
+  (MINLP + a random-search baseline) against the declarative priority sets and
+  persists per-CF metrics **including a `priority_score`**. Documented in
+  ["Priority-methods branch"](#priority-methods-branch-packaged-minlp--baseline)
+  below, and
 * the **standard-methods baseline branch** under `standard_methods/`, which
   runs well-known regression counterfactual algorithms (DiCE, Wachter, sparse
   Wachter, prototype-guided, growing spheres, Nelder-Mead, Bayesian
@@ -31,9 +39,20 @@ explainit/experiments/continuous_minlp/
 ├── model_setup.py                <- stage 2: trained Keras models
 ├── priority_sets.py              <- stage 3: declarative priority sets (edit me)
 ├── priorities_selection.py       <- stage 4: workbench for analyser plots
+├── priorities_explorer.ipynb     <- notebook: inspect a sample's priorities
 ├── minlp_test_config.yaml        <- stage 5: experiment configuration
 ├── minlp_runner.py               <- stage 6: MINLP search runner
 ├── random_runner.py              <- stage 7: random-search baseline runner
+│
+├── priority_methods/             <- packaged priority branch (runs after stage 2)
+│   ├── selection.py                     <- sample/target + priority context
+│   ├── methods.py                       <- MINLP + random-search + priority_score
+│   ├── config.yaml                      <- priority-methods configuration
+│   ├── runner.py                        <- runs the methods + writes results
+│   ├── results_explorer.ipynb           <- notebook: explore the run results
+│   └── results/<dataset_key>/{samples.csv, counterfactuals.csv,
+│                              metrics_summary.csv, summary.json,
+│                              run_config.json}
 │
 ├── standard_methods/             <- baseline branch (runs after stage 2)
 │   ├── predicted_dataset_setup.py       <- stage 2b: predicted-target dataset
@@ -42,9 +61,11 @@ explainit/experiments/continuous_minlp/
 │   ├── methods.py                       <- regression CF method registry
 │   ├── config.yaml                      <- standard-methods configuration
 │   ├── runner.py                        <- runs the methods + writes results
+│   ├── results_explorer.ipynb           <- notebook: explore the run results
 │   ├── predicted_data/<dataset_key>/data.pkl
 │   └── results/<dataset_key>/{samples.csv, counterfactuals.csv,
-│                              metrics_summary.csv, summary.json}
+│                              metrics_summary.csv, summary.json,
+│                              run_config.json}
 │
 ├── data/<dataset_key>/data.pkl
 ├── data_analysis/<dataset_key>/{numerical_features.csv, categorical_features.csv}
@@ -154,7 +175,7 @@ counterfactual (CF) methods so their metrics can be compared later against
 `MINLSearchExplainer`.
 
 The full flow is: **2b build predicted-target dataset → explore it →
-configure → run methods**.
+configure → run methods → explore results**.
 
 ### 2b. Build the predicted-target dataset
 
@@ -193,6 +214,7 @@ whose resulting target falls below `skip_if_target_below` are skipped.
 ```yaml
 defaults:
   epsilon: 0.05
+  n_cfs: 5                  # default number of CFs per (sample, method)
 
 experiments:
   - dataset: diabetes
@@ -213,13 +235,24 @@ experiments:
 
     methods:
       - name: dice
+        n_cfs: 5              # per-method override of defaults.n_cfs
         params: {total_cfs: 5, method: genetic, backend: sklearn}
       - name: wachter
-        params: {learning_rate: 0.1, max_iterations: 1000, proximity_weight: 0.005}
+        n_cfs: 5
+        params: {learning_rate: 0.1, max_iterations: 1000, proximity_weight: 0.005, seed: 42}
       - name: random_search
+        n_cfs: 5
         params: {max_iterations: 3000, seed: 42}
       # ... other methods ...
 ```
+
+Counterfactual count:
+
+* `defaults.n_cfs` sets how many counterfactuals each method returns per
+  sample; a per-method `n_cfs` overrides it for that method.
+* A method that declares it cannot return more than one distinct CF
+  (`supports_multiple = False` in `methods.py`) is clamped to a single CF
+  regardless of `n_cfs`. All methods currently shipped support multiple CFs.
 
 Selection keys:
 
@@ -263,9 +296,10 @@ python -m explainit.experiments.continuous_minlp.standard_methods.runner --datas
 python -m explainit.experiments.continuous_minlp.standard_methods.runner --config standard_methods/config.yaml
 ```
 
-For each `(sample, method)` pair the runner records the CF, checks validity
-(`|prediction - target| <= epsilon`), and computes proximity / sparsity /
-timing metrics.
+For each `(sample, method)` pair the runner generates up to `n_cfs`
+counterfactuals, records each one (indexed by `cf_index`), checks validity
+(`|prediction - target| <= epsilon`), and computes per-CF proximity /
+sparsity / timing metrics.
 
 #### Available methods
 
@@ -292,15 +326,28 @@ Written to `standard_methods/results/<dataset_key>/`:
 * `samples.csv` — one row per selected sample: `sample_id`,
   `original_prediction`, `target`, and every feature value. This is the
   **link key** for the other tables.
-* `counterfactuals.csv` — one row per `(sample_id, method)`: the generated CF
-  (`cf__<feature>` columns) plus per-CF metrics: `cf_prediction`, `validity`,
+* `counterfactuals.csv` — **one row per counterfactual**, i.e. per
+  `(sample_id, method, cf_index)`. Columns: `sample_id`, `method`,
+  `cf_index`, `target`, `original_prediction`, `cf_prediction`, `validity`,
   `abs_pred_error`, `l1`, `l2`, `n_changed`, `sparsity_fraction`,
-  `iterations`, `time_seconds`, `error`.
-* `metrics_summary.csv` — per-method averages: `validity_rate`,
-  `avg_abs_pred_error`, `avg_l1`, `avg_l2`, `avg_n_changed`,
-  `avg_sparsity_fraction`, `avg_iterations`, `avg_time_seconds` (distance /
-  sparsity averages are taken over the *valid* CFs only).
-* `summary.json` — the same per-method summary in machine-readable form.
+  `iterations`, `time_seconds`, `error`, and one `cf__<feature>` column per
+  feature holding the CF's value. `cf_index` runs `0..n_cfs-1` for the CFs a
+  method returned for that sample.
+* `metrics_summary.csv` — one row per method with run-level aggregates:
+  `dataset`, `method`, `n_cfs_requested`, `n_samples`,
+  `n_samples_with_valid`, `sample_validity_rate` (fraction of samples with at
+  least one valid CF), `n_cfs_total`, `n_cfs_valid`, `cf_validity_rate`
+  (fraction of returned CFs that are valid), `avg_abs_pred_error`, `avg_l1`,
+  `avg_l2`, `avg_n_changed`, `avg_sparsity_fraction`, `avg_iterations`,
+  `avg_time_seconds`. The `avg_*` values are computed over the *valid* CFs
+  only.
+* `summary.json` — the same per-method summary in machine-readable form
+  (`{"dataset": ..., "methods": [ ... ]}`).
+* `run_config.json` — a snapshot of everything needed to interpret the run:
+  `epsilon`, `n_samples_selected`, the resolved `selection` and
+  `actionability` config, the `methods` list (each with its resolved `n_cfs`
+  and params), and the feature layout (`feature_names`, `numerical_features`,
+  `categorical_groups`) plus a UTC timestamp.
 
 Join `counterfactuals.csv` to `samples.csv` on `sample_id` to compare each CF
 against its original instance.
@@ -308,6 +355,152 @@ against its original instance.
 > Metrics are computed in the scaled feature space and are intentionally a
 > superset of the MINLP result metrics, so the two branches can be compared
 > later. New metrics can be appended without breaking the existing columns.
+
+### 2f. Explore the results (`results_explorer.ipynb`)
+
+`results_explorer.ipynb` is an interactive notebook for reading a completed
+run out of `results/<dataset_key>/`. Run all cells and drive it with the
+widgets. It has three parts.
+
+**Part 1 - Selection.** Pick a results dataset from the dropdown and click
+*Load*; the initial samples used for the run (`samples.csv`) are displayed.
+Then choose one CF method and one sample and click *Use selection* to fix the
+focus for Part 2.
+
+**Part 2 - Sample analysis** (all plots use the *selected method* and
+*selected sample*):
+
+* **Counterfactual table** — the original sample followed by one row per
+  counterfactual (`cf_index`) that the selected method produced for it.
+* **1D distribution** — pick any feature or the target. Continuous features
+  render as a histogram of the dataset; categorical features as category
+  bars. The sample value and the CF value(s) are overlaid; an *all methods*
+  toggle overlays every method's CF instead of just the selected one. When
+  the target axis is shown, its valid band is highlighted.
+* **2D distribution** — plot two features against each other over the dataset
+  background. Two continuous features use a 2D histogram; if either axis is
+  categorical the dataset is shown as a jittered scatter with labelled
+  category ticks. The sample is a black X connected to each CF; every CF gets
+  a distinct colour from a continuous `turbo` colormap (spread across all
+  plotted CFs) with its `cf_index` printed inside the dot. When the target is
+  on an axis its valid band is shaded green.
+* **CF predictions vs target** — one bar per counterfactual showing its
+  predicted value against the desired target (green line) and the valid band
+  (shaded), with the original prediction as a dashed reference. Bars are
+  green when the CF is valid, grey otherwise. A companion table lists each
+  CF's distance from the target, sorted by `abs_pred_error`.
+
+**Part 3 - Method metrics** (compare every method across the whole run):
+
+* **Per-method averages** — a grid of bar charts from `metrics_summary.csv`:
+  sample validity rate, CF validity rate, number of valid CFs, average L1 and
+  L2 (proximity), average #changed and sparsity fraction (sparsity), average
+  `|pred - target|`, average time, and average iterations. Averages are over
+  valid CFs.
+* **Per-CF distributions** — box plots from `counterfactuals.csv` showing the
+  spread across individual CFs for L1, L2, sparsity fraction, #changed,
+  `|pred - target|`, and time.
+
+> The baseline methods do not compute a preference/priority score (that
+> belongs to the MINLP branch), so no priority metric is shown here.
+
+## Priority-methods branch (packaged MINLP + baseline)
+
+Everything under `priority_methods/` is a **self-contained package** that runs
+*after stage 2* and mirrors the `standard_methods/` layout, but drives the
+**priority** methods against the declarative priority sets from
+`priority_sets.py`. It runs `MINLSearchExplainer` (MINLP) and a random-search
+baseline on **identical priorities**, and persists the same result tables as
+`standard_methods/` **plus a per-CF `priority_score`** so the branches are
+directly comparable.
+
+Targets live in the MinMax-scaled `[0, 1]` space: for each selected sample the
+target is `model_prediction + target_offset`.
+
+The flow is: **explore priorities → configure → run methods → explore
+results**.
+
+### P1. Explore a sample's priorities (`priorities_explorer.ipynb`)
+
+`priorities_explorer.ipynb` is a self-contained notebook to inspect what a
+priority set implies for one sample **before** running the methods. Pick a
+dataset, a priority set (`set1` / `set2`), and a sample index; it plots each
+feature's materialised priority function (with the sample value marked) and
+breaks down the sample's own priority score. Use it to sanity-check that the
+peaks/decays match your intent and that features stay positive across the
+range (so MINLP has a feasible region).
+
+### P2. Configure the run (`priority_methods/config.yaml`)
+
+```yaml
+defaults:
+  epsilon: 0.05
+  n_cfs: 5                  # default CFs per method (MINLP is clamped to 1)
+
+experiments:
+  - dataset: diabetes
+    priority_set: set1       # which set from priority_sets.py
+
+    selection:
+      strategy: indices      # "indices" or "random"
+      sample_indices: [60, 2, 52, 18, 27, 26, 38, 50, 24, 33]
+      # n_samples: 10        # only for random strategy
+      # seed: 42             # only for random strategy
+      target_offset: -0.3    # target = prediction - 0.3 (scaled)
+      skip_if_target_below: 0.0
+
+    methods:
+      - name: minlp
+        n_cfs: 1             # MINLP is single-shot
+        params:
+          shap_approx: true
+          shap_num_samples: 200
+          max_iterations: 10
+          patience: 5
+          target_exemplar_epsilon: 0.10
+      - name: random_search
+        n_cfs: 5
+        params: {max_iterations: 10000, use_monte_carlo: true, seed: 42}
+```
+
+Selection keys behave exactly like the standard-methods branch (`indices` vs
+`random`, `target_offset`, `skip_if_target_below/above`). The priorities
+(including which features are actionable and their search bounds) come from the
+chosen `priority_set`, not from an `actionability` block.
+
+### P3. Run the methods
+
+```bash
+python -m explainit.experiments.continuous_minlp.priority_methods.runner
+python -m explainit.experiments.continuous_minlp.priority_methods.runner --dataset diabetes
+```
+
+For each `(sample, method)` pair the runner builds the sample-specific
+priorities, generates up to `n_cfs` counterfactuals, checks validity
+(`|prediction - target| <= epsilon`), and records per-CF proximity / sparsity
+/ timing metrics **and the `priority_score`** (sum of the per-feature priority
+weights at the CF's values). MINLP failures (e.g. an infeasible exemplar
+search under very strict priorities) are caught per sample and recorded as
+zero counterfactuals rather than aborting the run.
+
+### Outputs
+
+Written to `priority_methods/results/<dataset_key>/`, identical in shape to the
+standard-methods outputs with two additions:
+
+* `counterfactuals.csv` — adds a **`priority_score`** column (per CF).
+* `metrics_summary.csv` — adds **`avg_priority_score`** (over valid CFs).
+* `samples.csv`, `summary.json`, `run_config.json` — as in the standard branch
+  (`run_config.json` also records the `priority_set`).
+
+### P4. Explore the results (`priority_methods/results_explorer.ipynb`)
+
+Mirrors `standard_methods/results_explorer.ipynb` (same three parts and
+widgets), reading from `priority_methods/results/` and using the model's
+predictions on the training set as the target-axis background. The
+`priority_score` is surfaced throughout: in the Part 2 counterfactual table, as
+a dedicated bar chart next to "CF predictions vs target", and in the Part 3
+per-method (`avg_priority_score`) and per-CF (`priority_score`) metric panels.
 
 ### 3. Author priorities
 
@@ -395,6 +588,64 @@ You can also write your own. Anything callable works, e.g. a lambda that
 > Note: diabetes features are standard-scaled, so their values sit roughly
 > in `[-3, 3]` rather than raw units like "age in years". Look at
 > `coverage.txt` / the dataset plots (stage 4) to choose sensible numbers.
+
+#### Sample- and dataset-relative priorities
+
+The helpers above return **static** functions that know nothing about the
+sample being explained. Many realistic preferences are *relative* -- e.g.
+"prefer values just below the sample's current value" or "decay toward the
+dataset maximum". Those are expressed with an **anchor** (a point resolved
+per sample/feature at build time) plus `peak_priority`, which builds a
+single-peak function that decays to each side.
+
+```python
+from explainit.experiments.continuous_minlp.priority_sets import (
+    peak_priority, at_sample, at_min, at_max, at_value,
+)
+
+# Peak (height 1.0) just above the sample, decaying linearly to the dataset
+# min on the left and exponentially to the dataset max on the right.
+peak_priority(
+    peak_at=at_sample(offset=0.5), peak_value=1.0,
+    left=at_min(),  left_shape="linear",
+    right=at_max(), right_shape="exponential",
+)
+```
+
+Anchors (all take an `offset` and/or `pct`):
+
+* `at_sample(offset=0.0, pct=0.0)` — the sample's own value for this feature.
+* `at_min(...)` / `at_max(...)` — the dataset column min / max.
+* `at_value(v)` — a literal (scaled) value.
+
+Units: features are scaled, so an anchor `offset` is an **absolute** shift in
+that scaled space, while `pct` is a **fraction of the feature's dataset
+range** (`pct=-0.20` == "20% of the range below"; because scaling is linear
+this matches 20% of the raw range too).
+
+`peak_priority` parameters:
+
+* `peak_at` — anchor of the peak; `peak_value` — its height in `[0, 1]`.
+* `left` / `right` — anchors where each side reaches 0. Pass `None` for a
+  **hard cutoff** (0 beyond the peak on that side).
+* `left_shape` / `right_shape` — `"linear"` or `"exponential"` (`a` controls
+  exponential steepness).
+
+> Tip: hard cutoffs (`left=None`, `right=None`, or a `right=at_sample()` that
+> forbids everything above the sample) can make the priority-filtered dataset
+> collapse to a handful of rows, which starves the MINLP exemplar search. If
+> MINLP reports "no elements fulfilling the requirements" or "no
+> positive-priority region", relax the cutoffs to soft decays toward
+> `at_min()` / `at_max()` so every feature stays positive across the range.
+
+For full control you can also build your own `ContextualPriority` (a factory
+`build(FeatureContext) -> f(value)`); `peak_priority` is the common case.
+
+The shipped diabetes `set1` / `set2` use these helpers: both share every
+non-serum priority (via a `_shared_numerical()` helper) and pin `sex` as
+non-actionable, and differ **only** in the five serum features (`s1`..`s5`),
+whose peak sits 20% of the range below the sample (height 0.7) in `set1`
+versus 40% below (height 0.5) in `set2`.
 
 #### Search bounds (min / max)
 

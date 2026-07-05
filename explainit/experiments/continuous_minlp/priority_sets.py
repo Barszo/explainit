@@ -198,32 +198,280 @@ def numerical_entry(
 
 
 # ---------------------------------------------------------------------------
+# Sample / dataset-relative priorities
+# ---------------------------------------------------------------------------
+#
+# The helpers above return *static* functions ``f(value) -> [0, 1]`` that know
+# nothing about the sample being explained or the dataset. Many realistic
+# preferences are relative -- e.g. "prefer values just below the sample's
+# current value" or "decay toward the dataset maximum". Those are expressed
+# with an :class:`Anchor` (a point resolved per sample/feature at build time)
+# and a :class:`ContextualPriority` (a function factory that receives a
+# :class:`FeatureContext`).
+#
+# Units: features are stored scaled. An :class:`Anchor` ``offset`` is an
+# absolute shift in that scaled space, while ``pct`` is a fraction of the
+# feature's dataset range (``dataset_max - dataset_min``). Because scaling is
+# linear, ``pct`` matches the same fraction of the raw feature range.
+
+
+@dataclass
+class FeatureContext:
+    """Per-feature, per-sample context passed to a :class:`ContextualPriority`."""
+
+    feature_name: str
+    sample_value: float
+    dataset_min: float
+    dataset_max: float
+
+    @property
+    def feature_range(self) -> float:
+        return float(self.dataset_max - self.dataset_min)
+
+
+@dataclass
+class Anchor:
+    """A point on a feature axis, resolved against a :class:`FeatureContext`.
+
+    ``base`` selects the reference (the sample value, dataset min/max, or a
+    literal ``value``); ``offset`` shifts it by an absolute amount and ``pct``
+    by a fraction of the feature's dataset range.
+    """
+
+    base: str
+    offset: float = 0.0
+    pct: float = 0.0
+    value: float = 0.0
+
+    def resolve(self, fc: "FeatureContext") -> float:
+        if self.base == "sample":
+            base_v = fc.sample_value
+        elif self.base == "min":
+            base_v = fc.dataset_min
+        elif self.base == "max":
+            base_v = fc.dataset_max
+        elif self.base == "value":
+            base_v = self.value
+        else:
+            raise ValueError(f"Unknown anchor base {self.base!r}.")
+        return float(base_v + self.offset + self.pct * fc.feature_range)
+
+
+def at_sample(offset: float = 0.0, pct: float = 0.0) -> Anchor:
+    """Anchor at the sample's value (``offset`` scaled units, ``pct`` of range)."""
+    return Anchor("sample", offset=float(offset), pct=float(pct))
+
+
+def at_min(offset: float = 0.0, pct: float = 0.0) -> Anchor:
+    """Anchor at the dataset minimum."""
+    return Anchor("min", offset=float(offset), pct=float(pct))
+
+
+def at_max(offset: float = 0.0, pct: float = 0.0) -> Anchor:
+    """Anchor at the dataset maximum."""
+    return Anchor("max", offset=float(offset), pct=float(pct))
+
+
+def at_value(value: float) -> Anchor:
+    """Anchor at a literal (scaled) value."""
+    return Anchor("value", value=float(value))
+
+
+def _as_anchor(a: Any) -> Anchor:
+    if isinstance(a, Anchor):
+        return a
+    return at_value(float(a))
+
+
+@dataclass
+class ContextualPriority:
+    """A priority function that is materialised per sample.
+
+    ``build(FeatureContext) -> f(value) -> [0, 1]``. Optional bound overrides
+    behave like :func:`numerical_entry`.
+    """
+
+    build: Callable[["FeatureContext"], PriorityFn]
+    min_val: Optional[float] = None
+    max_val: Optional[float] = None
+    use_dataset_bounds: bool = True
+
+
+def peak_priority(
+    *,
+    peak_at: Any,
+    peak_value: float = 1.0,
+    left: Optional[Any] = None,
+    left_shape: str = "linear",
+    right: Optional[Any] = None,
+    right_shape: str = "linear",
+    a: float = 5.0,
+    min_val: Optional[float] = None,
+    max_val: Optional[float] = None,
+    use_dataset_bounds: bool = True,
+) -> ContextualPriority:
+    """Preference that peaks at ``peak_at`` and decays to 0 on each side.
+
+    * ``peak_at`` / ``left`` / ``right`` are :class:`Anchor` objects (or plain
+      numbers). ``peak_value`` is the height at the peak.
+    * ``left`` is where the rising side reaches 0 (``left < peak_at``); ``None``
+      means a hard cutoff -- the priority is 0 for values below the peak.
+    * ``right`` is where the falling side reaches 0 (``right > peak_at``);
+      ``None`` means a hard cutoff -- the priority is 0 above the peak.
+    * ``left_shape`` / ``right_shape`` are ``"linear"`` or ``"exponential"``
+      (``a`` controls exponential steepness).
+
+    Examples::
+
+        # 0 below the sample, decaying exponentially to 0 at the dataset max.
+        peak_priority(peak_at=at_sample(offset=0.5), peak_value=1.0,
+                      right=at_max(), right_shape="exponential")
+
+        # peak 0.5 at the sample, linearly down to 0 at 20% of range below it,
+        # and 0 above the sample.
+        peak_priority(peak_at=at_sample(), peak_value=0.5,
+                      left=at_sample(pct=-0.20), left_shape="linear")
+    """
+
+    peak_anchor = _as_anchor(peak_at)
+    left_anchor = None if left is None else _as_anchor(left)
+    right_anchor = None if right is None else _as_anchor(right)
+    pv = float(peak_value)
+    a_val = float(a)
+    ls = str(left_shape)
+    rs = str(right_shape)
+
+    def _build(fc: "FeatureContext") -> PriorityFn:
+        px = peak_anchor.resolve(fc)
+        lx = None if left_anchor is None else left_anchor.resolve(fc)
+        rx = None if right_anchor is None else right_anchor.resolve(fc)
+
+        def _fn(x, _px=px, _lx=lx, _rx=rx, _pv=pv, _ls=ls, _rs=rs, _a=a_val):
+            x = np.asarray(x, dtype=float)
+            if _lx is None or _lx >= _px:
+                left_vals = np.where(x >= _px, _pv, 0.0)
+            elif _ls == "exponential":
+                left_vals = _pv * _exponential(x, x0=_lx, x1=_px, increasing=True, a=_a)
+            else:
+                left_vals = _pv * _basic_linear(x, x0=_lx, x1=_px, increasing=True)
+
+            if _rx is None or _rx <= _px:
+                right_vals = np.zeros_like(x)
+            elif _rs == "exponential":
+                right_vals = _pv * _exponential(x, x0=_px, x1=_rx, increasing=False, a=_a)
+            else:
+                right_vals = _pv * _basic_linear(x, x0=_px, x1=_rx, increasing=False)
+
+            return np.where(x <= _px, left_vals, right_vals)
+
+        return _fn
+
+    return ContextualPriority(
+        build=_build,
+        min_val=min_val,
+        max_val=max_val,
+        use_dataset_bounds=bool(use_dataset_bounds),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Registry -- EDIT THIS
 # ---------------------------------------------------------------------------
 
 
+# The five diabetes blood-serum measurements share the same priority shape;
+# only the peak location and height change between sets.
+_SERUM_FEATURES = ("s1", "s2", "s3", "s4", "s5")
+
+
+def _shared_numerical() -> Dict[str, Any]:
+    """Numerical priorities shared verbatim by every diabetes set.
+
+    Only the serum features (:data:`_SERUM_FEATURES`) differ between sets; the
+    remaining numerical features (``age``, ``bmi``, ``bp``, ``s6``) are declared
+    here once so the sets cannot drift apart.
+
+    These are the *relaxed* shapes: each feature keeps a peak that encodes its
+    preferred direction, but decays smoothly toward the dataset min/max instead
+    of using hard cutoffs. Staying positive across the interior of the range
+    keeps the derived search bounds wide, so the MINLP exemplar search has real
+    candidates to work with (strict cutoffs previously left 0-1 feasible rows).
+    """
+    return {
+        # Prefer higher age: peak just above the sample, declining gently toward
+        # the dataset min (below) and max (above) rather than forbidding either.
+        "age": peak_priority(
+            peak_at=at_sample(offset=0.5), peak_value=1.0,
+            left=at_min(), left_shape="linear",
+            right=at_max(), right_shape="exponential",
+        ),
+        # Prefer at/below the sample's bmi: peak at the sample, declining toward
+        # the min and more steeply above the sample (higher bmi less preferred).
+        "bmi": peak_priority(
+            peak_at=at_sample(), peak_value=0.5,
+            left=at_min(), left_shape="linear",
+            right=at_max(), right_shape="exponential",
+        ),
+        # Mild both-sided preference centred on the sample.
+        "bp": peak_priority(
+            peak_at=at_sample(), peak_value=0.5,
+            left=at_min(), left_shape="exponential",
+            right=at_max(), right_shape="exponential",
+        ),
+        # Flat, low preference across the whole dataset range.
+        "s6": constant_priority(0.1),
+    }
+
+
+def _serum_priorities(*, peak_pct: float, peak_value: float) -> Dict[str, Any]:
+    """Serum priority: peak at ``sample + peak_pct * range`` (below the sample,
+    encoding "prefer lowering the serum"), decaying exponentially toward the
+    dataset min on the left and the dataset max on the right.
+
+    Relaxed vs. the original hard cutoff at the sample value: values above the
+    sample are now merely less preferred rather than forbidden, so the feature
+    stays positive across the range and always has a feasible region.
+    """
+    return {
+        name: peak_priority(
+            peak_at=at_sample(pct=peak_pct),
+            peak_value=peak_value,
+            left=at_min(),
+            left_shape="exponential",
+            right=at_max(),
+            right_shape="exponential",
+        )
+        for name in _SERUM_FEATURES
+    }
+
+
+# NOTE on units: features are standard-scaled. Anchor ``offset`` values (e.g.
+# age's +0.5) are absolute shifts in that scaled space; ``pct`` values are
+# fractions of the feature's dataset range (so pct=-0.20 == "20% of the range
+# below", matching a raw 20%-of-range shift).
 PRIORITY_SETS: Dict[str, Dict[str, Dict[str, Any]]] = {
     "diabetes": {
-        # Example set. Diabetes features are standard-scaled, so values are
-        # roughly in [-3, 3]. Every feature must appear exactly once, either
-        # under "numerical" or "categorical".
-        "default": {
+        # set1 and set2 share every non-serum priority (via _shared_numerical)
+        # and the non-actionable sex constraint; they differ *only* in the
+        # serum features s1 (tc), s2 (ldl), s3 (hdl), s4 (tch), s5 (ltg):
+        # set1's serum peak sits 20% of range below the sample (height 0.7),
+        # set2's sits 40% below (height 0.5).
+        "set1": {
             "numerical": {
-                "age": constant_priority(0.5),          # no preference, free to move
-                "bmi": linear_priority(x0=2.0, x1=-2.0, increasing=False),   # prefer lower bmi
-                "bp": linear_priority(x0=2.0, x1=-2.0, increasing=False),    # prefer lower bp
-                "s1": constant_priority(0.5),
-                "s2": constant_priority(0.5),
-                "s3": constant_priority(0.5),
-                "s4": constant_priority(0.5),
-                "s5": exponential_priority(x0=2.0, x1=-2.0, increasing=False, a=5.0),
-                "s6": constant_priority(0.5),
+                **_shared_numerical(),
+                **_serum_priorities(peak_pct=-0.20, peak_value=0.7),
             },
             "categorical": {
-                # 'sex' is one-hot encoded with two category codes (0 and 1).
-                # Weights are relative preferences (0 = forbidden). Here both
-                # are allowed, with code 0 preferred over code 1.
-                "sex": {0: 1.0, 1: 0.5},
+                "sex": NON_ACTIONABLE,   # must keep the sample's sex
+            },
+        },
+        "set2": {
+            "numerical": {
+                **_shared_numerical(),
+                **_serum_priorities(peak_pct=-0.40, peak_value=0.5),
+            },
+            "categorical": {
+                "sex": NON_ACTIONABLE,
             },
         },
     },
@@ -366,6 +614,20 @@ def build_priorities(
             numerical[idx] = {"function": None, "min": fixed, "max": fixed}
             continue
 
+        if isinstance(entry, ContextualPriority):
+            fc = FeatureContext(
+                feature_name=fname,
+                sample_value=float(sample_arr[idx]),
+                dataset_min=dmin,
+                dataset_max=dmax,
+            )
+            fn = entry.build(fc)
+            final_min, final_max = _resolve_bounds(
+                entry.min_val, entry.max_val, dmin, dmax, entry.use_dataset_bounds,
+            )
+            numerical[idx] = {"function": fn, "min": final_min, "max": final_max}
+            continue
+
         if callable(entry):
             fn: Optional[PriorityFn] = entry
             user_min: Optional[float] = None
@@ -395,6 +657,23 @@ def build_priorities(
         group = categorical_groups[fname]
         indices = tuple(int(i) for i in group["indices"])
         categories = list(group["categories"])
+
+        # Non-actionable categorical: pin to the sample's own category. Only
+        # that one-hot combination keeps a (non-None) weight; the rest are set
+        # to None, which the search treats as forbidden/non-actionable.
+        if weights is NON_ACTIONABLE:
+            sample_one_hot = tuple(float(sample_arr[i]) for i in indices)
+            mapping = {}
+            for code in categories:
+                one_hot = tuple(1.0 if c == code else 0.0 for c in categories)
+                mapping[one_hot] = 1.0 if one_hot == sample_one_hot else None
+            if not any(v is not None for v in mapping.values()):
+                raise ValueError(
+                    f"Non-actionable categorical '{fname}' did not match the "
+                    f"sample's one-hot state {sample_one_hot}; categories={categories}."
+                )
+            categorical[indices] = mapping
+            continue
 
         if not isinstance(weights, dict) or not weights:
             raise ValueError(
@@ -436,4 +715,12 @@ __all__ = [
     "exponential_priority",
     "constant_priority",
     "interval_priority",
+    "FeatureContext",
+    "Anchor",
+    "ContextualPriority",
+    "at_sample",
+    "at_min",
+    "at_max",
+    "at_value",
+    "peak_priority",
 ]
