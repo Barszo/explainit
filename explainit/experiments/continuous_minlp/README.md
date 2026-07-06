@@ -414,21 +414,76 @@ baseline on **identical priorities**, and persists the same result tables as
 `standard_methods/` **plus a per-CF `priority_score`** so the branches are
 directly comparable.
 
-Targets live in the MinMax-scaled `[0, 1]` space: for each selected sample the
-target is `model_prediction + target_offset`.
+The target for each selected sample is `model_prediction + target_offset`,
+expressed in whatever space the dataset's target lives in. For the bundled
+`diabetes` dataset that space is the MinMax-scaled `[0, 1]` range (see stage 1),
+so a `target_offset` of `-0.3` shifts the prediction down by 0.3 in scaled
+units. A dataset with a differently scaled (or unscaled) target simply uses its
+own units for `target_offset` / `epsilon` / `skip_if_target_*`.
 
-The flow is: **explore priorities → configure → run methods → explore
-results**.
+The flow is: **define/adjust priorities → explore priorities → configure → run
+methods → explore results**.
+
+### P0. Define or modify priorities (`priority_sets.py`)
+
+All priorities live in one place: the `PRIORITY_SETS` registry near the bottom
+of `priority_sets.py`. This is the file you edit to change *what the search
+prefers*. It is a plain nested dict, keyed first by **dataset**, then by
+**set name**, so nothing here is hard-wired to `diabetes` or to `set1`/`set2`:
+
+```python
+PRIORITY_SETS = {
+    "<dataset_key>": {                 # matches a dataset from data_setup.py
+        "<set_name>": {                # any name; add as many as you like
+            "numerical":   {"<feature>": <priority fn> | NON_ACTIONABLE, ...},
+            "categorical": {"<feature>": {<code>: <weight>, ...} | NON_ACTIONABLE, ...},
+        },
+        # ... more sets ...
+    },
+    # ... more datasets ...
+}
+```
+
+Three common edits:
+
+* **Tweak an existing priority** — change the function or weight for a feature
+  in the relevant set (e.g. make `bmi` decay faster, or raise a category's
+  weight). See ["3. Author priorities"](#3-author-priorities) below for the full
+  catalogue of building blocks (`linear_priority`, `constant_priority`,
+  `interval_priority`, the sample-relative `peak_priority` / anchors, and
+  `NON_ACTIONABLE`).
+* **Add a new set** — add a new `"<set_name>": { "numerical": {...},
+  "categorical": {...} }` entry under a dataset. It is picked up automatically:
+  it appears in the `priorities_explorer.ipynb` dropdown and can be referenced
+  by `priority_set: <set_name>` in `config.yaml`. Sets are independent, so a new
+  set never affects the others.
+* **Add a new dataset** — add a new top-level `"<dataset_key>": {...}` entry
+  (after preparing that dataset in stages 1-2). Every logical feature of the
+  dataset must appear exactly once across `numerical` + `categorical`;
+  `build_priorities` raises a clear error naming anything missing or misplaced.
+
+To keep repeated shapes DRY (as the diabetes sets do for their shared non-serum
+features), factor them into a small helper that returns a dict and spread it
+with `**helper()` inside each set — this is optional and dataset-specific.
+
+> **Non-actionable features.** To forbid the search from ever changing a
+> feature, set it to `NON_ACTIONABLE` (numerical) or `{"<feature>":
+> NON_ACTIONABLE}` (categorical). It is then pinned to the sample's original
+> value and shown as `actionable = False` in the explorer's breakdown. The
+> bundled diabetes sets pin `sex` this way.
 
 ### P1. Explore a sample's priorities (`priorities_explorer.ipynb`)
 
 `priorities_explorer.ipynb` is a self-contained notebook to inspect what a
 priority set implies for one sample **before** running the methods. Pick a
-dataset, a priority set (`set1` / `set2`), and a sample index; it plots each
-feature's materialised priority function (with the sample value marked) and
-breaks down the sample's own priority score. Use it to sanity-check that the
-peaks/decays match your intent and that features stay positive across the
-range (so MINLP has a feasible region).
+dataset, one of its priority sets, and a sample index; it plots each feature's
+materialised priority function (with the sample value marked) and breaks down
+the sample's own priority score (including an `actionable` column so you can
+confirm that pinned features like `sex` are non-actionable). The dataset and set
+dropdowns are populated straight from `PRIORITY_SETS`, so any set or dataset you
+add in P0 shows up automatically. Use it to sanity-check that the peaks/decays
+match your intent and that features stay positive across the range (so MINLP has
+a feasible region).
 
 ### P2. Configure the run (`priority_methods/config.yaml`)
 
@@ -438,15 +493,15 @@ defaults:
   n_cfs: 5                  # default CFs per method (MINLP is clamped to 1)
 
 experiments:
-  - dataset: diabetes
-    priority_set: set1       # which set from priority_sets.py
+  - dataset: diabetes        # any dataset_key from priority_sets.py
+    priority_set: set1       # any set defined for that dataset
 
     selection:
       strategy: indices      # "indices" or "random"
       sample_indices: [60, 2, 52, 18, 27, 26, 38, 50, 24, 33]
       # n_samples: 10        # only for random strategy
       # seed: 42             # only for random strategy
-      target_offset: -0.3    # target = prediction - 0.3 (scaled)
+      target_offset: -0.3    # target = prediction + offset (dataset's target units)
       skip_if_target_below: 0.0
 
     methods:
@@ -641,11 +696,13 @@ this matches 20% of the raw range too).
 For full control you can also build your own `ContextualPriority` (a factory
 `build(FeatureContext) -> f(value)`); `peak_priority` is the common case.
 
-The shipped diabetes `set1` / `set2` use these helpers: both share every
-non-serum priority (via a `_shared_numerical()` helper) and pin `sex` as
-non-actionable, and differ **only** in the five serum features (`s1`..`s5`),
-whose peak sits 20% of the range below the sample (height 0.7) in `set1`
-versus 40% below (height 0.5) in `set2`.
+The shipped diabetes `set1` / `set2` use these helpers: both spread the same
+`_diabetes_shared_numerical()` block (so `age`, `bmi`, `bp`, `s6` stay identical
+by construction) and pin `sex` as non-actionable, and differ **only** in the
+five serum features (`s1`..`s5`), whose peak sits 20% of the range below the
+sample (height 0.7) in `set1` versus 40% below (height 0.5) in `set2`. Sharing
+via a helper is a convenience, not a rule: each set is independent, so you can
+add sets that share nothing.
 
 #### Search bounds (min / max)
 

@@ -379,19 +379,51 @@ def peak_priority(
 # ---------------------------------------------------------------------------
 
 
+# ===========================================================================
+# HOW TO EDIT THIS REGISTRY
+# ===========================================================================
+#
+# ``PRIORITY_SETS`` is a plain nested dict:
+#
+#     PRIORITY_SETS[<dataset_key>][<set_name>] = {
+#         "numerical":   {<feature_name>: <priority fn> | NON_ACTIONABLE, ...},
+#         "categorical": {<feature_name>: {<code>: <weight>, ...} | NON_ACTIONABLE, ...},
+#     }
+#
+# To *tweak* a priority        -> edit the relevant function/weight below.
+# To *add a new set*           -> add a new ``"<set_name>": {...}`` entry under
+#                                 the dataset (any name; not limited to set1/set2).
+# To *add a new dataset*       -> add a new ``"<dataset_key>": {...}`` top-level
+#                                 entry with one or more sets. Every logical
+#                                 feature of that dataset must appear exactly
+#                                 once (``build_priorities`` enforces this).
+#
+# Each set is self-contained: sets and datasets are independent, so adding one
+# never constrains another. The helpers below are optional conveniences for the
+# diabetes example (they keep repeated shapes DRY); a new dataset can define its
+# own helpers or just inline the priority functions.
+#
+# Units: features are standard-scaled. Anchor ``offset`` values (e.g. age's
+# +0.5) are absolute shifts in that scaled space; ``pct`` values are fractions
+# of the feature's dataset range (so pct=-0.20 == "20% of the range below",
+# matching a raw 20%-of-range shift).
+
+
+# --- Diabetes helpers ------------------------------------------------------
 # The five diabetes blood-serum measurements share the same priority shape;
 # only the peak location and height change between sets.
-_SERUM_FEATURES = ("s1", "s2", "s3", "s4", "s5")
+_DIABETES_SERUM_FEATURES = ("s1", "s2", "s3", "s4", "s5")
 
 
-def _shared_numerical() -> Dict[str, Any]:
-    """Numerical priorities shared verbatim by every diabetes set.
+def _diabetes_shared_numerical() -> Dict[str, Any]:
+    """Non-serum numerical priorities reused across diabetes sets.
 
-    Only the serum features (:data:`_SERUM_FEATURES`) differ between sets; the
-    remaining numerical features (``age``, ``bmi``, ``bp``, ``s6``) are declared
-    here once so the sets cannot drift apart.
+    Declaring the shared features (``age``, ``bmi``, ``bp``, ``s6``) here once
+    keeps them identical across any diabetes set that spreads this helper, so
+    the sets only differ where you *want* them to (the serum features). This is
+    a convenience, not a requirement -- a set may override or ignore it.
 
-    These are the *relaxed* shapes: each feature keeps a peak that encodes its
+    These are *relaxed* shapes: each feature keeps a peak that encodes its
     preferred direction, but decays smoothly toward the dataset min/max instead
     of using hard cutoffs. Staying positive across the interior of the range
     keeps the derived search bounds wide, so the MINLP exemplar search has real
@@ -423,7 +455,7 @@ def _shared_numerical() -> Dict[str, Any]:
     }
 
 
-def _serum_priorities(*, peak_pct: float, peak_value: float) -> Dict[str, Any]:
+def _diabetes_serum_priorities(*, peak_pct: float, peak_value: float) -> Dict[str, Any]:
     """Serum priority: peak at ``sample + peak_pct * range`` (below the sample,
     encoding "prefer lowering the serum"), decaying exponentially toward the
     dataset min on the left and the dataset max on the right.
@@ -441,40 +473,46 @@ def _serum_priorities(*, peak_pct: float, peak_value: float) -> Dict[str, Any]:
             right=at_max(),
             right_shape="exponential",
         )
-        for name in _SERUM_FEATURES
+        for name in _DIABETES_SERUM_FEATURES
     }
 
 
-# NOTE on units: features are standard-scaled. Anchor ``offset`` values (e.g.
-# age's +0.5) are absolute shifts in that scaled space; ``pct`` values are
-# fractions of the feature's dataset range (so pct=-0.20 == "20% of the range
-# below", matching a raw 20%-of-range shift).
+# --- The registry (edit / extend freely) -----------------------------------
 PRIORITY_SETS: Dict[str, Dict[str, Dict[str, Any]]] = {
     "diabetes": {
-        # set1 and set2 share every non-serum priority (via _shared_numerical)
-        # and the non-actionable sex constraint; they differ *only* in the
-        # serum features s1 (tc), s2 (ldl), s3 (hdl), s4 (tch), s5 (ltg):
-        # set1's serum peak sits 20% of range below the sample (height 0.7),
-        # set2's sits 40% below (height 0.5).
+        # set1 and set2 reuse the same non-serum priorities and keep sex
+        # non-actionable; they differ only in the serum features s1 (tc),
+        # s2 (ldl), s3 (hdl), s4 (tch), s5 (ltg).
         "set1": {
             "numerical": {
-                **_shared_numerical(),
-                **_serum_priorities(peak_pct=-0.20, peak_value=0.7),
+                **_diabetes_shared_numerical(),
+                # Serum peak 20% of range below the sample (height 0.7).
+                **_diabetes_serum_priorities(peak_pct=-0.20, peak_value=0.7),
             },
             "categorical": {
-                "sex": NON_ACTIONABLE,   # must keep the sample's sex
+                "sex": NON_ACTIONABLE,   # keep the sample's sex; never change it
             },
         },
         "set2": {
             "numerical": {
-                **_shared_numerical(),
-                **_serum_priorities(peak_pct=-0.40, peak_value=0.5),
+                **_diabetes_shared_numerical(),
+                # Serum peak 40% of range below the sample (height 0.5).
+                **_diabetes_serum_priorities(peak_pct=-0.40, peak_value=0.5),
             },
             "categorical": {
                 "sex": NON_ACTIONABLE,
             },
         },
+        # To add another diabetes set, copy a block above and rename it, e.g.:
+        # "set3": {"numerical": {...}, "categorical": {"sex": NON_ACTIONABLE}},
     },
+    # To add another dataset, add a sibling entry keyed by its dataset_key:
+    # "my_dataset": {
+    #     "default": {
+    #         "numerical": {"feat_a": constant_priority(0.5), ...},
+    #         "categorical": {"cat_b": {0: 1.0, 1: 0.0}},
+    #     },
+    # },
 }
 
 

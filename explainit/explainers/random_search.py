@@ -168,12 +168,21 @@ class RandomSearchExplainer:
             # Get current sample combination
             current_combo = tuple(sample[idx] for idx in group_indices)
             # Get weight for this combination (default to 0 if not found)
-            weight = possible_values.get(current_combo, 0)
+            raw_weight = possible_values.get(current_combo, 0)
+            weight = 0.0 if raw_weight is None else float(raw_weight)
+            # A categorical feature is actionable only if the search may switch
+            # it to more than one combination, i.e. at least two combinations
+            # carry a selectable (non-None) weight. A feature pinned to the
+            # sample's category (all other combinations set to None) is not
+            # actionable.
+            selectable = sum(1 for w in possible_values.values() if w is not None)
+            actionable = selectable > 1
             breakdown['categorical'][group_indices] = {
                 'combination': current_combo,
-                'weight': float(weight)
+                'weight': weight,
+                'actionable': actionable,
             }
-            all_scores.append(float(weight))
+            all_scores.append(weight)
         
         # Calculate overall score
         breakdown['overall'] = float(np.sum(all_scores)) if len(all_scores) > 0 else 0.0
