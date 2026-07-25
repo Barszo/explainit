@@ -1677,31 +1677,20 @@ class MINLSearchExplainer:
     #################################################################
 
     def _stage1_find_exemplar(self):
-        """Locate the anchor exemplar, with graceful fallbacks.
+        """Locate the anchor exemplar, with one fallback.
 
         Selection strategy, tried in order (the first that succeeds wins):
 
           1. ``dataset_priority_filtered`` -- original behaviour: the
              priority-feasible dataset row whose prediction is closest to the
              target (:meth:`find_closest_elem`).
-          2. ``dataset_actionable`` -- if (1) finds no feasible row, pick the
-             dataset row closest to the target in prediction while respecting
-             only actionability (non-actionable categorical values must match
-             the sample; non-actionable numerical features are frozen at the
-             sample value), ignoring the per-feature priority windows. **F1
-             gate**: this exemplar is accepted only if its ``|pred - target|``
-             is within ``target_exemplar_epsilon``; otherwise we cascade.
-          3. ``random_in_range`` -- if (2) is missing or too far, *randomly
-             generate* an exemplar by sampling each actionable feature's allowed
+          2. ``random_in_range`` -- if (1) finds no feasible row, randomly
+             generate an exemplar by sampling each actionable feature's allowed
              range and taking the first point within ``epsilon`` of the target.
              This is **not** the random-search comparison method: preference /
              priority score is deliberately ignored here; we only need any
              reachable, in-range anchor for MINLP to then optimise for the
              highest preference score.
-
-        After selection, **F3** projects the exemplar into every feature's
-        ``allowed_intervals`` so the Shapley linearisation is taken at a point
-        that lies inside the feasible region.
 
         Sets ``self.sample_state.target_exemplar``, records the chosen strategy
         on ``self.exemplar_source`` and the anchor's ``|pred - target|`` on
@@ -1714,131 +1703,41 @@ class MINLSearchExplainer:
                     "requested target. It anchors the linear (Shapley) approximation "
                     "used in later stages.")
 
-        tee = float(self.target_exemplar_epsilon)
-        accept_tol = float(self.epsilon)
-
-        def project_and_log(source: str) -> float:
-            dist_before = self._exemplar_pred_distance()
-            self._project_exemplar_into_allowed_region()
-            dist_after = self._exemplar_pred_distance()
-            logger.info("Target exemplar via '%s': |pred - target| before projection=%.4f, "
-                        "after projection=%.4f (target=%.4f).",
-                        source, dist_before, dist_after, float(self.target))
-            return dist_after
-
         try:
             self.find_closest_elem()
-            dist_after = project_and_log("dataset_priority_filtered")
             self.exemplar_source = "dataset_priority_filtered"
-            self.exemplar_pred_distance = dist_after
+            self.exemplar_pred_distance = self._exemplar_pred_distance()
+            logger.info("Target exemplar via '%s': |pred - target|=%.4f "
+                        "(target=%.4f).",
+                        self.exemplar_source,
+                        self.exemplar_pred_distance,
+                        float(self.target))
             return
         except Exception as primary_exc:
             logger.warning("[Stage 1] Primary exemplar selection "
                            "('dataset_priority_filtered') failed: %s", primary_exc)
             try:
-                dist = self._find_exemplar_actionable_fallback()
-                # F1: only accept the actionable dataset anchor when it remains
-                # close to the target after projection into the priority-allowed
-                # region. A row that is close before projection can become a bad
-                # Shapley anchor after snapping into strict priority intervals.
-                dist_after = project_and_log("dataset_actionable")
-                if dist <= tee and dist_after <= accept_tol:
-                    self.exemplar_source = "dataset_actionable"
-                    self.exemplar_pred_distance = dist_after
-                    logger.warning("[Stage 1] Fallback 'dataset_actionable' accepted "
-                                   "(before projection |pred - target|=%.4f, after "
-                                   "projection %.4f).", dist, dist_after)
-                    return
-                else:
-                    logger.warning("[Stage 1] Fallback 'dataset_actionable' rejected: "
-                                   "before projection |pred - target|=%.4f, after "
-                                   "projection %.4f, tolerance %.4f; cascading to "
-                                   "random in-range generation.",
-                                   dist, dist_after, accept_tol)
-                    raise Exception(
-                        f"actionable exemplar unsuitable after projection "
-                        f"(before={dist:.4f}, after={dist_after:.4f}, "
-                        f"tol={accept_tol:.4f})")
-            except Exception as fallback_exc:
-                logger.warning("[Stage 1] Actionable dataset anchor unusable: %s",
-                               fallback_exc)
-                try:
-                    dist = self._generate_exemplar_in_range(
-                        max_iterations=int(getattr(
-                            self, "_fallback_random_max_iterations", 10000)),
-                    )
-                    dist_after = project_and_log("random_in_range")
-                    self.exemplar_source = "random_in_range"
-                    self.exemplar_pred_distance = dist_after
-                    logger.warning("[Stage 1] Randomly generated in-range exemplar "
-                                   "(before projection |pred - target|=%.4f, after "
-                                   "projection %.4f).", dist, dist_after)
-                    return
-                except Exception as rnd_exc:
-                    self.exemplar_source = "none"
-                    logger.error("[Stage 1] Could not obtain any exemplar (dataset or "
-                                 "random in-range): %s", rnd_exc)
-                    raise
+                self._generate_exemplar_in_range(
+                    max_iterations=int(getattr(
+                        self, "_fallback_random_max_iterations", 10000)),
+                )
+                self.exemplar_source = "random_in_range"
+                self.exemplar_pred_distance = self._exemplar_pred_distance()
+                logger.warning("[Stage 1] Randomly generated in-range exemplar "
+                               "(|pred - target|=%.4f).",
+                               self.exemplar_pred_distance)
+                return
+            except Exception as rnd_exc:
+                self.exemplar_source = "none"
+                logger.error("[Stage 1] Could not obtain any exemplar (dataset or "
+                             "random in-range): %s", rnd_exc)
+                raise
 
     def _exemplar_pred_distance(self) -> float:
         """``|model_pred(target_exemplar) - target|`` for the current exemplar."""
         pred = float(
             np.asarray(self.model_pred([self.sample_state.target_exemplar])).reshape(-1)[0])
         return abs(pred - float(self.target))
-
-    def _project_exemplar_into_allowed_region(self) -> None:
-        """Snap each numerical exemplar value into its allowed interval(s) (F3).
-
-        Non-actionable features have degenerate ``[(fixed, fixed)]`` intervals so
-        they stay put; actionable features that fell in a zero-priority gap (e.g.
-        a ``dataset_actionable`` anchor) are moved to the nearest allowed point.
-        """
-        ex = np.asarray(self.sample_state.target_exemplar, dtype=float).copy()
-        for idx, cfg in self.priorities_state.numerical_priorities.items():
-            intervals = cfg.get("allowed_intervals") if isinstance(cfg, dict) else None
-            if intervals:
-                ex[idx] = self._project_to_allowed_intervals(float(ex[idx]), intervals)
-        self.sample_state.target_exemplar = ex
-
-    def _find_exemplar_actionable_fallback(self) -> float:
-        """Pick the dataset row closest to the target, respecting only actionability.
-
-        Non-actionable categorical values must match the sample, and
-        non-actionable numerical features are frozen at the sample value before
-        the prediction is measured. The per-feature priority windows are
-        deliberately ignored so an anchor can still be found when no dataset row
-        lies in the joint priority region. Returns ``|prediction - target|`` of
-        the selected exemplar.
-        """
-        logger.info("[Stage 1 - fallback] Selecting dataset exemplar by target "
-                    "distance under actionability constraints only.")
-        data_np = self.dataset.copy()
-        sample = np.asarray(self.sample_state.sample, dtype=float)
-
-        # Respect non-actionable categorical values (drop rows that differ).
-        for group, mapping in self.priorities_state.categorical_priorities.items():
-            forbidden = [combo for combo, weight in mapping.items() if weight is None]
-            for combo in forbidden:
-                cols = list(group)
-                keep = ~np.all(
-                    data_np[:, cols] == np.asarray(combo, dtype=float), axis=1)
-                data_np = data_np[keep]
-        if data_np.size == 0:
-            raise Exception("No dataset rows match the sample's non-actionable "
-                            "categorical values.")
-
-        # Freeze non-actionable numerical features at the sample value so the
-        # anchor reflects only what the search can actually move.
-        projected = data_np.copy()
-        for idx in self.priorities_state.non_actionable_indices:
-            if isinstance(idx, int):
-                projected[:, idx] = sample[idx]
-
-        preds = np.asarray(self.model_pred(projected)).reshape(-1)
-        dists = np.abs(preds - float(self.target))
-        best = int(np.argmin(dists))
-        self.sample_state.target_exemplar = projected[best]
-        return float(dists[best])
 
     def _sample_from_allowed_region(self, cfg: dict) -> float:
         """Draw a uniform value from a numerical feature's allowed region."""
@@ -1950,67 +1849,6 @@ class MINLSearchExplainer:
             "min_pred_distance": float(min_dist),
             "iterations_run": int(found_iter if found_iter is not None else max_iterations),
         }
-
-    def _stage2_log_bounds(self):
-        """Surface the numerical bounds used by both LP and SLSQP."""
-
-    def _find_exemplar_actionable_fallback(self) -> float:
-        """Pick the dataset row closest to the target, respecting only actionability.
-
-        Non-actionable categorical values must match the sample, and
-        non-actionable numerical features are frozen at the sample value before
-        the prediction is measured. The per-feature priority windows are
-        deliberately ignored so an anchor can still be found when no dataset row
-        lies in the joint priority region. Returns ``|prediction - target|`` of
-        the selected exemplar.
-        """
-        logger.info("[Stage 1 - fallback] Selecting dataset exemplar by target "
-                    "distance under actionability constraints only.")
-        data_np = self.dataset.copy()
-        sample = np.asarray(self.sample_state.sample, dtype=float)
-
-        # Respect non-actionable categorical values (drop rows that differ).
-        for group, mapping in self.priorities_state.categorical_priorities.items():
-            forbidden = [combo for combo, weight in mapping.items() if weight is None]
-            for combo in forbidden:
-                cols = list(group)
-                keep = ~np.all(
-                    data_np[:, cols] == np.asarray(combo, dtype=float), axis=1)
-                data_np = data_np[keep]
-        if data_np.size == 0:
-            raise Exception("No dataset rows match the sample's non-actionable "
-                            "categorical values.")
-
-        # Freeze non-actionable numerical features at the sample value so the
-        # anchor reflects only what the search can actually move.
-        projected = data_np.copy()
-        for idx in self.priorities_state.non_actionable_indices:
-            if isinstance(idx, int):
-                projected[:, idx] = sample[idx]
-
-        preds = np.asarray(self.model_pred(projected)).reshape(-1)
-        dists = np.abs(preds - float(self.target))
-        best = int(np.argmin(dists))
-        self.sample_state.target_exemplar = projected[best]
-        return float(dists[best])
-
-    def _sample_from_allowed_region(self, cfg: dict) -> float:
-        """Draw a uniform value from a numerical feature's allowed region."""
-        intervals = cfg.get("allowed_intervals") if isinstance(cfg, dict) else None
-        if not intervals:
-            lo = cfg.get("min")
-            hi = cfg.get("max")
-            if lo is None or hi is None:
-                raise Exception("Feature has no allowed region to sample from.")
-            return float(np.random.uniform(float(lo), float(hi)))
-        lengths = np.array(
-            [max(0.0, float(hi) - float(lo)) for lo, hi in intervals], dtype=float)
-        total = float(lengths.sum())
-        if total <= 0.0:
-            lo, _hi = intervals[int(np.random.randint(len(intervals)))]
-            return float(lo)
-        pick = intervals[int(np.random.choice(len(intervals), p=lengths / total))]
-        return float(np.random.uniform(float(pick[0]), float(pick[1])))
 
     def _find_exemplar_random_fallback(
         self, max_iterations: int = 10000, random_seed=None,
