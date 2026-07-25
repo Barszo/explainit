@@ -103,6 +103,10 @@ class MINLPMethod(BasePriorityMethod):
             logger.warning("MINLP find_counterfactuals failed: %s", exc)
         last = getattr(explainer, "last_search_result", None) or {}
         exemplar_source = getattr(explainer, "exemplar_source", None)
+        exemplar_pred_distance = last.get(
+            "exemplar_pred_distance",
+            getattr(explainer, "exemplar_pred_distance", None))
+        warm_start = last.get("warm_start") or {}
         cfs: List[np.ndarray] = []
         if cf_raw is not None:
             cfs.append(np.asarray(cf_raw, dtype=float).reshape(-1))
@@ -115,6 +119,12 @@ class MINLPMethod(BasePriorityMethod):
                 "reached_target": bool(last.get("reached_target", False)),
                 "stop_reason": str(last.get("stop_reason", "unknown")),
                 "exemplar_source": exemplar_source,
+                "exemplar_pred_distance": exemplar_pred_distance,
+                "search_exception": last.get("search_exception"),
+                "warm_start_total_combos": warm_start.get("total_combos"),
+                "warm_start_feasible_combos": warm_start.get("feasible_combos"),
+                "warm_start_best_model_gap": warm_start.get("best_warmstart_model_gap"),
+                "warm_start_best_linear_gap": warm_start.get("best_warmstart_linear_gap"),
             },
         }
 

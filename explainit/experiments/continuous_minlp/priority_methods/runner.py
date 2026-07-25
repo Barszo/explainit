@@ -42,6 +42,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[4]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from explainit.explainers.minlp_search import MINLSearchExplainer  # noqa: E402
 from explainit.experiments.continuous_minlp.priority_sets import build_priorities  # noqa: E402
 from explainit.experiments.continuous_minlp.priority_methods.methods import (  # noqa: E402
     build_method,
@@ -162,14 +163,68 @@ def _write_counterfactuals_csv(path: Path, pctx: PriorityContext, rows: List[Dic
         "sample_id", "method", "cf_index", "target", "original_prediction",
         "cf_prediction", "validity", "abs_pred_error", "l1", "l2", "n_changed",
         "sparsity_fraction", "priority_score", "iterations", "time_seconds",
-        "error", "failure_reason", "exemplar_source",
+        "error", "failure_reason", "stop_reason", "exemplar_source",
+        "exemplar_pred_distance", "warm_start_total_combos",
+        "warm_start_feasible_combos", "warm_start_best_model_gap",
+        "search_exception",
     ]
     fieldnames = metric_fields + [f"cf__{n}" for n in pctx.feature_names]
     with open(path, "w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer = csv.DictWriter(handle, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
         for row in rows:
             writer.writerow(row)
+
+
+def _write_feasibility_csv(path: Path, rows: List[Dict[str, Any]]) -> None:
+    fieldnames = [
+        "sample_id", "target", "feasible_within_epsilon", "min_pred_distance",
+        "iterations_run", "error",
+    ]
+    with open(path, "w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames, extrasaction="ignore")
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
+
+
+def _run_feasibility_probe(
+    pctx: PriorityContext,
+    priorities: Dict[str, Any],
+    rec: SampleRecord,
+    epsilon: float,
+    max_iterations: int,
+) -> Dict[str, Any]:
+    """Random in-range probe: can the allowed region reach the target at all?
+
+    Separates feasibility (region cannot reach the target) from convergence
+    (region can, but MINLP's optimiser did not) failures. Preference/priority
+    score is ignored on purpose (this is not the random-search baseline).
+    """
+    try:
+        explainer = MINLSearchExplainer(
+            model_pred=pctx.model_predict,
+            priorities=priorities,
+            sample=np.asarray(rec.x, dtype=float).tolist(),
+            target=float(rec.target),
+            dataset=np.asarray(pctx.X_train, dtype=float).copy(),
+            epsilon=float(epsilon),
+            feature_names=pctx.feature_names,
+        )
+        probe = explainer.probe_allowed_region_feasibility(
+            max_iterations=int(max_iterations))
+        probe["error"] = None
+    except Exception as exc:
+        logger.warning("[feasibility probe] sample=%d failed: %s", rec.sample_id, exc)
+        probe = {
+            "feasible_within_epsilon": None,
+            "min_pred_distance": None,
+            "iterations_run": None,
+            "error": str(exc),
+        }
+    probe["sample_id"] = rec.sample_id
+    probe["target"] = rec.target
+    return probe
 
 
 def _write_summary(path_csv: Path, path_json: Path, dataset_key: str,
@@ -375,6 +430,9 @@ def run_experiment(experiment: Dict[str, Any], defaults: Dict[str, Any]) -> Opti
     logger.info("[%s] Live progress log: %s", dataset_key, progress_log.path)
 
     cf_rows: List[Dict[str, Any]] = []
+    feasibility_rows: List[Dict[str, Any]] = []
+    run_feasibility_probe = any(m.name == "minlp" for m in methods)
+    feasibility_probe_iterations = int(settings.get("feasibility_probe_iterations", 5000))
     per_method: Dict[str, List[Dict[str, Any]]] = {m.name: [] for m in methods}
     experiment_started = time.perf_counter()
     completed_method_runs = 0
@@ -386,6 +444,18 @@ def run_experiment(experiment: Dict[str, Any], defaults: Dict[str, Any]) -> Opti
                 dataset_key, sample_index, len(samples), rec.sample_id,
             )
             priorities = build_priorities(pctx.ctx, priority_set, rec.x)
+            if run_feasibility_probe:
+                probe = _run_feasibility_probe(
+                    pctx, priorities, rec, epsilon, feasibility_probe_iterations)
+                feasibility_rows.append(probe)
+                logger.info(
+                    "[%s] sample=%d feasibility probe: feasible=%s min_pred_distance=%s "
+                    "(iterations=%s).",
+                    dataset_key, rec.sample_id,
+                    probe.get("feasible_within_epsilon"),
+                    probe.get("min_pred_distance"),
+                    probe.get("iterations_run"),
+                )
             sample_method_summaries: Dict[str, Dict[str, Any]] = {}
             for method in methods:
                 n_cfs = int(getattr(method, "_n_cfs", 1))
@@ -419,14 +489,23 @@ def run_experiment(experiment: Dict[str, Any], defaults: Dict[str, Any]) -> Opti
                     if metrics["validity"]:
                         n_valid += 1
 
+                    stop_reason = extra_info.get("stop_reason")
+                    search_exception = extra_info.get("search_exception")
                     failure_reason: str = ""
                     if cf is None:
-                        failure_reason = error or "no counterfactual produced"
+                        if error:
+                            failure_reason = error
+                        elif stop_reason:
+                            failure_reason = f"no counterfactual produced (stop_reason={stop_reason})"
+                        else:
+                            failure_reason = "no counterfactual produced"
+                        if search_exception:
+                            failure_reason = f"{failure_reason}; search_exception={search_exception}"
                     elif not metrics["validity"]:
                         if extra_info.get("reached_target") is not None and not extra_info["reached_target"]:
                             failure_reason = (
                                 f"MINLP did not reach target: "
-                                f"{extra_info.get('stop_reason', 'unknown')}"
+                                f"{stop_reason or 'unknown'}"
                             )
                         else:
                             failure_reason = (
@@ -457,7 +536,13 @@ def run_experiment(experiment: Dict[str, Any], defaults: Dict[str, Any]) -> Opti
                         "time_seconds": float(elapsed),
                         "error": error,
                         "failure_reason": failure_reason,
+                        "stop_reason": stop_reason,
                         "exemplar_source": exemplar_source,
+                        "exemplar_pred_distance": extra_info.get("exemplar_pred_distance"),
+                        "warm_start_total_combos": extra_info.get("warm_start_total_combos"),
+                        "warm_start_feasible_combos": extra_info.get("warm_start_feasible_combos"),
+                        "warm_start_best_model_gap": extra_info.get("warm_start_best_model_gap"),
+                        "search_exception": search_exception,
                     }
                     for i, name in enumerate(pctx.feature_names):
                         row[f"cf__{name}"] = float(cf[i]) if cf is not None else None
@@ -564,6 +649,8 @@ def run_experiment(experiment: Dict[str, Any], defaults: Dict[str, Any]) -> Opti
 
     _write_samples_csv(out_dir / "samples.csv", pctx, samples)
     _write_counterfactuals_csv(out_dir / "counterfactuals.csv", pctx, cf_rows)
+    if feasibility_rows:
+        _write_feasibility_csv(out_dir / "minlp_feasibility.csv", feasibility_rows)
     _write_summary(out_dir / "metrics_summary.csv", out_dir / "summary.json",
                    dataset_key, summary_rows)
     _write_run_config(
