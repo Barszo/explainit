@@ -2060,29 +2060,52 @@ class MINLSearchExplainer:
 
         return counterfactuals
 
-    def _select_best_candidate(self, counterfactuals):
-        """Stage 6: pick the candidate with the lowest priority cost.
+    def _priority_benefit(self, cf):
+        """``calculate_total_weight(cf)`` or ``None`` when ``cf`` is out of range.
 
-        With no categorical features there is exactly one candidate so this
-        just returns it. Raises :class:`RuntimeError` if no candidates are
-        available so the iterative loop can mark the iteration as failed.
+        ``calculate_total_weight`` is the *priority benefit* that the search
+        maximises (higher is better, same quantity as
+        ``priority_methods.methods.compute_priority_score``). It raises for
+        values outside the allowed range / inside a zero-priority gap, which
+        SLSQP can still produce, so callers get ``None`` instead of an
+        exception.
+        """
+        try:
+            return float(self.calculate_total_weight(cf))
+        except ValueError as exc:
+            logger.debug("Priority benefit unavailable for candidate: %s", exc)
+            return None
+
+    def _select_best_candidate(self, counterfactuals):
+        """Stage 6: pick the candidate with the highest priority benefit.
+
+        ``calculate_total_weight`` is maximised by the SLSQP objective (which
+        minimises its negation), so selection across categorical combinations
+        must pick the *largest* value. With no categorical features there is
+        exactly one candidate so this just returns it. Raises
+        :class:`RuntimeError` if no candidates are available so the iterative
+        loop can mark the iteration as failed.
         """
         logger.info("--- STAGE 6/6: Pick best counterfactual ---")
-        logger.info("Among %d candidate(s), pick the one with the lowest priority "
-                    "cost (calculate_total_weight). With no categorical features there "
-                    "is exactly one candidate.", len(counterfactuals))
+        logger.info("Among %d candidate(s), pick the one with the highest priority "
+                    "benefit (calculate_total_weight). With no categorical features "
+                    "there is exactly one candidate.", len(counterfactuals))
         if not counterfactuals:
             raise RuntimeError("No counterfactual candidates produced for selection.")
         if len(counterfactuals) > 1:
             best_counterfactual = None
-            best_weight = float('inf')
+            best_benefit = float('-inf')
             for cf in counterfactuals:
-                weight = self.calculate_total_weight(cf)
-                logger.debug("Candidate weight=%.4f", weight)
-                if weight < best_weight:
-                    best_weight = weight
+                benefit = self._priority_benefit(cf)
+                logger.debug("Candidate priority benefit=%s", benefit)
+                if benefit is not None and benefit > best_benefit:
+                    best_benefit = benefit
                     best_counterfactual = cf
-            logger.info("Selected candidate weight=%.4f", best_weight)
+            if best_counterfactual is None:
+                logger.warning("No candidate had an evaluable priority benefit; "
+                               "falling back to the first candidate.")
+                return counterfactuals[0]
+            logger.info("Selected candidate priority benefit=%.4f", best_benefit)
             return best_counterfactual
         return counterfactuals[0]
 
@@ -2093,8 +2116,11 @@ class MINLSearchExplainer:
           * ``model_pred``: real model output on ``cf``.
           * ``h_x``: surrogate prediction (Shapley-linear approximation).
             Falls back to NaN if the surrogate cannot be evaluated yet.
-          * ``distance``: ``|model_pred - target|`` used as the iteration
-            improvement metric.
+          * ``distance``: ``|model_pred - target|``, used to rank candidates
+            only while no candidate satisfies the target band.
+          * ``priority``: priority benefit (``None`` if not evaluable), used
+            to rank candidates that do satisfy the band.
+          * ``feasible``: ``distance <= epsilon`` against the real model.
         """
         model_pred = float(self.model_pred([cf])[0])
         try:
@@ -2108,10 +2134,13 @@ class MINLSearchExplainer:
             ))
         except Exception:
             h_x = float("nan")
+        distance = abs(model_pred - float(self.target))
         return {
             "model_pred": model_pred,
             "h_x": h_x,
-            "distance": abs(model_pred - float(self.target)),
+            "distance": distance,
+            "priority": self._priority_benefit(cf),
+            "feasible": distance <= float(self.epsilon),
         }
 
     def find_counterfactuals(self, shap_approx=False, num_samples=200,
@@ -2123,15 +2152,28 @@ class MINLSearchExplainer:
         Stages 1 and 2 (locate target exemplar, gather bounds) run once.
         Stages 3-6 (Shapley, LP warm starts, SLSQP, candidate selection)
         run inside a refinement loop: after each pass we evaluate the
-        chosen candidate with the real model. While we are still outside
-        ``epsilon`` of ``target`` we advance the working sample to the
-        new candidate and re-linearise against the same exemplar.
+        chosen candidate with the real model and advance the working sample
+        to it, re-linearising against the same exemplar.
+
+        Two incumbents are tracked, so that the priority benefit (the
+        quantity the optimisation claims to maximise) is what decides the
+        returned counterfactual:
+
+          * ``best_feasible``: among candidates inside the target band
+            (``|model_pred - target| <= epsilon``), the one with the highest
+            priority benefit. Returned whenever it exists.
+          * ``best_infeasible``: only used while no candidate has entered the
+            band; ranked by ``|model_pred - target|``.
+
+        The loop therefore does *not* stop when the band is first reached: the
+        band becomes a hard constraint and the search keeps trying to improve
+        the priority benefit inside it.
 
         The loop stops when:
-          * the real model prediction is within ``epsilon`` of ``target``, or
           * ``max_iterations`` passes have been executed, or
-          * ``patience`` consecutive iterations have failed to beat the
-            best ``|model_pred(cf) - target|`` seen so far, or
+          * ``patience`` consecutive iterations have failed to improve the
+            active incumbent (priority benefit once inside the band, distance
+            to target before that), or
           * an internal pass raised an exception (e.g. infeasible LP).
 
         Args:
@@ -2140,7 +2182,7 @@ class MINLSearchExplainer:
                 Shapley estimator.
             max_iterations: Maximum number of refinement passes.
             patience: Stop after this many consecutive iterations without
-                improving the best distance to target.
+                improving the active incumbent.
             return_when_fails: If True (default) return the best candidate
                 found even when the target was never reached, with a
                 warning log and full status on
@@ -2154,8 +2196,11 @@ class MINLSearchExplainer:
 
         Side effects:
             Sets ``self.last_search_result`` with keys ``reached_target``,
-            ``distance``, ``iterations_run``, ``stop_reason``,
-            ``best_cf`` and ``history``.
+            ``distance``, ``iterations_run``, ``stop_reason``, ``best_cf``,
+            ``history``, ``cf_source`` (``anchor`` when the returned CF is the
+            Stage 1 exemplar, ``optimiser`` when it came out of SLSQP),
+            ``priority_score``, ``anchor_priority_score`` and
+            ``priority_gain_vs_anchor`` (0.0 when the anchor wins).
         """
         logger.info("=" * 78)
         logger.info("MINLP COUNTERFACTUAL SEARCH | target=%.4f | epsilon=%.4f | "
@@ -2190,15 +2235,26 @@ class MINLSearchExplainer:
         anchor_cf = list(np.asarray(self.sample_state.target_exemplar, dtype=float))
         anchor_pred = float(np.asarray(self.model_pred([anchor_cf])).reshape(-1)[0])
         anchor_distance = abs(anchor_pred - float(self.target))
+        anchor_priority = self._priority_benefit(anchor_cf)
+
+        best_feasible = None
+        best_feasible_priority = float("-inf")
+        best_feasible_distance = float("inf")
+        best_feasible_source = None
+        best_infeasible = None
+        best_infeasible_distance = float("inf")
+
         if anchor_distance <= float(self.epsilon):
-            best_cf = anchor_cf
-            best_distance = anchor_distance
+            best_feasible = anchor_cf
+            best_feasible_priority = (
+                anchor_priority if anchor_priority is not None else float("-inf"))
+            best_feasible_distance = anchor_distance
+            best_feasible_source = "anchor"
             logger.info("Initial exemplar is already a valid fallback CF: "
-                        "model_pred=%.4f | distance=%.4f.", anchor_pred,
-                        anchor_distance)
-        else:
-            best_cf = None
-            best_distance = float("inf")
+                        "model_pred=%.4f | distance=%.4f | priority=%s. It is only "
+                        "kept as the incumbent until an SLSQP candidate beats its "
+                        "priority benefit.",
+                        anchor_pred, anchor_distance, anchor_priority)
         no_progress = 0
         history = []
         stop_reason = "max_iterations"
@@ -2218,25 +2274,49 @@ class MINLSearchExplainer:
                 break
 
             eval_info = self._evaluate_candidate(cf)
-            improved = eval_info["distance"] < best_distance
-            best_so_far = (
-                f"{best_distance:.4f}" if best_distance != float("inf") else "n/a"
+            priority = eval_info["priority"]
+            improved = False
+
+            if eval_info["feasible"]:
+                # Inside the band: rank on the priority benefit only.
+                if best_feasible is None or (
+                    priority is not None and priority > best_feasible_priority
+                ):
+                    best_feasible = list(cf)
+                    best_feasible_priority = (
+                        priority if priority is not None else float("-inf"))
+                    best_feasible_distance = eval_info["distance"]
+                    best_feasible_source = "optimiser"
+                    improved = True
+            elif best_feasible is None and eval_info["distance"] < best_infeasible_distance:
+                # No candidate inside the band yet: rank on distance to target.
+                best_infeasible = list(cf)
+                best_infeasible_distance = eval_info["distance"]
+                improved = True
+
+            best_priority_so_far = (
+                f"{best_feasible_priority:.4f}"
+                if best_feasible_priority != float("-inf") else "n/a"
             )
-            logger.info("[Iter %d] model_pred(cf)=%.4f | h(x)=%.4f | "
-                        "distance=%.4f | best_so_far=%s | improved_vs_best=%s",
+            best_distance_so_far = (
+                f"{best_feasible_distance:.4f}" if best_feasible is not None
+                else (f"{best_infeasible_distance:.4f}"
+                      if best_infeasible_distance != float("inf") else "n/a")
+            )
+            logger.info("[Iter %d] model_pred(cf)=%.4f | h(x)=%.4f | distance=%.4f | "
+                        "feasible=%s | priority=%s | best_priority=%s | "
+                        "best_distance=%s | improved_vs_best=%s",
                         iteration + 1,
                         eval_info["model_pred"], eval_info["h_x"],
-                        eval_info["distance"], best_so_far, improved)
+                        eval_info["distance"], eval_info["feasible"],
+                        f"{priority:.4f}" if priority is not None else "n/a",
+                        best_priority_so_far, best_distance_so_far, improved)
 
             if improved:
-                best_cf = list(cf)
-                best_distance = eval_info["distance"]
                 no_progress = 0
-                logger.info("[Iter %d] New best CF (distance=%.4f).",
-                            iteration + 1, best_distance)
             else:
                 no_progress += 1
-                logger.info("[Iter %d] No improvement vs best (%d/%d).",
+                logger.info("[Iter %d] No improvement vs incumbent (%d/%d).",
                             iteration + 1, no_progress, int(patience))
 
             history.append({
@@ -2244,19 +2324,17 @@ class MINLSearchExplainer:
                 "model_pred": eval_info["model_pred"],
                 "h_x": eval_info["h_x"],
                 "distance": eval_info["distance"],
+                "feasible": eval_info["feasible"],
+                "priority": priority,
                 "improved_vs_best": improved,
             })
 
-            if eval_info["distance"] <= self.epsilon:
-                logger.info("[Iter %d] Target reached within epsilon=%.4f.",
-                            iteration + 1, float(self.epsilon))
-                stop_reason = "target_reached"
-                break
-
             if no_progress >= int(patience):
-                logger.info("Stopping: %d consecutive iterations without improvement.",
-                            int(patience))
-                stop_reason = "patience_exhausted"
+                logger.info("Stopping: %d consecutive iterations without improving "
+                            "the %s incumbent.", int(patience),
+                            "priority" if best_feasible is not None else "distance")
+                stop_reason = ("priority_stagnation" if best_feasible is not None
+                               else "patience_exhausted")
                 break
 
             # Always advance to the latest CF, even when it did not improve;
@@ -2270,9 +2348,29 @@ class MINLSearchExplainer:
         self.sample_state.sample = original_sample
         self._workflow_iteration = None
 
-        reached = best_distance <= float(self.epsilon)
-        if reached and stop_reason != "target_reached":
-            stop_reason = "best_candidate_within_epsilon"
+        reached = best_feasible is not None
+        if reached:
+            best_cf = best_feasible
+            best_distance = best_feasible_distance
+            best_priority = (best_feasible_priority
+                             if best_feasible_priority != float("-inf") else None)
+            cf_source = best_feasible_source
+            if stop_reason == "max_iterations":
+                stop_reason = "target_reached"
+        else:
+            best_cf = best_infeasible
+            best_distance = best_infeasible_distance
+            best_priority = (self._priority_benefit(best_cf)
+                             if best_cf is not None else None)
+            cf_source = "optimiser" if best_cf is not None else None
+
+        # The anchor is a priority-agnostic in-range point, so a run that
+        # returns it must not be credited with a priority gain.
+        if cf_source == "anchor" or best_priority is None or anchor_priority is None:
+            priority_gain_vs_anchor = 0.0 if cf_source == "anchor" else None
+        else:
+            priority_gain_vs_anchor = float(best_priority) - float(anchor_priority)
+
         self.last_search_result = {
             "reached_target": reached,
             "distance": best_distance,
@@ -2284,13 +2382,26 @@ class MINLSearchExplainer:
             "exemplar_pred_distance": self.exemplar_pred_distance,
             "warm_start": self._warm_start_info,
             "search_exception": self._last_search_exception,
+            "cf_source": cf_source,
+            "priority_score": best_priority,
+            "anchor_priority_score": anchor_priority,
+            "anchor_distance": anchor_distance,
+            "priority_gain_vs_anchor": priority_gain_vs_anchor,
         }
 
         logger.info("=" * 78)
         logger.info("MINLP SEARCH DONE | reached_target=%s | stop_reason=%s | "
-                    "iterations=%d | best_distance=%.4f",
+                    "iterations=%d | best_distance=%.4f | cf_source=%s | "
+                    "priority=%s | anchor_priority=%s | gain_vs_anchor=%s",
                     reached, stop_reason, len(history),
-                    best_distance if best_distance != float("inf") else float("nan"))
+                    best_distance if best_distance != float("inf") else float("nan"),
+                    cf_source, best_priority, anchor_priority,
+                    priority_gain_vs_anchor)
+        if cf_source == "anchor":
+            logger.warning("Returned CF is the Stage 1 anchor exemplar (source=%s): no "
+                           "SLSQP candidate beat its priority benefit (%s). This run "
+                           "carries no optimisation gain.",
+                           self.exemplar_source, anchor_priority)
         logger.info("=" * 78)
 
         if reached:

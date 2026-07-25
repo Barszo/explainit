@@ -163,7 +163,8 @@ def _write_counterfactuals_csv(path: Path, pctx: PriorityContext, rows: List[Dic
         "sample_id", "method", "cf_index", "target", "original_prediction",
         "cf_prediction", "validity", "abs_pred_error", "l1", "l2", "n_changed",
         "sparsity_fraction", "priority_score", "iterations", "time_seconds",
-        "error", "failure_reason", "stop_reason", "exemplar_source",
+        "error", "failure_reason", "stop_reason", "cf_source",
+        "anchor_priority_score", "priority_gain_vs_anchor", "exemplar_source",
         "exemplar_pred_distance", "warm_start_total_combos",
         "warm_start_feasible_combos", "warm_start_best_model_gap",
         "search_exception",
@@ -337,6 +338,8 @@ class _ProgressLogWriter:
                 f"{method_name}_valid_cfs",
                 f"{method_name}_invalid_cfs",
                 f"{method_name}_exemplar_source",
+                f"{method_name}_cf_source",
+                f"{method_name}_priority_gain_vs_anchor",
                 f"{method_name}_failure_reason",
             ])
         self._handle = open(path, "w", newline="", encoding="utf-8")
@@ -386,6 +389,9 @@ class _ProgressLogWriter:
             row[f"{method_name}_valid_cfs"] = int(summary.get("valid_cfs", 0))
             row[f"{method_name}_invalid_cfs"] = int(summary.get("invalid_cfs", 0))
             row[f"{method_name}_exemplar_source"] = summary.get("exemplar_source", "") or ""
+            row[f"{method_name}_cf_source"] = summary.get("cf_source", "") or ""
+            row[f"{method_name}_priority_gain_vs_anchor"] = summary.get(
+                "priority_gain_vs_anchor")
             row[f"{method_name}_failure_reason"] = summary.get("failure_reason", "")
         self._writer.writerow(row)
         self._flush()
@@ -537,6 +543,9 @@ def run_experiment(experiment: Dict[str, Any], defaults: Dict[str, Any]) -> Opti
                         "error": error,
                         "failure_reason": failure_reason,
                         "stop_reason": stop_reason,
+                        "cf_source": extra_info.get("cf_source"),
+                        "anchor_priority_score": extra_info.get("anchor_priority_score"),
+                        "priority_gain_vs_anchor": extra_info.get("priority_gain_vs_anchor"),
                         "exemplar_source": exemplar_source,
                         "exemplar_pred_distance": extra_info.get("exemplar_pred_distance"),
                         "warm_start_total_combos": extra_info.get("warm_start_total_combos"),
@@ -563,6 +572,8 @@ def run_experiment(experiment: Dict[str, Any], defaults: Dict[str, Any]) -> Opti
                     "valid_cfs": n_valid,
                     "invalid_cfs": invalid_count,
                     "exemplar_source": exemplar_source,
+                    "cf_source": extra_info.get("cf_source"),
+                    "priority_gain_vs_anchor": extra_info.get("priority_gain_vs_anchor"),
                     "failure_reason": method_failure,
                 }
                 avg_seconds_per_method = (
@@ -574,14 +585,15 @@ def run_experiment(experiment: Dict[str, Any], defaults: Dict[str, Any]) -> Opti
                     if avg_seconds_per_method is not None else None
                 )
                 logger.info(
-                    "[%s] sample=%d method=%s valid=%d invalid=%d source=%s time=%.2fs | "
-                    "progress=%.1f%% | remaining=%d method runs | eta=%s",
+                    "[%s] sample=%d method=%s valid=%d invalid=%d source=%s cf_source=%s "
+                    "time=%.2fs | progress=%.1f%% | remaining=%d method runs | eta=%s",
                     dataset_key,
                     rec.sample_id,
                     method.name,
                     n_valid,
                     invalid_count,
                     exemplar_source or "n/a",
+                    extra_info.get("cf_source") or "n/a",
                     elapsed,
                     (100.0 * completed_method_runs / total_method_runs)
                     if total_method_runs else 100.0,
