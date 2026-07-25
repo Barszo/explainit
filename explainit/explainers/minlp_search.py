@@ -110,6 +110,12 @@ class MINLSearchExplainer:
         self.epsilon = epsilon
         self.workflow_logger = workflow_logger
         self.feature_names = list(feature_names) if feature_names is not None else None
+        # Records which strategy produced the target exemplar for the last run
+        # (see ``_stage1_find_exemplar``): one of ``dataset_priority_filtered``,
+        # ``dataset_actionable`` or ``random_search``.
+        self.exemplar_source = None
+        self.last_search_result = {}
+        self._fallback_random_max_iterations = 10000
 
     def _workflow_log(self, message, *args):
         if self.workflow_logger is not None:
@@ -1639,21 +1645,168 @@ class MINLSearchExplainer:
     #################################################################
 
     def _stage1_find_exemplar(self):
-        """Locate the dataset row whose prediction is closest to ``target``.
+        """Locate the anchor exemplar, with graceful fallbacks.
 
-        Sets ``self.sample_state.target_exemplar``. Runs once per
-        ``find_counterfactuals`` call; the exemplar is the fixed anchor
-        every refinement iteration linearises against.
+        Selection strategy, tried in order (the first that succeeds wins):
+
+          1. ``dataset_priority_filtered`` -- original behaviour: the
+             priority-feasible dataset row whose prediction is closest to the
+             target (:meth:`find_closest_elem`).
+          2. ``dataset_actionable`` -- if (1) finds no feasible row, pick the
+             dataset row closest to the target in prediction while respecting
+             only actionability (non-actionable categorical values must match
+             the sample; non-actionable numerical features are frozen at the
+             sample value), ignoring the per-feature priority windows.
+          3. ``random_search`` -- if (2) also fails, sample points from each
+             actionable feature's allowed region and take the first whose
+             prediction is within ``epsilon`` of the target (priority score is
+             deliberately not considered).
+
+        Sets ``self.sample_state.target_exemplar`` and records the chosen
+        strategy on ``self.exemplar_source``. Runs once per
+        ``find_counterfactuals`` call; the exemplar is the fixed anchor every
+        refinement iteration linearises against.
         """
-        logger.info("--- STAGE 1/6: Locate target exemplar in dataset ---")
-        logger.info("Goal: pick a real training point whose model prediction is closest "
-                    "to the requested target (within target_exemplar_epsilon=%.4f). "
-                    "It anchors the linear (Shapley) approximation used in later stages.",
-                    float(self.target_exemplar_epsilon))
-        self.find_closest_elem()
-        logger.info("Target exemplar selected: prediction=%.4f (target=%.4f)",
+        logger.info("--- STAGE 1/6: Locate target exemplar (with fallbacks) ---")
+        logger.info("Goal: pick an anchor whose model prediction is close to the "
+                    "requested target. It anchors the linear (Shapley) approximation "
+                    "used in later stages.")
+
+        try:
+            self.find_closest_elem()
+            self.exemplar_source = "dataset_priority_filtered"
+        except Exception as primary_exc:
+            logger.warning("[Stage 1] Primary exemplar selection "
+                           "('dataset_priority_filtered') failed: %s", primary_exc)
+            try:
+                dist = self._find_exemplar_actionable_fallback()
+                self.exemplar_source = "dataset_actionable"
+                logger.warning("[Stage 1] Fallback 'dataset_actionable' selected an "
+                               "exemplar (|pred - target|=%.4f).", dist)
+            except Exception as fallback_exc:
+                logger.warning("[Stage 1] Fallback 'dataset_actionable' failed: %s",
+                               fallback_exc)
+                dist = self._find_exemplar_random_fallback(
+                    max_iterations=int(getattr(
+                        self, "_fallback_random_max_iterations", 10000)),
+                )
+                self.exemplar_source = "random_search"
+                logger.warning("[Stage 1] Fallback 'random_search' selected an "
+                               "exemplar (|pred - target|=%.4f).", dist)
+
+        logger.info("Target exemplar selected via '%s': prediction=%.4f (target=%.4f)",
+                    self.exemplar_source,
                     float(self.model_pred([self.sample_state.target_exemplar])[0]),
                     float(self.target))
+
+    def _find_exemplar_actionable_fallback(self) -> float:
+        """Pick the dataset row closest to the target, respecting only actionability.
+
+        Non-actionable categorical values must match the sample, and
+        non-actionable numerical features are frozen at the sample value before
+        the prediction is measured. The per-feature priority windows are
+        deliberately ignored so an anchor can still be found when no dataset row
+        lies in the joint priority region. Returns ``|prediction - target|`` of
+        the selected exemplar.
+        """
+        logger.info("[Stage 1 - fallback] Selecting dataset exemplar by target "
+                    "distance under actionability constraints only.")
+        data_np = self.dataset.copy()
+        sample = np.asarray(self.sample_state.sample, dtype=float)
+
+        # Respect non-actionable categorical values (drop rows that differ).
+        for group, mapping in self.priorities_state.categorical_priorities.items():
+            forbidden = [combo for combo, weight in mapping.items() if weight is None]
+            for combo in forbidden:
+                cols = list(group)
+                keep = ~np.all(
+                    data_np[:, cols] == np.asarray(combo, dtype=float), axis=1)
+                data_np = data_np[keep]
+        if data_np.size == 0:
+            raise Exception("No dataset rows match the sample's non-actionable "
+                            "categorical values.")
+
+        # Freeze non-actionable numerical features at the sample value so the
+        # anchor reflects only what the search can actually move.
+        projected = data_np.copy()
+        for idx in self.priorities_state.non_actionable_indices:
+            if isinstance(idx, int):
+                projected[:, idx] = sample[idx]
+
+        preds = np.asarray(self.model_pred(projected)).reshape(-1)
+        dists = np.abs(preds - float(self.target))
+        best = int(np.argmin(dists))
+        self.sample_state.target_exemplar = projected[best]
+        return float(dists[best])
+
+    def _sample_from_allowed_region(self, cfg: dict) -> float:
+        """Draw a uniform value from a numerical feature's allowed region."""
+        intervals = cfg.get("allowed_intervals") if isinstance(cfg, dict) else None
+        if not intervals:
+            lo = cfg.get("min")
+            hi = cfg.get("max")
+            if lo is None or hi is None:
+                raise Exception("Feature has no allowed region to sample from.")
+            return float(np.random.uniform(float(lo), float(hi)))
+        lengths = np.array(
+            [max(0.0, float(hi) - float(lo)) for lo, hi in intervals], dtype=float)
+        total = float(lengths.sum())
+        if total <= 0.0:
+            lo, _hi = intervals[int(np.random.randint(len(intervals)))]
+            return float(lo)
+        pick = intervals[int(np.random.choice(len(intervals), p=lengths / total))]
+        return float(np.random.uniform(float(pick[0]), float(pick[1])))
+
+    def _find_exemplar_random_fallback(
+        self, max_iterations: int = 10000, random_seed=None,
+    ) -> float:
+        """Sample points from the allowed region; return the first near the target.
+
+        Each actionable numerical feature is drawn uniformly from its allowed
+        interval(s); each actionable categorical group picks uniformly among its
+        allowed combinations (priority weights are ignored on purpose).
+        Non-actionable features are frozen at the sample value. The first
+        candidate whose prediction lands within ``epsilon`` of the target is
+        accepted, without regard to its priority score. Returns
+        ``|prediction - target|`` of the accepted point.
+        """
+        logger.info("[Stage 1 - fallback] Random-search exemplar: sampling the allowed "
+                    "region for a point within epsilon=%.4f of target "
+                    "(max_iterations=%d).", float(self.epsilon), int(max_iterations))
+        if random_seed is not None:
+            np.random.seed(int(random_seed))
+
+        sample = np.asarray(self.sample_state.sample, dtype=float)
+        num_priorities = self.priorities_state.numerical_priorities
+        cat_priorities = self.priorities_state.categorical_priorities
+
+        for i in range(int(max_iterations)):
+            cand = sample.copy()
+            for idx, cfg in num_priorities.items():
+                if not isinstance(cfg, dict) or cfg.get("function") is None:
+                    cand[idx] = float(sample[idx])  # non-actionable: frozen
+                    continue
+                cand[idx] = self._sample_from_allowed_region(cfg)
+            for group, mapping in cat_priorities.items():
+                allowed = [combo for combo, weight in mapping.items()
+                           if weight is not None and float(weight) > 0.0]
+                if not allowed:
+                    raise Exception(f"Categorical group {group} has no allowed "
+                                    f"combinations to sample from.")
+                combo = allowed[int(np.random.randint(len(allowed)))]
+                for j, idx in enumerate(group):
+                    cand[idx] = float(combo[j])
+            pred = float(np.asarray(self.model_pred(cand.reshape(1, -1))).reshape(-1)[0])
+            if abs(pred - float(self.target)) <= float(self.epsilon):
+                self.sample_state.target_exemplar = cand
+                logger.info("[Stage 1 - fallback] Random-search found a point at "
+                            "iteration %d (|pred - target|=%.4f).",
+                            i + 1, abs(pred - float(self.target)))
+                return abs(pred - float(self.target))
+
+        raise Exception(f"Random-search fallback could not find a point within "
+                        f"epsilon={self.epsilon} of target after {max_iterations} "
+                        f"iterations.")
 
     def _stage2_log_bounds(self):
         """Surface the numerical bounds used by both LP and SLSQP."""
@@ -1870,7 +2023,8 @@ class MINLSearchExplainer:
 
     def find_counterfactuals(self, shap_approx=False, num_samples=200,
                              max_iterations=10, patience=5,
-                             return_when_fails=True):
+                             return_when_fails=True,
+                             fallback_random_max_iterations=10000):
         """Find a counterfactual via iterative Shapley re-linearisation.
 
         Stages 1 and 2 (locate target exemplar, gather bounds) run once.
@@ -1919,6 +2073,9 @@ class MINLSearchExplainer:
                     bool(shap_approx), int(num_samples),
                     bool(return_when_fails))
         logger.info("=" * 78)
+
+        self.exemplar_source = None
+        self._fallback_random_max_iterations = int(fallback_random_max_iterations)
 
         # Stage 0: infer bounds directly from priority functions.
         self._derive_bounds_and_intervals_from_priorities()
@@ -2010,6 +2167,7 @@ class MINLSearchExplainer:
             "stop_reason": stop_reason,
             "best_cf": list(best_cf) if best_cf is not None else None,
             "history": history,
+            "exemplar_source": self.exemplar_source,
         }
 
         logger.info("=" * 78)

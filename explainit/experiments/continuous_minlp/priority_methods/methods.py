@@ -87,13 +87,22 @@ class MINLPMethod(BasePriorityMethod):
             workflow_logger=workflow_logger,
             feature_names=self.pctx.feature_names,
         )
-        cf_raw = explainer.find_counterfactuals(
-            shap_approx=bool(p.get("shap_approx", True)),
-            num_samples=int(p.get("shap_num_samples", 200)),
-            max_iterations=int(p.get("max_iterations", 10)),
-            patience=int(p.get("patience", 5)),
-        )
+        error: Optional[str] = None
+        cf_raw = None
+        try:
+            cf_raw = explainer.find_counterfactuals(
+                shap_approx=bool(p.get("shap_approx", True)),
+                num_samples=int(p.get("shap_num_samples", 200)),
+                max_iterations=int(p.get("max_iterations", 10)),
+                patience=int(p.get("patience", 5)),
+                fallback_random_max_iterations=int(
+                    p.get("fallback_random_max_iterations", 10000)),
+            )
+        except Exception as exc:
+            error = str(exc)
+            logger.warning("MINLP find_counterfactuals failed: %s", exc)
         last = getattr(explainer, "last_search_result", None) or {}
+        exemplar_source = getattr(explainer, "exemplar_source", None)
         cfs: List[np.ndarray] = []
         if cf_raw is not None:
             cfs.append(np.asarray(cf_raw, dtype=float).reshape(-1))
@@ -101,10 +110,11 @@ class MINLPMethod(BasePriorityMethod):
             "cfs": cfs,
             "cf_iterations": None,
             "iterations": int(last.get("iterations_run", 0)),
-            "error": None,
+            "error": error,
             "extra": {
                 "reached_target": bool(last.get("reached_target", False)),
                 "stop_reason": str(last.get("stop_reason", "unknown")),
+                "exemplar_source": exemplar_source,
             },
         }
 

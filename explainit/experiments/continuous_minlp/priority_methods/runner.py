@@ -162,7 +162,7 @@ def _write_counterfactuals_csv(path: Path, pctx: PriorityContext, rows: List[Dic
         "sample_id", "method", "cf_index", "target", "original_prediction",
         "cf_prediction", "validity", "abs_pred_error", "l1", "l2", "n_changed",
         "sparsity_fraction", "priority_score", "iterations", "time_seconds",
-        "error", "failure_reason",
+        "error", "failure_reason", "exemplar_source",
     ]
     fieldnames = metric_fields + [f"cf__{n}" for n in pctx.feature_names]
     with open(path, "w", newline="", encoding="utf-8") as handle:
@@ -281,6 +281,7 @@ class _ProgressLogWriter:
             fieldnames.extend([
                 f"{method_name}_valid_cfs",
                 f"{method_name}_invalid_cfs",
+                f"{method_name}_exemplar_source",
                 f"{method_name}_failure_reason",
             ])
         self._handle = open(path, "w", newline="", encoding="utf-8")
@@ -329,6 +330,7 @@ class _ProgressLogWriter:
             summary = method_summaries.get(method_name, {})
             row[f"{method_name}_valid_cfs"] = int(summary.get("valid_cfs", 0))
             row[f"{method_name}_invalid_cfs"] = int(summary.get("invalid_cfs", 0))
+            row[f"{method_name}_exemplar_source"] = summary.get("exemplar_source", "") or ""
             row[f"{method_name}_failure_reason"] = summary.get("failure_reason", "")
         self._writer.writerow(row)
         self._flush()
@@ -406,6 +408,7 @@ def run_experiment(experiment: Dict[str, Any], defaults: Dict[str, Any]) -> Opti
                                      dataset_key, method.name, rec.sample_id, exc)
                     error = str(exc)
                 elapsed = time.perf_counter() - started
+                exemplar_source = extra_info.get("exemplar_source")
 
                 emitted = cfs if cfs else [None]
                 n_valid = 0
@@ -454,6 +457,7 @@ def run_experiment(experiment: Dict[str, Any], defaults: Dict[str, Any]) -> Opti
                         "time_seconds": float(elapsed),
                         "error": error,
                         "failure_reason": failure_reason,
+                        "exemplar_source": exemplar_source,
                     }
                     for i, name in enumerate(pctx.feature_names):
                         row[f"cf__{name}"] = float(cf[i]) if cf is not None else None
@@ -473,6 +477,7 @@ def run_experiment(experiment: Dict[str, Any], defaults: Dict[str, Any]) -> Opti
                 sample_method_summaries[method.name] = {
                     "valid_cfs": n_valid,
                     "invalid_cfs": invalid_count,
+                    "exemplar_source": exemplar_source,
                     "failure_reason": method_failure,
                 }
                 avg_seconds_per_method = (
@@ -484,13 +489,14 @@ def run_experiment(experiment: Dict[str, Any], defaults: Dict[str, Any]) -> Opti
                     if avg_seconds_per_method is not None else None
                 )
                 logger.info(
-                    "[%s] sample=%d method=%s valid=%d invalid=%d time=%.2fs | "
+                    "[%s] sample=%d method=%s valid=%d invalid=%d source=%s time=%.2fs | "
                     "progress=%.1f%% | remaining=%d method runs | eta=%s",
                     dataset_key,
                     rec.sample_id,
                     method.name,
                     n_valid,
                     invalid_count,
+                    exemplar_source or "n/a",
                     elapsed,
                     (100.0 * completed_method_runs / total_method_runs)
                     if total_method_runs else 100.0,
