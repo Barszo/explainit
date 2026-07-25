@@ -18,23 +18,42 @@ defaults:
 
 experiments:
   - dataset: diabetes
-    # Which priority set from priority_sets.py to use (e.g. set1 / set2).
-    priority_set: set1
+    priority_set: set1     # which set from priority_sets.py
 
     selection:
-      # Strategy options:
-      # - indices: use explicit `sample_indices` below (in listed order)
-      # - random:  use `n_samples` + `seed`
       strategy: indices
       sample_indices: [60, 2, 52, 18, 27, 26, 38, 50, 24, 33]
-      # n_samples: 10
-      # seed: 42
       target_offset: -0.3
       skip_if_target_below: 0.0
 
     methods:
       - name: minlp
         n_cfs: 1               # MINLP is single-shot
+        params:
+          shap_approx: true
+          shap_num_samples: 200
+          max_iterations: 10
+          patience: 5
+          target_exemplar_epsilon: 0.10
+      - name: random_search
+        n_cfs: 5
+        params:
+          max_iterations: 10000
+          use_monte_carlo: true
+          seed: 42
+
+  - dataset: diabetes
+    priority_set: set2
+
+    selection:
+      strategy: indices
+      sample_indices: [60, 2, 52, 18, 27, 26, 38, 50, 24, 33]
+      target_offset: -0.3
+      skip_if_target_below: 0.0
+
+    methods:
+      - name: minlp
+        n_cfs: 1
         params:
           shap_approx: true
           shap_num_samples: 200

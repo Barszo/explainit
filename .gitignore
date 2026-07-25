@@ -29,7 +29,9 @@ __pycache__/
 *.csv
 *.keras
 *.pkl
-
+managing_droid_sessions.md
+minlp_theory_review_suggestions.md
+session_reader.py
 # C extensions
 *.so
 DiCE/

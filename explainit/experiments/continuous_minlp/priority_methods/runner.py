@@ -28,6 +28,7 @@ import argparse
 import csv
 import json
 import logging
+import os
 import sys
 import time
 from datetime import datetime, timezone
@@ -160,7 +161,8 @@ def _write_counterfactuals_csv(path: Path, pctx: PriorityContext, rows: List[Dic
     metric_fields = [
         "sample_id", "method", "cf_index", "target", "original_prediction",
         "cf_prediction", "validity", "abs_pred_error", "l1", "l2", "n_changed",
-        "sparsity_fraction", "priority_score", "iterations", "time_seconds", "error",
+        "sparsity_fraction", "priority_score", "iterations", "time_seconds",
+        "error", "failure_reason",
     ]
     fieldnames = metric_fields + [f"cf__{n}" for n in pctx.feature_names]
     with open(path, "w", newline="", encoding="utf-8") as handle:
@@ -230,6 +232,115 @@ def _write_run_config(
         json.dump(payload, handle, indent=2, default=_json_default)
 
 
+def _format_duration(seconds: Optional[float]) -> str:
+    if seconds is None:
+        return ""
+    if not np.isfinite(seconds):
+        return ""
+    total_seconds = max(0, int(round(float(seconds))))
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours:d}:{minutes:02d}:{secs:02d}"
+    return f"{minutes:02d}:{secs:02d}"
+
+
+class _ProgressLogWriter:
+    def __init__(
+        self,
+        path: Path,
+        *,
+        dataset_key: str,
+        priority_set: str,
+        method_names: Sequence[str],
+        total_samples: int,
+        total_method_runs: int,
+    ) -> None:
+        self.path = path
+        self.dataset_key = dataset_key
+        self.priority_set = priority_set
+        self.method_names = list(method_names)
+        self.total_samples = int(total_samples)
+        self.total_method_runs = int(total_method_runs)
+        fieldnames = [
+            "timestamp_utc",
+            "dataset",
+            "priority_set",
+            "sample_id",
+            "samples_completed",
+            "total_samples",
+            "samples_remaining",
+            "method_runs_completed",
+            "total_method_runs",
+            "method_runs_remaining",
+            "progress_pct",
+            "estimated_seconds_left",
+            "remaining_to_end",
+        ]
+        for method_name in self.method_names:
+            fieldnames.extend([
+                f"{method_name}_valid_cfs",
+                f"{method_name}_invalid_cfs",
+                f"{method_name}_failure_reason",
+            ])
+        self._handle = open(path, "w", newline="", encoding="utf-8")
+        self._writer = csv.DictWriter(self._handle, fieldnames=fieldnames)
+        self._writer.writeheader()
+        self._flush()
+
+    def append_sample(
+        self,
+        *,
+        sample_id: int,
+        method_summaries: Dict[str, Dict[str, Any]],
+        samples_completed: int,
+        method_runs_completed: int,
+        estimated_seconds_left: Optional[float],
+    ) -> None:
+        samples_remaining = max(0, self.total_samples - int(samples_completed))
+        method_runs_remaining = max(0, self.total_method_runs - int(method_runs_completed))
+        progress_pct = (
+            (100.0 * float(method_runs_completed) / float(self.total_method_runs))
+            if self.total_method_runs else 100.0
+        )
+        row: Dict[str, Any] = {
+            "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+            "dataset": self.dataset_key,
+            "priority_set": self.priority_set,
+            "sample_id": int(sample_id),
+            "samples_completed": int(samples_completed),
+            "total_samples": self.total_samples,
+            "samples_remaining": samples_remaining,
+            "method_runs_completed": int(method_runs_completed),
+            "total_method_runs": self.total_method_runs,
+            "method_runs_remaining": method_runs_remaining,
+            "progress_pct": round(progress_pct, 2),
+            "estimated_seconds_left": (
+                round(float(estimated_seconds_left), 2)
+                if estimated_seconds_left is not None else None
+            ),
+            "remaining_to_end": (
+                f"{samples_remaining} sample(s), "
+                f"{method_runs_remaining} method run(s), "
+                f"eta {_format_duration(estimated_seconds_left) or 'unknown'}"
+            ),
+        }
+        for method_name in self.method_names:
+            summary = method_summaries.get(method_name, {})
+            row[f"{method_name}_valid_cfs"] = int(summary.get("valid_cfs", 0))
+            row[f"{method_name}_invalid_cfs"] = int(summary.get("invalid_cfs", 0))
+            row[f"{method_name}_failure_reason"] = summary.get("failure_reason", "")
+        self._writer.writerow(row)
+        self._flush()
+
+    def close(self) -> None:
+        self._handle.close()
+
+    def _flush(self) -> None:
+        self._handle.flush()
+        os.fsync(self._handle.fileno())
+
+
 def run_experiment(experiment: Dict[str, Any], defaults: Dict[str, Any]) -> Optional[Path]:
     settings = _merge_defaults(experiment, defaults)
     dataset_key = settings["dataset"]
@@ -248,70 +359,169 @@ def run_experiment(experiment: Dict[str, Any], defaults: Dict[str, Any]) -> Opti
 
     default_n_cfs = int(settings.get("n_cfs", 1) or 1)
     methods = _instantiate_methods(pctx, method_cfgs, epsilon, default_n_cfs)
+    out_dir = RESULTS_DIR / dataset_key / priority_set
+    out_dir.mkdir(parents=True, exist_ok=True)
+    total_method_runs = len(samples) * len(methods)
+    progress_log = _ProgressLogWriter(
+        out_dir / "execution_progress.csv",
+        dataset_key=dataset_key,
+        priority_set=priority_set,
+        method_names=[m.name for m in methods],
+        total_samples=len(samples),
+        total_method_runs=total_method_runs,
+    )
+    logger.info("[%s] Live progress log: %s", dataset_key, progress_log.path)
 
     cf_rows: List[Dict[str, Any]] = []
     per_method: Dict[str, List[Dict[str, Any]]] = {m.name: [] for m in methods}
+    experiment_started = time.perf_counter()
+    completed_method_runs = 0
 
-    for rec in samples:
-        priorities = build_priorities(pctx.ctx, priority_set, rec.x)
-        for method in methods:
-            n_cfs = int(getattr(method, "_n_cfs", 1))
-            started = time.perf_counter()
-            error: Optional[str] = None
-            iterations: Optional[int] = None
-            cf_iterations: Optional[List[int]] = None
-            cfs: List[np.ndarray] = []
-            try:
-                out = method.generate_many(rec.x, rec.target, priorities, n_cfs)
-                iterations = out.get("iterations")
-                cf_iterations = out.get("cf_iterations")
-                error = out.get("error")
-                cfs = [np.asarray(c, dtype=float).reshape(-1)
-                       for c in (out.get("cfs") or []) if c is not None]
-            except Exception as exc:
-                logger.exception("[%s] method=%s sample=%d failed: %s",
-                                 dataset_key, method.name, rec.sample_id, exc)
-                error = str(exc)
-            elapsed = time.perf_counter() - started
-
-            emitted = cfs if cfs else [None]
-            n_valid = 0
-            for cf_index, cf in enumerate(emitted):
-                metrics = _compute_metrics(
-                    rec.x, cf, rec.target, epsilon, pctx.model_predict, priorities)
-                if metrics["validity"]:
-                    n_valid += 1
-                iters_for_cf = iterations
-                if cf_iterations is not None and cf_index < len(cf_iterations):
-                    iters_for_cf = cf_iterations[cf_index]
-                row: Dict[str, Any] = {
-                    "sample_id": rec.sample_id,
-                    "method": method.name,
-                    "cf_index": cf_index,
-                    "target": rec.target,
-                    "original_prediction": rec.original_prediction,
-                    "cf_prediction": metrics["cf_prediction"],
-                    "validity": metrics["validity"],
-                    "abs_pred_error": metrics["abs_pred_error"],
-                    "l1": metrics["l1"],
-                    "l2": metrics["l2"],
-                    "n_changed": metrics["n_changed"],
-                    "sparsity_fraction": metrics["sparsity_fraction"],
-                    "priority_score": metrics["priority_score"],
-                    "iterations": iters_for_cf,
-                    "time_seconds": float(elapsed),
-                    "error": error,
-                }
-                for i, name in enumerate(pctx.feature_names):
-                    row[f"cf__{name}"] = float(cf[i]) if cf is not None else None
-                cf_rows.append(row)
-                per_method[method.name].append(row)
-
+    try:
+        for sample_index, rec in enumerate(samples, start=1):
             logger.info(
-                "[%s] sample=%d method=%s cfs=%d valid=%d iters=%s time=%.2fs",
-                dataset_key, rec.sample_id, method.name, len(cfs), n_valid,
-                iterations, elapsed,
+                "[%s] sample %d/%d (id=%d) started.",
+                dataset_key, sample_index, len(samples), rec.sample_id,
             )
+            priorities = build_priorities(pctx.ctx, priority_set, rec.x)
+            sample_method_summaries: Dict[str, Dict[str, Any]] = {}
+            for method in methods:
+                n_cfs = int(getattr(method, "_n_cfs", 1))
+                started = time.perf_counter()
+                error: Optional[str] = None
+                iterations: Optional[int] = None
+                cf_iterations: Optional[List[int]] = None
+                cfs: List[np.ndarray] = []
+                extra_info: Dict[str, Any] = {}
+                try:
+                    out = method.generate_many(rec.x, rec.target, priorities, n_cfs)
+                    iterations = out.get("iterations")
+                    cf_iterations = out.get("cf_iterations")
+                    error = out.get("error")
+                    extra_info = dict(out.get("extra", {}) or {})
+                    cfs = [np.asarray(c, dtype=float).reshape(-1)
+                           for c in (out.get("cfs") or []) if c is not None]
+                except Exception as exc:
+                    logger.exception("[%s] method=%s sample=%d failed: %s",
+                                     dataset_key, method.name, rec.sample_id, exc)
+                    error = str(exc)
+                elapsed = time.perf_counter() - started
+
+                emitted = cfs if cfs else [None]
+                n_valid = 0
+                invalid_reasons: List[str] = []
+                for cf_index, cf in enumerate(emitted):
+                    metrics = _compute_metrics(
+                        rec.x, cf, rec.target, epsilon, pctx.model_predict, priorities)
+                    if metrics["validity"]:
+                        n_valid += 1
+
+                    failure_reason: str = ""
+                    if cf is None:
+                        failure_reason = error or "no counterfactual produced"
+                    elif not metrics["validity"]:
+                        if extra_info.get("reached_target") is not None and not extra_info["reached_target"]:
+                            failure_reason = (
+                                f"MINLP did not reach target: "
+                                f"{extra_info.get('stop_reason', 'unknown')}"
+                            )
+                        else:
+                            failure_reason = (
+                                f"prediction error {metrics['abs_pred_error']:.4f} "
+                                f"> epsilon {epsilon:.4f}"
+                            )
+                    if failure_reason:
+                        invalid_reasons.append(failure_reason)
+
+                    iters_for_cf = iterations
+                    if cf_iterations is not None and cf_index < len(cf_iterations):
+                        iters_for_cf = cf_iterations[cf_index]
+                    row: Dict[str, Any] = {
+                        "sample_id": rec.sample_id,
+                        "method": method.name,
+                        "cf_index": cf_index,
+                        "target": rec.target,
+                        "original_prediction": rec.original_prediction,
+                        "cf_prediction": metrics["cf_prediction"],
+                        "validity": metrics["validity"],
+                        "abs_pred_error": metrics["abs_pred_error"],
+                        "l1": metrics["l1"],
+                        "l2": metrics["l2"],
+                        "n_changed": metrics["n_changed"],
+                        "sparsity_fraction": metrics["sparsity_fraction"],
+                        "priority_score": metrics["priority_score"],
+                        "iterations": iters_for_cf,
+                        "time_seconds": float(elapsed),
+                        "error": error,
+                        "failure_reason": failure_reason,
+                    }
+                    for i, name in enumerate(pctx.feature_names):
+                        row[f"cf__{name}"] = float(cf[i]) if cf is not None else None
+                    cf_rows.append(row)
+                    per_method[method.name].append(row)
+
+                completed_method_runs += 1
+                invalid_count = max(0, n_cfs - n_valid)
+                method_failure = error or ""
+                if not method_failure and invalid_reasons:
+                    method_failure = invalid_reasons[0]
+                if not method_failure and len(cfs) < n_cfs:
+                    method_failure = (
+                        f"found {len(cfs)}/{n_cfs} counterfactuals within epsilon "
+                        f"{epsilon:.4f}"
+                    )
+                sample_method_summaries[method.name] = {
+                    "valid_cfs": n_valid,
+                    "invalid_cfs": invalid_count,
+                    "failure_reason": method_failure,
+                }
+                avg_seconds_per_method = (
+                    (time.perf_counter() - experiment_started) / completed_method_runs
+                    if completed_method_runs else None
+                )
+                estimated_seconds_left = (
+                    avg_seconds_per_method * max(0, total_method_runs - completed_method_runs)
+                    if avg_seconds_per_method is not None else None
+                )
+                logger.info(
+                    "[%s] sample=%d method=%s valid=%d invalid=%d time=%.2fs | "
+                    "progress=%.1f%% | remaining=%d method runs | eta=%s",
+                    dataset_key,
+                    rec.sample_id,
+                    method.name,
+                    n_valid,
+                    invalid_count,
+                    elapsed,
+                    (100.0 * completed_method_runs / total_method_runs)
+                    if total_method_runs else 100.0,
+                    max(0, total_method_runs - completed_method_runs),
+                    _format_duration(estimated_seconds_left) or "unknown",
+                )
+
+            avg_seconds_per_method = (
+                (time.perf_counter() - experiment_started) / completed_method_runs
+                if completed_method_runs else None
+            )
+            estimated_seconds_left = (
+                avg_seconds_per_method * max(0, total_method_runs - completed_method_runs)
+                if avg_seconds_per_method is not None else None
+            )
+            progress_log.append_sample(
+                sample_id=rec.sample_id,
+                method_summaries=sample_method_summaries,
+                samples_completed=sample_index,
+                method_runs_completed=completed_method_runs,
+                estimated_seconds_left=estimated_seconds_left,
+            )
+            logger.info(
+                "[%s] sample=%d finished | remaining=%d sample(s) | eta=%s",
+                dataset_key,
+                rec.sample_id,
+                max(0, len(samples) - sample_index),
+                _format_duration(estimated_seconds_left) or "unknown",
+            )
+    finally:
+        progress_log.close()
 
     summary_rows: List[Dict[str, Any]] = []
     for method in methods:
@@ -346,8 +556,6 @@ def run_experiment(experiment: Dict[str, Any], defaults: Dict[str, Any]) -> Opti
             "avg_time_seconds": _mean([r["time_seconds"] for r in real_rows or rows]),
         })
 
-    out_dir = RESULTS_DIR / dataset_key
-    out_dir.mkdir(parents=True, exist_ok=True)
     _write_samples_csv(out_dir / "samples.csv", pctx, samples)
     _write_counterfactuals_csv(out_dir / "counterfactuals.csv", pctx, cf_rows)
     _write_summary(out_dir / "metrics_summary.csv", out_dir / "summary.json",

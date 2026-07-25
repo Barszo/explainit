@@ -482,8 +482,8 @@ the sample's own priority score (including an `actionable` column so you can
 confirm that pinned features like `sex` are non-actionable). The dataset and set
 dropdowns are populated straight from `PRIORITY_SETS`, so any set or dataset you
 add in P0 shows up automatically. Use it to sanity-check that the peaks/decays
-match your intent and that features stay positive across the range (so MINLP has
-a feasible region).
+match your intent, that pinned features are really non-actionable, and, for
+strict sets, how much feasible space is left.
 
 ### P2. Configure the run (`priority_methods/config.yaml`)
 
@@ -667,16 +667,20 @@ peak_priority(
 )
 ```
 
-Anchors (all take an `offset` and/or `pct`):
+Anchors (all take an `offset` and/or `pct`; `at_sample` also accepts
+`sample_pct`):
 
-* `at_sample(offset=0.0, pct=0.0)` — the sample's own value for this feature.
+* `at_sample(offset=0.0, pct=0.0, sample_pct=0.0)` — the sample's own value for
+  this feature.
 * `at_min(...)` / `at_max(...)` — the dataset column min / max.
 * `at_value(v)` — a literal (scaled) value.
 
 Units: features are scaled, so an anchor `offset` is an **absolute** shift in
 that scaled space, while `pct` is a **fraction of the feature's dataset
 range** (`pct=-0.20` == "20% of the range below"; because scaling is linear
-this matches 20% of the raw range too).
+this matches 20% of the raw range too). `sample_pct` is a **fraction of the
+sample's absolute feature value**, so `sample_pct=-0.20` means "20% below the
+current sample value" on the value axis.
 
 `peak_priority` parameters:
 
@@ -688,10 +692,9 @@ this matches 20% of the raw range too).
 
 > Tip: hard cutoffs (`left=None`, `right=None`, or a `right=at_sample()` that
 > forbids everything above the sample) can make the priority-filtered dataset
-> collapse to a handful of rows, which starves the MINLP exemplar search. If
-> MINLP reports "no elements fulfilling the requirements" or "no
-> positive-priority region", relax the cutoffs to soft decays toward
-> `at_min()` / `at_max()` so every feature stays positive across the range.
+> collapse to a handful of rows, which starves the MINLP exemplar search. That
+> can still be a valid experimental choice, but if you want a softer search
+> space you can relax those cutoffs to decays toward `at_min()` / `at_max()`.
 
 For full control you can also build your own `ContextualPriority` (a factory
 `build(FeatureContext) -> f(value)`); `peak_priority` is the common case.
@@ -699,10 +702,10 @@ For full control you can also build your own `ContextualPriority` (a factory
 The shipped diabetes `set1` / `set2` use these helpers: both spread the same
 `_diabetes_shared_numerical()` block (so `age`, `bmi`, `bp`, `s6` stay identical
 by construction) and pin `sex` as non-actionable, and differ **only** in the
-five serum features (`s1`..`s5`), whose peak sits 20% of the range below the
-sample (height 0.7) in `set1` versus 40% below (height 0.5) in `set2`. Sharing
-via a helper is a convenience, not a rule: each set is independent, so you can
-add sets that share nothing.
+five serum features (`s1`..`s5`), whose peak sits 20% below the sample's
+absolute value (height 0.7) in `set1` versus 40% below (height 0.5) in `set2`,
+and both drop to 0 at the sample value. Sharing via a helper is a convenience,
+not a rule: each set is independent, so you can add sets that share nothing.
 
 #### Search bounds (min / max)
 

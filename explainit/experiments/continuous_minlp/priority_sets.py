@@ -210,9 +210,10 @@ def numerical_entry(
 # :class:`FeatureContext`).
 #
 # Units: features are stored scaled. An :class:`Anchor` ``offset`` is an
-# absolute shift in that scaled space, while ``pct`` is a fraction of the
-# feature's dataset range (``dataset_max - dataset_min``). Because scaling is
-# linear, ``pct`` matches the same fraction of the raw feature range.
+# absolute shift in that scaled space, ``pct`` is a fraction of the feature's
+# dataset range (``dataset_max - dataset_min``), and ``sample_pct`` is a
+# fraction of the sample's absolute feature value. Because scaling is linear,
+# ``pct`` matches the same fraction of the raw feature range too.
 
 
 @dataclass
@@ -234,13 +235,15 @@ class Anchor:
     """A point on a feature axis, resolved against a :class:`FeatureContext`.
 
     ``base`` selects the reference (the sample value, dataset min/max, or a
-    literal ``value``); ``offset`` shifts it by an absolute amount and ``pct``
-    by a fraction of the feature's dataset range.
+    literal ``value``); ``offset`` shifts it by an absolute amount, ``pct`` by
+    a fraction of the feature's dataset range, and ``sample_pct`` by a
+    fraction of the sample's absolute feature value.
     """
 
     base: str
     offset: float = 0.0
     pct: float = 0.0
+    sample_pct: float = 0.0
     value: float = 0.0
 
     def resolve(self, fc: "FeatureContext") -> float:
@@ -254,12 +257,26 @@ class Anchor:
             base_v = self.value
         else:
             raise ValueError(f"Unknown anchor base {self.base!r}.")
-        return float(base_v + self.offset + self.pct * fc.feature_range)
+        sample_shift = self.sample_pct * abs(fc.sample_value)
+        return float(base_v + self.offset + self.pct * fc.feature_range + sample_shift)
 
 
-def at_sample(offset: float = 0.0, pct: float = 0.0) -> Anchor:
-    """Anchor at the sample's value (``offset`` scaled units, ``pct`` of range)."""
-    return Anchor("sample", offset=float(offset), pct=float(pct))
+def at_sample(
+    offset: float = 0.0,
+    pct: float = 0.0,
+    sample_pct: float = 0.0,
+) -> Anchor:
+    """Anchor at the sample's value.
+
+    ``offset`` is in scaled units, ``pct`` is a fraction of the dataset range,
+    and ``sample_pct`` is a fraction of the sample's absolute value.
+    """
+    return Anchor(
+        "sample",
+        offset=float(offset),
+        pct=float(pct),
+        sample_pct=float(sample_pct),
+    )
 
 
 def at_min(offset: float = 0.0, pct: float = 0.0) -> Anchor:
@@ -283,6 +300,64 @@ def _as_anchor(a: Any) -> Anchor:
     return at_value(float(a))
 
 
+def _exponential_out(
+    x: Any,
+    *,
+    x0: float,
+    x1: float,
+    increasing: bool = True,
+    a: float = 5.0,
+) -> np.ndarray:
+    """Exponential ease-out transition.
+
+    Compared with :func:`_exponential`, this variant changes quickly near
+    ``x0`` and then flattens as it approaches the target value near ``x1``.
+    """
+
+    arr = np.asarray(x, dtype=float)
+    if x1 <= x0:
+        return np.zeros_like(arr) if increasing else np.ones_like(arr)
+    t = np.clip((arr - x0) / (x1 - x0), 0.0, 1.0)
+    curve = (1.0 - np.exp(-float(a) * t)) / (1.0 - np.exp(-float(a)))
+    if increasing:
+        return np.where(arr <= x0, 0.0, np.where(arr >= x1, 1.0, curve))
+    return np.where(arr <= x0, 1.0, np.where(arr >= x1, 0.0, 1.0 - curve))
+
+
+def _shaped_transition(
+    x: Any,
+    *,
+    x0: float,
+    x1: float,
+    shape: str,
+    increasing: bool,
+    a: float,
+) -> np.ndarray:
+    arr = np.asarray(x, dtype=float)
+    if shape == "exponential":
+        return _exponential(arr, x0=x0, x1=x1, increasing=increasing, a=a)
+    if shape == "exponential_out":
+        return _exponential_out(arr, x0=x0, x1=x1, increasing=increasing, a=a)
+    return _basic_linear(arr, x0=x0, x1=x1, increasing=increasing)
+
+
+def _shift_boundary_anchor(
+    anchor_value: Optional[float],
+    *,
+    raw_peak: float,
+    clamped_peak: float,
+    boundary: float,
+) -> Optional[float]:
+    if anchor_value is None:
+        return None
+    overflow = raw_peak - clamped_peak
+    if abs(overflow) <= 1e-12:
+        return float(anchor_value)
+    if abs(anchor_value - boundary) > 1e-12:
+        return float(anchor_value)
+    return float(anchor_value + overflow)
+
+
 @dataclass
 class ContextualPriority:
     """A priority function that is materialised per sample.
@@ -295,6 +370,7 @@ class ContextualPriority:
     min_val: Optional[float] = None
     max_val: Optional[float] = None
     use_dataset_bounds: bool = True
+    plot_points: Optional[Callable[["FeatureContext"], Sequence[float]]] = None
 
 
 def peak_priority(
@@ -318,8 +394,8 @@ def peak_priority(
       means a hard cutoff -- the priority is 0 for values below the peak.
     * ``right`` is where the falling side reaches 0 (``right > peak_at``);
       ``None`` means a hard cutoff -- the priority is 0 above the peak.
-    * ``left_shape`` / ``right_shape`` are ``"linear"`` or ``"exponential"``
-      (``a`` controls exponential steepness).
+    * ``left_shape`` / ``right_shape`` are ``"linear"``, ``"exponential"``,
+      or ``"exponential_out"`` (``a`` controls exponential steepness).
 
     Examples::
 
@@ -327,10 +403,10 @@ def peak_priority(
         peak_priority(peak_at=at_sample(offset=0.5), peak_value=1.0,
                       right=at_max(), right_shape="exponential")
 
-        # peak 0.5 at the sample, linearly down to 0 at 20% of range below it,
-        # and 0 above the sample.
+        # peak 0.5 at the sample, linearly down to 0 at 20% below the sample's
+        # absolute value, and 0 above the sample.
         peak_priority(peak_at=at_sample(), peak_value=0.5,
-                      left=at_sample(pct=-0.20), left_shape="linear")
+                      left=at_sample(sample_pct=-0.20), left_shape="linear")
     """
 
     peak_anchor = _as_anchor(peak_at)
@@ -342,35 +418,144 @@ def peak_priority(
     rs = str(right_shape)
 
     def _build(fc: "FeatureContext") -> PriorityFn:
-        px = peak_anchor.resolve(fc)
-        lx = None if left_anchor is None else left_anchor.resolve(fc)
-        rx = None if right_anchor is None else right_anchor.resolve(fc)
+        raw_px = peak_anchor.resolve(fc)
+        px = float(np.clip(raw_px, fc.dataset_min, fc.dataset_max))
+        raw_lx = None if left_anchor is None else left_anchor.resolve(fc)
+        raw_rx = None if right_anchor is None else right_anchor.resolve(fc)
+        lx = raw_lx
+        rx = raw_rx
+        if raw_px < fc.dataset_min:
+            lx = _shift_boundary_anchor(
+                raw_lx, raw_peak=raw_px, clamped_peak=px, boundary=fc.dataset_min,
+            )
+        elif raw_px > fc.dataset_max:
+            rx = _shift_boundary_anchor(
+                raw_rx, raw_peak=raw_px, clamped_peak=px, boundary=fc.dataset_max,
+            )
 
         def _fn(x, _px=px, _lx=lx, _rx=rx, _pv=pv, _ls=ls, _rs=rs, _a=a_val):
             x = np.asarray(x, dtype=float)
             if _lx is None or _lx >= _px:
                 left_vals = np.where(x >= _px, _pv, 0.0)
-            elif _ls == "exponential":
-                left_vals = _pv * _exponential(x, x0=_lx, x1=_px, increasing=True, a=_a)
             else:
-                left_vals = _pv * _basic_linear(x, x0=_lx, x1=_px, increasing=True)
+                left_vals = _pv * _shaped_transition(
+                    x, x0=_lx, x1=_px, shape=_ls, increasing=True, a=_a,
+                )
 
             if _rx is None or _rx <= _px:
                 right_vals = np.zeros_like(x)
-            elif _rs == "exponential":
-                right_vals = _pv * _exponential(x, x0=_px, x1=_rx, increasing=False, a=_a)
             else:
-                right_vals = _pv * _basic_linear(x, x0=_px, x1=_rx, increasing=False)
+                right_vals = _pv * _shaped_transition(
+                    x, x0=_px, x1=_rx, shape=_rs, increasing=False, a=_a,
+                )
 
             return np.where(x <= _px, left_vals, right_vals)
 
         return _fn
+
+    def _plot_points(fc: "FeatureContext") -> Sequence[float]:
+        pts = [float(fc.dataset_min), float(fc.dataset_max), float(fc.sample_value)]
+        pts.append(peak_anchor.resolve(fc))
+        if left_anchor is not None:
+            pts.append(left_anchor.resolve(fc))
+        if right_anchor is not None:
+            pts.append(right_anchor.resolve(fc))
+        return pts
 
     return ContextualPriority(
         build=_build,
         min_val=min_val,
         max_val=max_val,
         use_dataset_bounds=bool(use_dataset_bounds),
+        plot_points=_plot_points,
+    )
+
+
+def plateau_priority(
+    *,
+    low: Any,
+    high: Any,
+    weight: float = 1.0,
+    left: Optional[Any] = None,
+    left_shape: str = "linear",
+    right: Optional[Any] = None,
+    right_shape: str = "linear",
+    a: float = 5.0,
+    min_val: Optional[float] = None,
+    max_val: Optional[float] = None,
+    use_dataset_bounds: bool = True,
+) -> ContextualPriority:
+    """Constant plateau on ``[low, high]`` with optional decays on each side."""
+
+    low_anchor = _as_anchor(low)
+    high_anchor = _as_anchor(high)
+    left_anchor = None if left is None else _as_anchor(left)
+    right_anchor = None if right is None else _as_anchor(right)
+    w = float(weight)
+    a_val = float(a)
+    ls = str(left_shape)
+    rs = str(right_shape)
+
+    def _build(fc: "FeatureContext") -> PriorityFn:
+        raw_lo = low_anchor.resolve(fc)
+        raw_hi = high_anchor.resolve(fc)
+        lo = float(np.clip(raw_lo, fc.dataset_min, fc.dataset_max))
+        hi = float(np.clip(raw_hi, fc.dataset_min, fc.dataset_max))
+        if lo > hi:
+            lo, hi = hi, lo
+        raw_lx = None if left_anchor is None else left_anchor.resolve(fc)
+        raw_rx = None if right_anchor is None else right_anchor.resolve(fc)
+        lx = raw_lx
+        rx = raw_rx
+        if raw_lo < fc.dataset_min:
+            lx = _shift_boundary_anchor(
+                raw_lx, raw_peak=raw_lo, clamped_peak=lo, boundary=fc.dataset_min,
+            )
+        if raw_hi > fc.dataset_max:
+            rx = _shift_boundary_anchor(
+                raw_rx, raw_peak=raw_hi, clamped_peak=hi, boundary=fc.dataset_max,
+            )
+
+        def _fn(x, _lo=lo, _hi=hi, _lx=lx, _rx=rx, _w=w, _ls=ls, _rs=rs, _a=a_val):
+            arr = np.asarray(x, dtype=float)
+            vals = np.where((arr >= _lo) & (arr <= _hi), _w, 0.0)
+            if _lx is not None and _lx < _lo:
+                left_mask = (arr >= _lx) & (arr < _lo)
+                vals = np.where(
+                    left_mask,
+                    _w * _shaped_transition(
+                        arr, x0=_lx, x1=_lo, shape=_ls, increasing=True, a=_a,
+                    ),
+                    vals,
+                )
+            if _rx is not None and _rx > _hi:
+                right_mask = (arr > _hi) & (arr <= _rx)
+                vals = np.where(
+                    right_mask,
+                    _w * _shaped_transition(
+                        arr, x0=_hi, x1=_rx, shape=_rs, increasing=False, a=_a,
+                    ),
+                    vals,
+                )
+            return vals
+
+        return _fn
+
+    def _plot_points(fc: "FeatureContext") -> Sequence[float]:
+        pts = [float(fc.dataset_min), float(fc.dataset_max), float(fc.sample_value)]
+        pts.extend([low_anchor.resolve(fc), high_anchor.resolve(fc)])
+        if left_anchor is not None:
+            pts.append(left_anchor.resolve(fc))
+        if right_anchor is not None:
+            pts.append(right_anchor.resolve(fc))
+        return pts
+
+    return ContextualPriority(
+        build=_build,
+        min_val=min_val,
+        max_val=max_val,
+        use_dataset_bounds=bool(use_dataset_bounds),
+        plot_points=_plot_points,
     )
 
 
@@ -405,8 +590,30 @@ def peak_priority(
 #
 # Units: features are standard-scaled. Anchor ``offset`` values (e.g. age's
 # +0.5) are absolute shifts in that scaled space; ``pct`` values are fractions
-# of the feature's dataset range (so pct=-0.20 == "20% of the range below",
-# matching a raw 20%-of-range shift).
+# of the feature's dataset range; ``sample_pct`` values are fractions of the
+# sample's absolute feature value (so sample_pct=-0.20 means "20% below the
+# current sample value" on the value axis).
+#
+# PRIORITY RELAXATION INSTRUCTION: Summary of the main relaxation knobs for the
+# diabetes example lives here. Shared features (`age`, `bmi`, `bp`, `s6`) are
+# edited in `_diabetes_shared_numerical()`, so changing them affects both
+# `set1` and `set2`.
+# PRIORITY RELAXATION INSTRUCTION: To move a percentage-based point to the
+# right, make its `pct` / `peak_pct` less negative (example: `-0.20 -> -0.10`).
+# To move it to the left, make it more negative (example: `-0.20 -> -0.30`).
+# PRIORITY RELAXATION INSTRUCTION: To move the age threshold right or left,
+# edit `offset=0.5` in the `age` definition below. Larger positive values shift
+# it right, smaller values shift it left.
+# PRIORITY RELAXATION INSTRUCTION: To make an exponential side go down slower,
+# lower `a` (example: `5.0 -> 3.0`). To make it go down faster, raise `a`
+# (example: `5.0 -> 8.0`).
+# PRIORITY RELAXATION INSTRUCTION: `bp` currently uses one shared `a` value for
+# both sides in one `peak_priority(...)` call, so editing that `a` relaxes or
+# steepens both sides together.
+# PRIORITY RELAXATION INSTRUCTION: Serum features (`s1`..`s5`) use the helper
+# `_diabetes_serum_priorities(...)`. Their set-specific horizontal shift,
+# height, and exponential steepness are controlled in the `set1` / `set2`
+# registry entries below via `peak_pct`, `peak_value`, and `a`.
 
 
 # --- Diabetes helpers ------------------------------------------------------
@@ -423,46 +630,59 @@ def _diabetes_shared_numerical() -> Dict[str, Any]:
     the sets only differ where you *want* them to (the serum features). This is
     a convenience, not a requirement -- a set may override or ignore it.
 
-    These are *relaxed* shapes: each feature keeps a peak that encodes its
-    preferred direction, but decays smoothly toward the dataset min/max instead
-    of using hard cutoffs. Staying positive across the interior of the range
-    keeps the derived search bounds wide, so the MINLP exemplar search has real
-    candidates to work with (strict cutoffs previously left 0-1 feasible rows).
+    These follow the original strict requirements: hard cutoffs are preserved
+    where requested, and only the serum features differ between ``set1`` and
+    ``set2``.
     """
     return {
-        # Prefer higher age: peak just above the sample, declining gently toward
-        # the dataset min (below) and max (above) rather than forbidding either.
+        # PRIORITY RELAXATION INSTRUCTION: Edit `offset=0.5` here to move the
+        # age threshold right or left for both sets. Edit `a=5.0` here to make
+        # the right-side exponential drop slower (smaller `a`) or faster
+        # (larger `a`).
+        # 0 below sample+0.5, then a fast initial drop that flattens toward 0
+        # near the dataset max.
         "age": peak_priority(
             peak_at=at_sample(offset=0.5), peak_value=1.0,
-            left=at_min(), left_shape="linear",
-            right=at_max(), right_shape="exponential",
+            left=None,
+            right=at_max(), right_shape="exponential_out", a=5.0,
         ),
-        # Prefer at/below the sample's bmi: peak at the sample, declining toward
-        # the min and more steeply above the sample (higher bmi less preferred).
+        # PRIORITY RELAXATION INSTRUCTION: Edit `pct=-0.20` here to move bmi's
+        # left zero-point. Less negative shifts it right, more negative shifts
+        # it left. Edit `a=5.0` here to make the left-side exponential drop
+        # slower or faster for both sets.
+        # 0.5 at the sample, exponentially down to 0 at 20% of the dataset
+        # range below the sample, and 0 above the sample.
         "bmi": peak_priority(
             peak_at=at_sample(), peak_value=0.5,
-            left=at_min(), left_shape="linear",
-            right=at_max(), right_shape="exponential",
+            left=at_sample(pct=-0.20), left_shape="exponential", a=5.0,
+            right=None,
         ),
-        # Mild both-sided preference centred on the sample.
+        # PRIORITY RELAXATION INSTRUCTION: Edit `a=5.0` here if you want both
+        # sides of `bp` to go down slower (smaller `a`) or faster (larger `a`)
+        # in both sets.
+        # 0.5 at the sample, dropping quickly away from the sample and then
+        # flattening toward 0 on both sides.
         "bp": peak_priority(
             peak_at=at_sample(), peak_value=0.5,
             left=at_min(), left_shape="exponential",
-            right=at_max(), right_shape="exponential",
+            right=at_max(), right_shape="exponential_out", a=5.0,
         ),
         # Flat, low preference across the whole dataset range.
         "s6": constant_priority(0.1),
     }
 
 
-def _diabetes_serum_priorities(*, peak_pct: float, peak_value: float) -> Dict[str, Any]:
-    """Serum priority: peak at ``sample + peak_pct * range`` (below the sample,
-    encoding "prefer lowering the serum"), decaying exponentially toward the
-    dataset min on the left and the dataset max on the right.
+def _diabetes_serum_priorities(
+    *,
+    peak_pct: float,
+    peak_value: float,
+    a: float,
+) -> Dict[str, Any]:
+    """Serum priorities for the original strict diabetes setup.
 
-    Relaxed vs. the original hard cutoff at the sample value: values above the
-    sample are now merely less preferred rather than forbidden, so the feature
-    stays positive across the range and always has a feasible region.
+    The peak sits below the sample by a fraction of the dataset range, decays
+    exponentially toward the dataset minimum, and is 0 for all values above
+    the peak.
     """
     return {
         name: peak_priority(
@@ -470,8 +690,8 @@ def _diabetes_serum_priorities(*, peak_pct: float, peak_value: float) -> Dict[st
             peak_value=peak_value,
             left=at_min(),
             left_shape="exponential",
-            right=at_max(),
-            right_shape="exponential",
+            a=a,
+            right=None,
         )
         for name in _DIABETES_SERUM_FEATURES
     }
@@ -485,9 +705,15 @@ PRIORITY_SETS: Dict[str, Dict[str, Dict[str, Any]]] = {
         # s2 (ldl), s3 (hdl), s4 (tch), s5 (ltg).
         "set1": {
             "numerical": {
+                # PRIORITY RELAXATION INSTRUCTION: Edit `peak_pct=-0.20` below
+                # to move the serum peaks for `set1`. Less negative shifts them
+                # right, more negative shifts them left. Edit `peak_value=0.7`
+                # to raise or lower the serum peak height. Edit `a=5.0` to make
+                # the left exponential tail slower or faster for all serum
+                # features in `set1`.
                 **_diabetes_shared_numerical(),
-                # Serum peak 20% of range below the sample (height 0.7).
-                **_diabetes_serum_priorities(peak_pct=-0.20, peak_value=0.7),
+                # Serum peak at sample-20%-of-range (height 0.7), then 0 above.
+                **_diabetes_serum_priorities(peak_pct=-0.20, peak_value=0.7, a=5.0),
             },
             "categorical": {
                 "sex": NON_ACTIONABLE,   # keep the sample's sex; never change it
@@ -495,9 +721,15 @@ PRIORITY_SETS: Dict[str, Dict[str, Dict[str, Any]]] = {
         },
         "set2": {
             "numerical": {
+                # PRIORITY RELAXATION INSTRUCTION: Edit `peak_pct=-0.40` below
+                # to move the serum peaks for `set2`. Less negative shifts them
+                # right, more negative shifts them left. Edit `peak_value=0.5`
+                # to raise or lower the serum peak height. Edit `a=5.0` to make
+                # the left exponential tail slower or faster for all serum
+                # features in `set2`.
                 **_diabetes_shared_numerical(),
-                # Serum peak 40% of range below the sample (height 0.5).
-                **_diabetes_serum_priorities(peak_pct=-0.40, peak_value=0.5),
+                # Serum peak at sample-40%-of-range (height 0.5), then 0 above.
+                **_diabetes_serum_priorities(peak_pct=-0.40, peak_value=0.5, a=5.0),
             },
             "categorical": {
                 "sex": NON_ACTIONABLE,
@@ -663,7 +895,13 @@ def build_priorities(
             final_min, final_max = _resolve_bounds(
                 entry.min_val, entry.max_val, dmin, dmax, entry.use_dataset_bounds,
             )
-            numerical[idx] = {"function": fn, "min": final_min, "max": final_max}
+            payload = {"function": fn, "min": final_min, "max": final_max}
+            if entry.plot_points is not None:
+                pts = [float(p) for p in entry.plot_points(fc)]
+                if pts:
+                    payload["plot_min"] = float(min(pts))
+                    payload["plot_max"] = float(max(pts))
+            numerical[idx] = payload
             continue
 
         if callable(entry):
