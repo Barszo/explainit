@@ -97,6 +97,8 @@ class MINLPMethod(BasePriorityMethod):
                 patience=int(p.get("patience", 5)),
                 fallback_random_max_iterations=int(
                     p.get("fallback_random_max_iterations", 10000)),
+                peak_lock_in=bool(p.get("peak_lock_in", True)),
+                peak_lock_in_max_sweeps=int(p.get("peak_lock_in_max_sweeps", 3)),
             )
         except Exception as exc:
             error = str(exc)
@@ -107,6 +109,7 @@ class MINLPMethod(BasePriorityMethod):
             "exemplar_pred_distance",
             getattr(explainer, "exemplar_pred_distance", None))
         warm_start = last.get("warm_start") or {}
+        peak = last.get("peak_lock_in") or {}
         cfs: List[np.ndarray] = []
         if cf_raw is not None:
             cfs.append(np.asarray(cf_raw, dtype=float).reshape(-1))
@@ -123,6 +126,9 @@ class MINLPMethod(BasePriorityMethod):
                 "cf_source": last.get("cf_source"),
                 "anchor_priority_score": last.get("anchor_priority_score"),
                 "priority_gain_vs_anchor": last.get("priority_gain_vs_anchor"),
+                "peak_lock_in_moves": peak.get("accepted_moves"),
+                "peak_lock_in_gain": peak.get("priority_gain"),
+                "peak_lock_in_model_calls": peak.get("model_calls"),
                 "search_exception": last.get("search_exception"),
                 "warm_start_total_combos": warm_start.get("total_combos"),
                 "warm_start_feasible_combos": warm_start.get("feasible_combos"),

@@ -110,6 +110,8 @@ class MINLSearchExplainer:
         self.epsilon = epsilon
         self.workflow_logger = workflow_logger
         self.feature_names = list(feature_names) if feature_names is not None else None
+        # Cached argmax of every actionable priority function (Stage 7).
+        self._priority_peaks_cache = None
         # Records which strategy produced the target exemplar for the last run
         # (see ``_stage1_find_exemplar``): one of ``dataset_priority_filtered``,
         # ``dataset_actionable``, ``random_in_range`` or ``none``.
@@ -2076,6 +2078,191 @@ class MINLSearchExplainer:
             logger.debug("Priority benefit unavailable for candidate: %s", exc)
             return None
 
+    def _feature_priority(self, idx: int, value: float) -> float:
+        """Priority weight of a single numerical feature at ``value`` (0 if invalid)."""
+        cfg = self.priorities_state.numerical_priorities.get(idx, {})
+        fn = cfg.get("function") if isinstance(cfg, dict) else None
+        if fn is None:
+            return 0.0
+        try:
+            w = float(np.asarray(fn(float(value))).squeeze())
+        except Exception:
+            return 0.0
+        return w if np.isfinite(w) else 0.0
+
+    def _priority_peaks(self, grid_size: int = 1000) -> Dict[int, tuple]:
+        """``{feature_index: (peak_value, peak_weight)}`` for actionable features.
+
+        The peak is the argmax of the feature's priority function over its
+        allowed intervals. Priority functions are analytic, so this costs no
+        model calls; the result is cached because priorities do not change
+        during a run.
+        """
+        if getattr(self, "_priority_peaks_cache", None) is not None:
+            return self._priority_peaks_cache
+        peaks: Dict[int, tuple] = {}
+        for idx, cfg in self.priorities_state.numerical_priorities.items():
+            if not isinstance(cfg, dict) or cfg.get("function") is None:
+                continue
+            intervals = cfg.get("allowed_intervals") or [(cfg["min"], cfg["max"])]
+            best_v, best_w = None, float("-inf")
+            for lo, hi in intervals:
+                xs = np.linspace(float(lo), float(hi), int(grid_size))
+                ws = np.array([self._feature_priority(idx, v) for v in xs])
+                k = int(ws.argmax())
+                if ws[k] > best_w:
+                    best_w, best_v = float(ws[k]), float(xs[k])
+            if best_v is not None:
+                peaks[idx] = (best_v, best_w)
+        self._priority_peaks_cache = peaks
+        return peaks
+
+    def _clip_to_allowed(self, idx: int, value: float) -> float:
+        cfg = self.priorities_state.numerical_priorities.get(idx, {})
+        intervals = cfg.get("allowed_intervals") if isinstance(cfg, dict) else None
+        v = float(value)
+        if intervals:
+            v = self._project_to_allowed_intervals(v, intervals)
+        lo, hi = self.priorities_state.bounds.get(idx, (None, None))
+        if lo is not None:
+            v = max(v, float(lo))
+        if hi is not None:
+            v = min(v, float(hi))
+        return v
+
+    def _peak_lock_in(self, cf, max_sweeps: int = 3, max_compensators: int = 3):
+        """Stage 7: greedy peak lock-in with Shapley compensation.
+
+        Post-optimisation sweep over a *feasible* counterfactual ``cf``. For
+        each actionable numerical feature ``i`` (best potential gain first) it
+        proposes ``x_i = peak_i`` and pays for the resulting change of the
+        Shapley-linearised prediction, ``dh = c_i (peak_i - x_i)``, by moving the
+        feature ``j`` whose priority loses the least per unit of prediction
+        change: ``x_j -= dh / c_j``. One model call verifies the swap; if it
+        leaves the target band, one restoration step on ``j`` using the measured
+        residual is tried, and up to ``max_compensators`` alternative
+        compensating features are attempted before giving up on the feature. A
+        move is kept only when the point is inside the band *and* the total
+        priority benefit increased, so the incoming ``cf`` can never be made
+        worse.
+
+        Returns ``(cf, info)`` where ``info`` reports the priority before/after,
+        the accepted moves and the number of model calls spent.
+        """
+        info = {
+            "applied": False,
+            "sweeps_run": 0,
+            "accepted_moves": 0,
+            "model_calls": 0,
+            "priority_before": None,
+            "priority_after": None,
+            "priority_gain": 0.0,
+            "final_prediction": None,
+        }
+        coeffs_all = getattr(self.sample_state, "shap_coeffs", None)
+        if cf is None or not coeffs_all:
+            return cf, info
+
+        non_actionable = set(self.priorities_state.non_actionable_indices)
+        peaks = self._priority_peaks()
+        actionable = [i for i in peaks
+                      if i not in non_actionable
+                      and abs(float(coeffs_all.get(i, 0.0))) > 1e-12]
+        if not actionable:
+            return cf, info
+
+        cur = np.asarray(cf, dtype=float).copy()
+        cur_priority = self._priority_benefit(list(cur))
+        if cur_priority is None:
+            return cf, info
+        info["applied"] = True
+        info["priority_before"] = cur_priority
+
+        logger.info("--- STAGE 7/7: Peak lock-in with Shapley compensation ---")
+        logger.info("Sweeping %d actionable feature(s); start priority=%.4f. Each move "
+                    "locks a feature on its priority peak and pays for the linearised "
+                    "prediction change with the cheapest compensating feature.",
+                    len(actionable), cur_priority)
+
+        for sweep in range(int(max_sweeps)):
+            info["sweeps_run"] = sweep + 1
+            accepted_in_sweep = 0
+            order = sorted(
+                actionable,
+                key=lambda i: -(peaks[i][1] - self._feature_priority(i, cur[i])),
+            )
+            for i in order:
+                peak_v, peak_w = peaks[i]
+                gain = peak_w - self._feature_priority(i, cur[i])
+                if gain <= 1e-6:
+                    continue
+                c_i = float(coeffs_all[i])
+                dh = c_i * (peak_v - float(cur[i]))
+
+                compensators = []
+                for j in actionable:
+                    if j == i:
+                        continue
+                    c_j = float(coeffs_all[j])
+                    v_j = self._clip_to_allowed(j, float(cur[j]) - dh / c_j)
+                    cost = self._feature_priority(j, cur[j]) - self._feature_priority(j, v_j)
+                    if cost < gain:
+                        compensators.append((cost, j, v_j))
+                compensators.sort(key=lambda t: t[0])
+
+                accepted = None
+                for _cost, j, v_j in compensators[:max_compensators]:
+                    cand = cur.copy()
+                    cand[i] = peak_v
+                    cand[j] = v_j
+                    pred = float(np.asarray(self.model_pred([list(cand)])).reshape(-1)[0])
+                    info["model_calls"] += 1
+                    residual = pred - float(self.target)
+                    if abs(residual) > float(self.epsilon):
+                        # One restoration step on the compensating feature, using
+                        # the residual measured against the real model.
+                        cand[j] = self._clip_to_allowed(
+                            j, float(cand[j]) - residual / float(coeffs_all[j]))
+                        pred = float(np.asarray(self.model_pred([list(cand)])).reshape(-1)[0])
+                        info["model_calls"] += 1
+                        residual = pred - float(self.target)
+                        if abs(residual) > float(self.epsilon):
+                            logger.debug("[Stage 7] %s -> peak, compensated by %s: "
+                                         "rejected, |pred - target|=%.4f > epsilon.",
+                                         self._feature_label(i),
+                                         self._feature_label(j), abs(residual))
+                            continue
+                    cand_priority = self._priority_benefit(list(cand))
+                    if cand_priority is None or cand_priority <= cur_priority + 1e-9:
+                        continue
+                    accepted = (cand, cand_priority, pred, j)
+                    break
+
+                if accepted is None:
+                    continue
+                cand, cand_priority, pred, j = accepted
+                logger.info("[Stage 7] Accepted: %s -> peak %.4f, compensated by %s "
+                            "-> %.4f | priority %.4f -> %.4f | pred=%.4f.",
+                            self._feature_label(i), peak_v,
+                            self._feature_label(j), float(cand[j]),
+                            cur_priority, cand_priority, pred)
+                cur, cur_priority = cand, cand_priority
+                accepted_in_sweep += 1
+                info["accepted_moves"] += 1
+                info["final_prediction"] = pred
+
+            if accepted_in_sweep == 0:
+                break
+
+        info["priority_after"] = cur_priority
+        info["priority_gain"] = float(cur_priority - info["priority_before"])
+        logger.info("[Stage 7] Done: %d move(s) accepted over %d sweep(s) | "
+                    "priority %.4f -> %.4f (+%.4f) | model calls=%d.",
+                    info["accepted_moves"], info["sweeps_run"],
+                    info["priority_before"], cur_priority, info["priority_gain"],
+                    info["model_calls"])
+        return list(cur), info
+
     def _select_best_candidate(self, counterfactuals):
         """Stage 6: pick the candidate with the highest priority benefit.
 
@@ -2146,7 +2333,9 @@ class MINLSearchExplainer:
     def find_counterfactuals(self, shap_approx=False, num_samples=200,
                              max_iterations=10, patience=5,
                              return_when_fails=True,
-                             fallback_random_max_iterations=10000):
+                             fallback_random_max_iterations=10000,
+                             peak_lock_in=True,
+                             peak_lock_in_max_sweeps=3):
         """Find a counterfactual via iterative Shapley re-linearisation.
 
         Stages 1 and 2 (locate target exemplar, gather bounds) run once.
@@ -2188,6 +2377,10 @@ class MINLSearchExplainer:
                 warning log and full status on
                 ``self.last_search_result``. If False, return ``None``
                 when the target was not reached.
+            peak_lock_in: If True (default) run the Stage 7 peak lock-in
+                sweep (:meth:`_peak_lock_in`) on the feasible incumbent
+                before returning.
+            peak_lock_in_max_sweeps: Maximum number of Stage 7 sweeps.
 
         Returns:
             list | None: The selected counterfactual feature vector, or
@@ -2216,6 +2409,7 @@ class MINLSearchExplainer:
         self.exemplar_pred_distance = None
         self._warm_start_info = None
         self._last_search_exception = None
+        self._priority_peaks_cache = None
         self._fallback_random_max_iterations = int(fallback_random_max_iterations)
 
         # Stage 0: infer bounds directly from priority functions.
@@ -2348,6 +2542,17 @@ class MINLSearchExplainer:
         self.sample_state.sample = original_sample
         self._workflow_iteration = None
 
+        peak_info = None
+        if peak_lock_in and best_feasible is not None:
+            improved_cf, peak_info = self._peak_lock_in(
+                best_feasible, max_sweeps=int(peak_lock_in_max_sweeps))
+            if peak_info["accepted_moves"] > 0:
+                best_feasible = improved_cf
+                best_feasible_priority = float(peak_info["priority_after"])
+                best_feasible_distance = abs(
+                    float(peak_info["final_prediction"]) - float(self.target))
+                best_feasible_source = f"{best_feasible_source}+peak_lock_in"
+
         reached = best_feasible is not None
         if reached:
             best_cf = best_feasible
@@ -2387,6 +2592,7 @@ class MINLSearchExplainer:
             "anchor_priority_score": anchor_priority,
             "anchor_distance": anchor_distance,
             "priority_gain_vs_anchor": priority_gain_vs_anchor,
+            "peak_lock_in": peak_info,
         }
 
         logger.info("=" * 78)
