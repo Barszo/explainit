@@ -20,10 +20,12 @@ CLI usage::
 from __future__ import annotations
 
 import argparse
+import io
 import logging
 import pickle
 import ssl
 import sys
+import zipfile
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
@@ -65,6 +67,14 @@ def _load_diabetes_raw() -> Tuple[pd.DataFrame, np.ndarray, List[str]]:
     return X, y, list(bunch.feature_names)
 
 
+def _split_frame(
+    df: pd.DataFrame, target: str, *, drop: Sequence[str] = (),
+) -> Tuple[pd.DataFrame, np.ndarray, List[str]]:
+    X = df.drop(columns=[target, *drop], errors="ignore").copy()
+    y = pd.to_numeric(df[target], errors="coerce").to_numpy(dtype=float)
+    return X, y, list(X.columns)
+
+
 def _load_california_housing_raw() -> Tuple[pd.DataFrame, np.ndarray, List[str]]:
     from sklearn.datasets import fetch_california_housing
 
@@ -99,9 +109,105 @@ def _load_synthetic_raw() -> Tuple[pd.DataFrame, np.ndarray, List[str]]:
     return X, y.astype(float), feature_names
 
 
+def _load_diamonds_raw() -> Tuple[pd.DataFrame, np.ndarray, List[str]]:
+    logger.info("[%s] Raw load: downloading seaborn diamonds CSV.", "diamonds")
+    return _split_frame(
+        pd.read_csv("https://raw.githubusercontent.com/mwaskom/seaborn-data/master/diamonds.csv"),
+        "price",
+    )
+
+
+def _load_bike_sharing_hourly_raw() -> Tuple[pd.DataFrame, np.ndarray, List[str]]:
+    from urllib.request import urlopen
+
+    logger.info("[%s] Raw load: downloading UCI bike-sharing hourly CSV.", "bike_sharing_hourly")
+    with zipfile.ZipFile(
+        io.BytesIO(urlopen(
+            "https://archive.ics.uci.edu/static/public/275/bike+sharing+dataset.zip",
+            timeout=120,
+        ).read())
+    ) as zf:
+        df = pd.read_csv(zf.open("hour.csv"))
+    return _split_frame(
+        df,
+        "cnt",
+        drop=("instant", "dteday", "casual", "registered"),
+    )
+
+
+def _load_insurance_charges_raw() -> Tuple[pd.DataFrame, np.ndarray, List[str]]:
+    logger.info("[%s] Raw load: downloading insurance charges CSV.", "insurance_charges")
+    return _split_frame(
+        pd.read_csv("https://www.statlect.com/datasets/SimpleR-Pre-loaded-Medical-insurance-costs.csv"),
+        "charges",
+    )
+
+
+def _load_wage_raw() -> Tuple[pd.DataFrame, np.ndarray, List[str]]:
+    logger.info("[%s] Raw load: downloading ISLR Wage CSV.", "wage")
+    return _split_frame(
+        pd.read_csv("https://vincentarelbundock.github.io/Rdatasets/csv/ISLR/Wage.csv"),
+        "wage",
+        drop=("rownames", "logwage"),
+    )
+
+
+def _load_carseats_raw() -> Tuple[pd.DataFrame, np.ndarray, List[str]]:
+    logger.info("[%s] Raw load: downloading ISLR Carseats CSV.", "carseats")
+    return _split_frame(
+        pd.read_csv("https://vincentarelbundock.github.io/Rdatasets/csv/ISLR/Carseats.csv"),
+        "Sales",
+        drop=("rownames",),
+    )
+
+
+def _load_cps85_raw() -> Tuple[pd.DataFrame, np.ndarray, List[str]]:
+    logger.info("[%s] Raw load: downloading mosaicData CPS85 CSV.", "cps85")
+    return _split_frame(
+        pd.read_csv("https://vincentarelbundock.github.io/Rdatasets/csv/mosaicData/CPS85.csv"),
+        "wage",
+        drop=("rownames",),
+    )
+
+
+def _load_auto_mpg_raw() -> Tuple[pd.DataFrame, np.ndarray, List[str]]:
+    logger.info("[%s] Raw load: downloading seaborn mpg CSV.", "auto_mpg")
+    return _split_frame(
+        pd.read_csv("https://raw.githubusercontent.com/mwaskom/seaborn-data/master/mpg.csv").dropna().reset_index(drop=True),
+        "mpg",
+        drop=("name",),
+    )
+
+
+def _load_forest_fires_raw() -> Tuple[pd.DataFrame, np.ndarray, List[str]]:
+    logger.info("[%s] Raw load: downloading UCI forest fires CSV.", "forest_fires")
+    return _split_frame(
+        pd.read_csv("https://archive.ics.uci.edu/ml/machine-learning-databases/forest-fires/forestfires.csv"),
+        "area",
+    )
+
+
+def _load_brazilian_houses_to_rent_raw() -> Tuple[pd.DataFrame, np.ndarray, List[str]]:
+    logger.info("[%s] Raw load: downloading Brazilian houses-to-rent CSV.", "brazilian_houses_to_rent")
+    return _split_frame(
+        pd.read_csv("https://raw.githubusercontent.com/marcos-s1/Aluguel/master/houses_to_rent_v2.csv"),
+        "rent amount (R$)",
+        drop=("total (R$)",),
+    )
+
+
 # Registry. Add new datasets here.
 DATASETS: Dict[str, Callable[[], Tuple[pd.DataFrame, np.ndarray, List[str]]]] = {
     "diabetes": _load_diabetes_raw,
+    "diamonds": _load_diamonds_raw,
+    "bike_sharing_hourly": _load_bike_sharing_hourly_raw,
+    "insurance_charges": _load_insurance_charges_raw,
+    "wage": _load_wage_raw,
+    "carseats": _load_carseats_raw,
+    "cps85": _load_cps85_raw,
+    "auto_mpg": _load_auto_mpg_raw,
+    "forest_fires": _load_forest_fires_raw,
+    "brazilian_houses_to_rent": _load_brazilian_houses_to_rent_raw,
     # "california_housing": _load_california_housing_raw,
     # "synthetic": _load_synthetic_raw,
 }
@@ -109,6 +215,15 @@ DATASETS: Dict[str, Callable[[], Tuple[pd.DataFrame, np.ndarray, List[str]]]] = 
 
 TARGET_NAMES: Dict[str, str] = {
     "diabetes": "disease_progression",
+    "diamonds": "price",
+    "bike_sharing_hourly": "bike_rentals",
+    "insurance_charges": "medical_charges",
+    "wage": "wage",
+    "carseats": "sales",
+    "cps85": "wage",
+    "auto_mpg": "mpg",
+    "forest_fires": "burned_area",
+    "brazilian_houses_to_rent": "rent_amount",
     "california_housing": "median_house_value",
     "synthetic": "synthetic_target",
 }
@@ -118,6 +233,21 @@ TARGET_NAMES: Dict[str, str] = {
 # are always treated as categorical and override automatic detection.
 CATEGORICAL_FEATURES: Dict[str, List[str]] = {
     "diabetes": ["sex"],
+    "bike_sharing_hourly": [
+        "season", "yr", "mnth", "hr", "holiday",
+        "weekday", "workingday", "weathersit",
+    ],
+    "auto_mpg": ["cylinders", "origin"],
+}
+
+NUMERICAL_FEATURES: Dict[str, List[str]] = {
+    "wage": ["year"],
+    "cps85": ["educ"],
+    "forest_fires": ["X", "Y"],
+}
+
+TARGET_TRANSFORMS: Dict[str, str] = {
+    "wage": "log1p",
 }
 
 
@@ -125,6 +255,45 @@ AUTO_CATEGORICAL_MAX_UNIQUE_VALUES = 20
 AUTO_CATEGORICAL_MAX_UNIQUE_VALUES_NON_INTEGER = 5
 AUTO_CATEGORICAL_MAX_UNIQUE_RATIO = 0.05
 MISSING_CATEGORY_TOKEN = "__MISSING__"
+
+
+class TargetScaler:
+    def __init__(self, transform: str = "identity") -> None:
+        self.transform_name = transform
+        self.scaler = MinMaxScaler()
+
+    def _forward(self, values: np.ndarray) -> np.ndarray:
+        arr = np.asarray(values, dtype=float)
+        if self.transform_name == "log1p":
+            if np.any(arr < 0.0):
+                raise ValueError("log1p target transform requires non-negative targets.")
+            return np.log1p(arr)
+        return arr
+
+    def _inverse(self, values: np.ndarray) -> np.ndarray:
+        arr = np.asarray(values, dtype=float)
+        if self.transform_name == "log1p":
+            return np.expm1(arr)
+        return arr
+
+    def fit_transform(self, values: np.ndarray) -> np.ndarray:
+        transformed = self._forward(values).reshape(-1, 1)
+        return self.scaler.fit_transform(transformed)
+
+    def transform(self, values: np.ndarray) -> np.ndarray:
+        transformed = self._forward(values).reshape(-1, 1)
+        return self.scaler.transform(transformed)
+
+    def inverse_transform(self, values: np.ndarray) -> np.ndarray:
+        arr = np.asarray(values, dtype=float).reshape(-1, 1)
+        return self._inverse(self.scaler.inverse_transform(arr))
+
+
+TargetScaler.__module__ = "explainit.experiments.continuous_minlp.data_setup"
+sys.modules.setdefault(
+    "explainit.experiments.continuous_minlp.data_setup",
+    sys.modules[__name__],
+)
 
 
 # ---------------------------------------------------------------------------
@@ -172,9 +341,13 @@ def _is_integer_like(series: pd.Series) -> bool:
 
 
 def _detect_categorical_features(
-    X_raw: pd.DataFrame, feature_names: List[str], manual_overrides: Sequence[str],
+    X_raw: pd.DataFrame,
+    feature_names: List[str],
+    manual_overrides: Sequence[str],
+    numerical_overrides: Sequence[str],
 ) -> Tuple[List[str], Dict[str, str], List[str], List[Dict[str, object]], List[Dict[str, object]]]:
     manual_set = set(manual_overrides)
+    numerical_set = set(numerical_overrides)
     categorical: List[str] = []
     reasoning: Dict[str, str] = {}
     auto_categorical: List[str] = []
@@ -223,8 +396,10 @@ def _detect_categorical_features(
                 f"(dtype={series.dtype}, integer_like={integer_like}, unique={n_unique}, unique/non-nan={unique_ratio:.2%})"
             )
 
-        final_is_categorical = auto_is_categorical or (col in manual_set)
-        if col in manual_set:
+        final_is_categorical = (auto_is_categorical or (col in manual_set)) and (col not in numerical_set)
+        if col in numerical_set:
+            reason = f"manual override in NUMERICAL_FEATURES (auto: {auto_reason})"
+        elif col in manual_set:
             reason = f"manual override in CATEGORICAL_FEATURES (auto: {auto_reason})"
         else:
             reason = f"automatic detection: {auto_reason}"
@@ -313,15 +488,22 @@ def _prepare_dataset(
     )
 
     manual_cat_cols = list(CATEGORICAL_FEATURES.get(key, []))
+    manual_num_cols = list(NUMERICAL_FEATURES.get(key, []))
     for col in manual_cat_cols:
         if col not in feature_names:
             raise KeyError(
                 f"Categorical feature '{col}' for dataset '{key}' is not a known "
                 f"column. Known columns: {feature_names}"
             )
+    for col in manual_num_cols:
+        if col not in feature_names:
+            raise KeyError(
+                f"Numerical feature '{col}' for dataset '{key}' is not a known "
+                f"column. Known columns: {feature_names}"
+            )
 
     cat_cols, feature_reasoning, auto_cat_cols, numerical_summary_rows, categorical_summary_rows = _detect_categorical_features(
-        X_raw, feature_names, manual_cat_cols
+        X_raw, feature_names, manual_cat_cols, manual_num_cols
     )
     num_cols = [c for c in feature_names if c not in set(cat_cols)]
     logger.info(
@@ -422,16 +604,17 @@ def _prepare_dataset(
             "columns": list(cols),
         }
 
-    y_scaler = MinMaxScaler()
-    y_train = y_scaler.fit_transform(y_train_raw.reshape(-1, 1)).flatten()
-    y_test = y_scaler.transform(y_test_raw.reshape(-1, 1)).flatten()
+    target_transform = TARGET_TRANSFORMS.get(key, "identity")
+    y_scaler = TargetScaler(transform=target_transform)
+    y_train = y_scaler.fit_transform(y_train_raw).flatten()
+    y_test = y_scaler.transform(y_test_raw).flatten()
     logger.info(
         "[%s] Step 4/6 done: final features=%d (%s).",
         key, len(final_names), final_names,
     )
     logger.info(
-        "[%s] Step 5/6: target scaling done with MinMaxScaler to [0, 1].",
-        key,
+        "[%s] Step 5/6: target transform=%s + MinMax scaling to [0, 1].",
+        key, target_transform,
     )
 
     return {
@@ -453,6 +636,7 @@ def _prepare_dataset(
         "categorical_features": list(cat_cols),
         "auto_categorical_features": list(auto_cat_cols),
         "manual_categorical_overrides": list(manual_cat_cols),
+        "manual_numerical_overrides": list(manual_num_cols),
         "categorical_groups": categorical_groups,
         "feature_analysis": {
             "numerical_csv": str(numerical_csv_path),
@@ -461,6 +645,7 @@ def _prepare_dataset(
         },
         "x_scaler": x_scaler,
         "y_scaler": y_scaler,
+        "target_transform": target_transform,
         "raw_target_min": float(np.min(y_raw)),
         "raw_target_max": float(np.max(y_raw)),
         "target_name": TARGET_NAMES.get(key, "target"),

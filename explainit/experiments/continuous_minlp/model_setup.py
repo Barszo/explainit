@@ -58,24 +58,77 @@ logger = logging.getLogger("explainit.experiments.continuos_minlp.model_setup")
 # ---------------------------------------------------------------------------
 
 
-def build_default_regressor(input_dim: int) -> tf.keras.Model:
-    """Default two-layer MLP regressor with ReLU hidden activations."""
-    model = tf.keras.Sequential([
-        tf.keras.layers.Input(shape=(input_dim,)),
-        tf.keras.layers.Dense(64, activation="relu"),
-        tf.keras.layers.Dense(32, activation="relu"),
-        tf.keras.layers.Dense(1, activation="linear"),
-    ])
+def build_mlp_regressor(
+    input_dim: int,
+    *,
+    hidden_units: tuple[int, ...] = (64, 32),
+    learning_rate: float = 1e-3,
+    loss: str | tf.keras.losses.Loss = "mse",
+    dropout: float = 0.0,
+    l2: float = 0.0,
+) -> tf.keras.Model:
+    """Configurable MLP regressor for tabular regression."""
+    regularizer = tf.keras.regularizers.l2(l2) if l2 else None
+    model = tf.keras.Sequential([tf.keras.layers.Input(shape=(input_dim,))])
+    for units in hidden_units:
+        model.add(
+            tf.keras.layers.Dense(
+                units, activation="relu", kernel_regularizer=regularizer,
+            )
+        )
+        if dropout > 0.0:
+            model.add(tf.keras.layers.Dropout(dropout))
+    model.add(tf.keras.layers.Dense(1, activation="linear"))
     model.compile(
-        optimizer=tf.keras.optimizers.Adam(learning_rate=1e-3), loss="mse",
+        optimizer=tf.keras.optimizers.Adam(learning_rate=learning_rate),
+        loss=loss,
     )
     return model
 
 
+def build_default_regressor(input_dim: int) -> tf.keras.Model:
+    return build_mlp_regressor(input_dim)
+
+
 MODEL_BUILDERS: Dict[str, Callable[[int], tf.keras.Model]] = {
-    "diabetes": build_default_regressor,
+    "diabetes": lambda input_dim: build_mlp_regressor(
+        input_dim,
+        hidden_units=(192, 96, 48),
+        learning_rate=7e-4,
+        dropout=0.05,
+        l2=1e-5,
+    ),
+    "diamonds": build_default_regressor,
+    "bike_sharing_hourly": lambda input_dim: build_mlp_regressor(input_dim, hidden_units=(256, 128)),
+    "insurance_charges": lambda input_dim: build_mlp_regressor(input_dim, hidden_units=(256, 128)),
+    "wage": lambda input_dim: build_mlp_regressor(input_dim, dropout=0.1),
+    "carseats": lambda input_dim: build_mlp_regressor(input_dim, hidden_units=(256, 128)),
+    "cps85": lambda input_dim: build_mlp_regressor(
+        input_dim,
+        hidden_units=(256, 128),
+        learning_rate=5e-4,
+        loss=tf.keras.losses.Huber(),
+        l2=1e-5,
+    ),
+    "auto_mpg": lambda input_dim: build_mlp_regressor(input_dim, l2=1e-4),
+    "forest_fires": lambda input_dim: build_mlp_regressor(input_dim, hidden_units=()),
+    "brazilian_houses_to_rent": lambda input_dim: build_mlp_regressor(input_dim, l2=1e-4),
     # "california_housing": build_default_regressor,
     # "synthetic": build_default_regressor,
+}
+
+
+TRAINING_DEFAULTS: Dict[str, Dict[str, int]] = {
+    "diabetes": {"epochs": 200, "batch_size": 32},
+    "diamonds": {"epochs": 120, "batch_size": 128},
+    "bike_sharing_hourly": {"epochs": 120, "batch_size": 128},
+    "insurance_charges": {"epochs": 200, "batch_size": 32},
+    "wage": {"epochs": 200, "batch_size": 32},
+    "carseats": {"epochs": 250, "batch_size": 32},
+    "cps85": {"epochs": 250, "batch_size": 32},
+    "auto_mpg": {"epochs": 250, "batch_size": 32},
+    "forest_fires": {"epochs": 600, "batch_size": 32, "patience": 100},
+    "brazilian_houses_to_rent": {"epochs": 200, "batch_size": 64},
 }
 
 
@@ -198,8 +251,8 @@ def _write_model_analysis_csv(
 def train_model_with_report(
     key: str,
     *,
-    epochs: int = 60,
-    batch_size: int = 32,
+    epochs: Optional[int] = None,
+    batch_size: Optional[int] = None,
     force: bool = False,
 ) -> Dict[str, Any]:
     """Train and evaluate a regression model for dataset ``key``."""
@@ -245,6 +298,11 @@ def train_model_with_report(
             "metrics_test_raw": None,
         }
 
+    defaults = TRAINING_DEFAULTS.get(key, {})
+    resolved_epochs = int(epochs if epochs is not None else defaults.get("epochs", 200))
+    resolved_batch_size = int(batch_size if batch_size is not None else defaults.get("batch_size", 32))
+    resolved_patience = int(defaults.get("patience", 25))
+
     X_train = np.asarray(
         data["X_train"].values if hasattr(data["X_train"], "values") else data["X_train"],
         dtype=float,
@@ -255,12 +313,41 @@ def train_model_with_report(
     )
     y_train = np.asarray(data["y_train"], dtype=float)
     y_test = np.asarray(data["y_test"], dtype=float)
+    train_mask = np.isfinite(X_train).all(axis=1) & np.isfinite(y_train)
+    test_mask = np.isfinite(X_test).all(axis=1) & np.isfinite(y_test)
+    if not np.all(train_mask) or not np.all(test_mask):
+        logger.warning(
+            "Dataset '%s' contains non-finite values, dropping train=%d test=%d rows before training.",
+            key,
+            int((~train_mask).sum()),
+            int((~test_mask).sum()),
+        )
+    X_train = X_train[train_mask]
+    y_train = y_train[train_mask]
+    X_test = X_test[test_mask]
+    y_test = y_test[test_mask]
 
+    tf.keras.backend.clear_session()
+    tf.keras.utils.set_random_seed(42)
     model = builder(X_train.shape[1])
+    callbacks = [
+        tf.keras.callbacks.EarlyStopping(
+            monitor="val_loss", patience=resolved_patience, restore_best_weights=True,
+        ),
+        tf.keras.callbacks.ReduceLROnPlateau(
+            monitor="val_loss",
+            factor=0.5,
+            patience=max(10, resolved_patience // 2),
+            min_lr=1e-5,
+        ),
+    ]
     model.fit(
         X_train, y_train,
         validation_data=(X_test, y_test),
-        epochs=int(epochs), batch_size=int(batch_size), verbose=0,
+        epochs=resolved_epochs,
+        batch_size=resolved_batch_size,
+        verbose=0,
+        callbacks=callbacks,
     )
 
     y_pred_train = model.predict(X_train, verbose=0).reshape(-1)
@@ -313,8 +400,8 @@ def train_model_with_report(
 def train_model(
     key: str,
     *,
-    epochs: int = 60,
-    batch_size: int = 32,
+    epochs: Optional[int] = None,
+    batch_size: Optional[int] = None,
     force: bool = False,
 ) -> Path:
     """Train and save a regression model for dataset ``key``."""
@@ -359,8 +446,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         "--datasets", nargs="+", default=sorted(MODEL_BUILDERS),
         help="Dataset keys to train models for. Default: all registered.",
     )
-    parser.add_argument("--epochs", type=int, default=60)
-    parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("--epochs", type=int, default=None)
+    parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--verbose", "-v", action="store_true")
     return parser.parse_args(argv)
