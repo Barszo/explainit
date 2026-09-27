@@ -53,6 +53,66 @@ def compute_priority_score(priorities: Dict[str, Any], cf: np.ndarray) -> float:
     return float(np.sum(scores)) if scores else 1.0
 
 
+def max_attainable_priority(
+    priorities: Dict[str, Any], grid_size: int = 1001, refine_steps: int = 40,
+) -> Optional[float]:
+    """Upper bound of :func:`compute_priority_score` over the allowed region.
+
+    Sums each actionable numerical feature's maximum priority over its
+    ``[min, max]`` box and each categorical group's largest allowed weight.
+    The per-feature maximum is a grid scan followed by a golden-section
+    refinement around the best grid point, because the priority functions peak
+    at a sample-relative anchor that a fixed grid can miss (an underestimate
+    would make normalised scores exceed 1). No model calls.
+    """
+    total = 0.0
+    for constraint in priorities.get("numerical", {}).values():
+        if not isinstance(constraint, dict) or constraint.get("function") is None:
+            continue
+        lo = float(constraint["min"])
+        hi = float(constraint["max"])
+        fn = constraint["function"]
+
+        def evaluate(v: float) -> float:
+            try:
+                w = float(np.asarray(fn(float(v))).squeeze())
+            except Exception:
+                return float("-inf")
+            return w if np.isfinite(w) else float("-inf")
+
+        if hi <= lo:
+            best = evaluate(lo)
+            total += best if np.isfinite(best) else 0.0
+            continue
+
+        grid = np.linspace(lo, hi, int(grid_size))
+        values = np.array([evaluate(v) for v in grid])
+        k = int(values.argmax())
+        best_v, best_w = float(grid[k]), float(values[k])
+        # Refine inside the bracket around the best grid point.
+        left = float(grid[max(0, k - 1)])
+        right = float(grid[min(len(grid) - 1, k + 1)])
+        for _ in range(int(refine_steps)):
+            if right - left < 1e-12:
+                break
+            m1 = left + (right - left) / 3.0
+            m2 = right - (right - left) / 3.0
+            w1, w2 = evaluate(m1), evaluate(m2)
+            if w1 > best_w:
+                best_v, best_w = m1, w1
+            if w2 > best_w:
+                best_v, best_w = m2, w2
+            if w1 >= w2:
+                right = m2
+            else:
+                left = m1
+        total += best_w if np.isfinite(best_w) else 0.0
+    for mapping in priorities.get("categorical", {}).values():
+        allowed = [float(w) for w in mapping.values() if w is not None]
+        total += max(allowed) if allowed else 0.0
+    return float(total) if total > 0.0 else None
+
+
 class BasePriorityMethod:
     name = "base"
     supports_multiple = True
@@ -99,6 +159,13 @@ class MINLPMethod(BasePriorityMethod):
                     p.get("fallback_random_max_iterations", 10000)),
                 peak_lock_in=bool(p.get("peak_lock_in", True)),
                 peak_lock_in_max_sweeps=int(p.get("peak_lock_in_max_sweeps", 3)),
+                random_seed=p.get("seed", None),
+                trust_region=bool(p.get("trust_region", True)),
+                trust_region_init=float(p.get("trust_region_init", 0.25)),
+                trust_region_min=float(p.get("trust_region_min", 0.02)),
+                trust_region_max=float(p.get("trust_region_max", 1.0)),
+                residual_correction=bool(p.get("residual_correction", True)),
+                restoration=bool(p.get("restoration", True)),
             )
         except Exception as exc:
             error = str(exc)
@@ -110,6 +177,7 @@ class MINLPMethod(BasePriorityMethod):
             getattr(explainer, "exemplar_pred_distance", None))
         warm_start = last.get("warm_start") or {}
         peak = last.get("peak_lock_in") or {}
+        step = last.get("step_control") or {}
         cfs: List[np.ndarray] = []
         if cf_raw is not None:
             cfs.append(np.asarray(cf_raw, dtype=float).reshape(-1))
@@ -134,6 +202,10 @@ class MINLPMethod(BasePriorityMethod):
                 "warm_start_feasible_combos": warm_start.get("feasible_combos"),
                 "warm_start_best_model_gap": warm_start.get("best_warmstart_model_gap"),
                 "warm_start_best_linear_gap": warm_start.get("best_warmstart_linear_gap"),
+                "accepted_steps": step.get("accepted_steps"),
+                "rejected_steps": step.get("rejected_steps"),
+                "restoration_hits": step.get("restoration_hits"),
+                "trust_fraction_final": step.get("trust_fraction_final"),
             },
         }
 
@@ -189,4 +261,5 @@ __all__ = [
     "RandomSearchMethod",
     "build_method",
     "compute_priority_score",
+    "max_attainable_priority",
 ]

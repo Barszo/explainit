@@ -47,10 +47,15 @@ from explainit.experiments.continuous_minlp.priority_sets import build_prioritie
 from explainit.experiments.continuous_minlp.priority_methods.methods import (  # noqa: E402
     build_method,
     compute_priority_score,
+    max_attainable_priority,
+)
+from explainit.experiments.continuous_minlp.priority_methods.metrics import (  # noqa: E402
+    compute_cf_metrics,
 )
 from explainit.experiments.continuous_minlp.priority_methods.selection import (  # noqa: E402
     PriorityContext,
     SampleRecord,
+    counted_context,
     load_priority_context,
     select_samples,
 )
@@ -85,28 +90,10 @@ def _compute_metrics(
     epsilon: float,
     model_predict,
     priorities: Dict[str, Any],
+    max_priority: Optional[float] = None,
 ) -> Dict[str, Any]:
-    if cf is None:
-        return {
-            "cf_prediction": None, "validity": False, "abs_pred_error": None,
-            "l1": None, "l2": None, "n_changed": None, "sparsity_fraction": None,
-            "priority_score": None,
-        }
-    cf = np.asarray(cf, dtype=float)
-    cf_pred = float(model_predict(cf.reshape(1, -1))[0])
-    abs_err = abs(cf_pred - float(target))
-    diff = np.abs(cf - x)
-    n_changed = int(np.sum(diff > _CHANGE_TOL))
-    return {
-        "cf_prediction": cf_pred,
-        "validity": bool(abs_err <= epsilon),
-        "abs_pred_error": abs_err,
-        "l1": float(np.sum(diff)),
-        "l2": float(np.linalg.norm(cf - x)),
-        "n_changed": n_changed,
-        "sparsity_fraction": float(n_changed / len(x)),
-        "priority_score": compute_priority_score(priorities, cf),
-    }
+    return compute_cf_metrics(
+        x, cf, target, epsilon, model_predict, priorities, max_priority)
 
 
 def _mean(values: Sequence[Optional[float]]) -> Optional[float]:
@@ -124,18 +111,24 @@ def _resolve_n_cfs(mc: Dict[str, Any], params: Dict[str, Any], default_n_cfs: in
 
 def _instantiate_methods(
     pctx: PriorityContext, method_cfgs: Sequence[Dict[str, Any]], epsilon: float,
-    default_n_cfs: int,
+    default_n_cfs: int, default_seed: Optional[int] = None,
 ) -> List[Any]:
     methods = []
     for mc in method_cfgs:
         name = mc["name"]
         params = dict(mc.get("params", {}) or {})
+        if default_seed is not None and params.get("seed") is None:
+            params["seed"] = int(default_seed)
         n_cfs = _resolve_n_cfs(mc, params, default_n_cfs)
         try:
-            method = build_method(name, pctx=pctx, epsilon=epsilon, **params)
+            # Each method gets its own counting proxy so the model-call
+            # budget is attributed per method run.
+            counted_pctx, counter = counted_context(pctx)
+            method = build_method(name, pctx=counted_pctx, epsilon=epsilon, **params)
             if not getattr(method, "supports_multiple", True):
                 n_cfs = 1
             method._n_cfs = n_cfs
+            method._call_counter = counter
             methods.append(method)
         except Exception as exc:
             logger.error("Failed to instantiate method '%s': %s", name, exc)
@@ -162,10 +155,14 @@ def _write_counterfactuals_csv(path: Path, pctx: PriorityContext, rows: List[Dic
     metric_fields = [
         "sample_id", "method", "cf_index", "target", "original_prediction",
         "cf_prediction", "validity", "abs_pred_error", "l1", "l2", "n_changed",
-        "sparsity_fraction", "priority_score", "iterations", "time_seconds",
+        "sparsity_fraction", "priority_score", "priority_score_normalised",
+        "max_attainable_priority", "iterations", "time_seconds",
+        "model_calls", "model_rows",
         "error", "failure_reason", "stop_reason", "cf_source",
         "anchor_priority_score", "priority_gain_vs_anchor", "peak_lock_in_moves",
-        "peak_lock_in_gain", "peak_lock_in_model_calls", "exemplar_source",
+        "peak_lock_in_gain", "peak_lock_in_model_calls", "accepted_steps",
+        "rejected_steps", "restoration_hits", "trust_fraction_final",
+        "exemplar_source",
         "exemplar_pred_distance", "warm_start_total_combos",
         "warm_start_feasible_combos", "warm_start_best_model_gap",
         "search_exception",
@@ -236,8 +233,9 @@ def _write_summary(path_csv: Path, path_json: Path, dataset_key: str,
         "n_samples_with_valid", "sample_validity_rate",
         "n_cfs_total", "n_cfs_valid", "cf_validity_rate",
         "avg_abs_pred_error", "avg_l1", "avg_l2", "avg_n_changed",
-        "avg_sparsity_fraction", "avg_priority_score", "avg_iterations",
-        "avg_time_seconds",
+        "avg_sparsity_fraction", "avg_priority_score",
+        "avg_priority_score_normalised", "avg_iterations",
+        "avg_time_seconds", "avg_model_rows", "avg_model_calls",
     ]
     with open(path_csv, "w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
@@ -266,12 +264,14 @@ def _write_run_config(
     method_cfgs: Sequence[Dict[str, Any]],
     n_selected: int,
     n_cfs_by_method: Dict[str, int],
+    seed: Optional[int] = None,
 ) -> None:
     payload = {
         "dataset": pctx.dataset_key,
         "run_timestamp_utc": datetime.now(timezone.utc).isoformat(),
         "epsilon": epsilon,
         "priority_set": priority_set,
+        "seed": seed,
         "n_samples_selected": int(n_selected),
         "selection": selection_cfg,
         "methods": [
@@ -405,7 +405,13 @@ class _ProgressLogWriter:
         os.fsync(self._handle.fileno())
 
 
-def run_experiment(experiment: Dict[str, Any], defaults: Dict[str, Any]) -> Optional[Path]:
+def run_experiment(
+    experiment: Dict[str, Any],
+    defaults: Dict[str, Any],
+    *,
+    out_root: Optional[Path] = None,
+    force: bool = False,
+) -> Optional[Path]:
     settings = _merge_defaults(experiment, defaults)
     dataset_key = settings["dataset"]
     priority_set = str(settings.get("priority_set", "set1"))
@@ -422,8 +428,18 @@ def run_experiment(experiment: Dict[str, Any], defaults: Dict[str, Any]) -> Opti
                 dataset_key, priority_set, len(samples), len(method_cfgs))
 
     default_n_cfs = int(settings.get("n_cfs", 1) or 1)
-    methods = _instantiate_methods(pctx, method_cfgs, epsilon, default_n_cfs)
-    out_dir = RESULTS_DIR / dataset_key / priority_set
+    default_seed = settings.get("seed", None)
+    methods = _instantiate_methods(
+        pctx, method_cfgs, epsilon, default_n_cfs,
+        default_seed=None if default_seed is None else int(default_seed),
+    )
+    out_dir = (out_root or RESULTS_DIR) / dataset_key / priority_set
+    if (out_dir / "summary.json").exists() and not force:
+        raise FileExistsError(
+            f"Results already exist in {out_dir}. They are not tracked by git and "
+            f"would be overwritten. Re-run with --force to replace them, or with "
+            f"--out-dir <path> to write elsewhere."
+        )
     out_dir.mkdir(parents=True, exist_ok=True)
     total_method_runs = len(samples) * len(methods)
     progress_log = _ProgressLogWriter(
@@ -450,10 +466,15 @@ def run_experiment(experiment: Dict[str, Any], defaults: Dict[str, Any]) -> Opti
                 "[%s] sample %d/%d (id=%d) started.",
                 dataset_key, sample_index, len(samples), rec.sample_id,
             )
-            priorities = build_priorities(pctx.ctx, priority_set, rec.x)
+            # Stage 0 of the MINLP search mutates the priority dict in place
+            # (min/max/allowed_intervals), so every consumer gets its own copy
+            # and scoring uses a pristine one.
+            scoring_priorities = build_priorities(pctx.ctx, priority_set, rec.x)
+            max_priority = max_attainable_priority(scoring_priorities)
             if run_feasibility_probe:
                 probe = _run_feasibility_probe(
-                    pctx, priorities, rec, epsilon, feasibility_probe_iterations)
+                    pctx, build_priorities(pctx.ctx, priority_set, rec.x),
+                    rec, epsilon, feasibility_probe_iterations)
                 feasibility_rows.append(probe)
                 logger.info(
                     "[%s] sample=%d feasibility probe: feasible=%s min_pred_distance=%s "
@@ -466,6 +487,9 @@ def run_experiment(experiment: Dict[str, Any], defaults: Dict[str, Any]) -> Opti
             sample_method_summaries: Dict[str, Dict[str, Any]] = {}
             for method in methods:
                 n_cfs = int(getattr(method, "_n_cfs", 1))
+                counter = getattr(method, "_call_counter", None)
+                if counter is not None:
+                    counter.reset()
                 started = time.perf_counter()
                 error: Optional[str] = None
                 iterations: Optional[int] = None
@@ -473,7 +497,11 @@ def run_experiment(experiment: Dict[str, Any], defaults: Dict[str, Any]) -> Opti
                 cfs: List[np.ndarray] = []
                 extra_info: Dict[str, Any] = {}
                 try:
-                    out = method.generate_many(rec.x, rec.target, priorities, n_cfs)
+                    out = method.generate_many(
+                        rec.x, rec.target,
+                        build_priorities(pctx.ctx, priority_set, rec.x),
+                        n_cfs,
+                    )
                     iterations = out.get("iterations")
                     cf_iterations = out.get("cf_iterations")
                     error = out.get("error")
@@ -485,6 +513,8 @@ def run_experiment(experiment: Dict[str, Any], defaults: Dict[str, Any]) -> Opti
                                      dataset_key, method.name, rec.sample_id, exc)
                     error = str(exc)
                 elapsed = time.perf_counter() - started
+                model_calls = int(counter.n_calls) if counter is not None else None
+                model_rows = int(counter.n_rows) if counter is not None else None
                 exemplar_source = extra_info.get("exemplar_source")
 
                 emitted = cfs if cfs else [None]
@@ -492,7 +522,8 @@ def run_experiment(experiment: Dict[str, Any], defaults: Dict[str, Any]) -> Opti
                 invalid_reasons: List[str] = []
                 for cf_index, cf in enumerate(emitted):
                     metrics = _compute_metrics(
-                        rec.x, cf, rec.target, epsilon, pctx.model_predict, priorities)
+                        rec.x, cf, rec.target, epsilon, pctx.model_predict,
+                        scoring_priorities, max_priority)
                     if metrics["validity"]:
                         n_valid += 1
 
@@ -539,8 +570,12 @@ def run_experiment(experiment: Dict[str, Any], defaults: Dict[str, Any]) -> Opti
                         "n_changed": metrics["n_changed"],
                         "sparsity_fraction": metrics["sparsity_fraction"],
                         "priority_score": metrics["priority_score"],
+                        "priority_score_normalised": metrics["priority_score_normalised"],
+                        "max_attainable_priority": max_priority,
                         "iterations": iters_for_cf,
                         "time_seconds": float(elapsed),
+                        "model_calls": model_calls,
+                        "model_rows": model_rows,
                         "error": error,
                         "failure_reason": failure_reason,
                         "stop_reason": stop_reason,
@@ -550,6 +585,10 @@ def run_experiment(experiment: Dict[str, Any], defaults: Dict[str, Any]) -> Opti
                         "peak_lock_in_moves": extra_info.get("peak_lock_in_moves"),
                         "peak_lock_in_gain": extra_info.get("peak_lock_in_gain"),
                         "peak_lock_in_model_calls": extra_info.get("peak_lock_in_model_calls"),
+                        "accepted_steps": extra_info.get("accepted_steps"),
+                        "rejected_steps": extra_info.get("rejected_steps"),
+                        "restoration_hits": extra_info.get("restoration_hits"),
+                        "trust_fraction_final": extra_info.get("trust_fraction_final"),
                         "exemplar_source": exemplar_source,
                         "exemplar_pred_distance": extra_info.get("exemplar_pred_distance"),
                         "warm_start_total_combos": extra_info.get("warm_start_total_combos"),
@@ -659,8 +698,12 @@ def run_experiment(experiment: Dict[str, Any], defaults: Dict[str, Any]) -> Opti
             "avg_n_changed": _mean([r["n_changed"] for r in valid_rows]),
             "avg_sparsity_fraction": _mean([r["sparsity_fraction"] for r in valid_rows]),
             "avg_priority_score": _mean([r["priority_score"] for r in valid_rows]),
+            "avg_priority_score_normalised": _mean(
+                [r["priority_score_normalised"] for r in valid_rows]),
             "avg_iterations": _mean([r["iterations"] for r in valid_rows]),
             "avg_time_seconds": _mean([r["time_seconds"] for r in real_rows or rows]),
+            "avg_model_rows": _mean([r["model_rows"] for r in real_rows or rows]),
+            "avg_model_calls": _mean([r["model_calls"] for r in real_rows or rows]),
         })
 
     _write_samples_csv(out_dir / "samples.csv", pctx, samples)
@@ -677,6 +720,7 @@ def run_experiment(experiment: Dict[str, Any], defaults: Dict[str, Any]) -> Opti
         method_cfgs=method_cfgs,
         n_selected=len(samples),
         n_cfs_by_method={m.name: int(getattr(m, "_n_cfs", 1)) for m in methods},
+        seed=None if default_seed is None else int(default_seed),
     )
     logger.info("[%s] Wrote results to %s", dataset_key, out_dir)
     return out_dir
@@ -698,6 +742,10 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--config", default=str(DEFAULT_CONFIG))
     parser.add_argument("--dataset", default=None,
                         help="Optional filter -- run only this dataset key.")
+    parser.add_argument("--out-dir", default=None,
+                        help="Write results under this root instead of results/.")
+    parser.add_argument("--force", action="store_true",
+                        help="Overwrite an existing result set (they are not in git).")
     parser.add_argument("--verbose", "-v", action="store_true")
     return parser.parse_args(argv)
 
@@ -714,7 +762,11 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
 
     for exp in experiments:
         try:
-            run_experiment(exp, defaults)
+            run_experiment(
+                exp, defaults,
+                out_root=Path(args.out_dir) if args.out_dir else None,
+                force=bool(args.force),
+            )
         except Exception as exc:
             logger.error("Experiment failed (%s): %s", exp.get("dataset"), exc)
 

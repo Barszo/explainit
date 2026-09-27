@@ -124,6 +124,24 @@ class MINLSearchExplainer:
         self._last_search_exception = None
         self.last_search_result = {}
         self._fallback_random_max_iterations = 10000
+        # Seed for the only stochastic part of the search (the Stage 1
+        # fallback anchor); set per run by ``find_counterfactuals``.
+        self._random_seed = None
+        # Step-limiting state (Stage 4/5). ``_tr_fraction`` is the trust-region
+        # radius as a fraction of each feature's allowed span; ``None`` when the
+        # trust region is disabled.
+        self._tr_fraction = None
+        self._tr_min = 0.02
+        self._tr_max = 1.0
+        self._tr_expand = 2.0
+        self._tr_shrink = 0.5
+        # Additive surrogate correction: the linear constraint aims at
+        # ``target - _target_correction`` so the surrogate reproduces the last
+        # measured model residual.
+        self._target_correction = 0.0
+        self._residual_correction_enabled = False
+        self._pass_targets = {}
+        self._restoration_enabled = False
 
     def _workflow_log(self, message, *args):
         if self.workflow_logger is not None:
@@ -1280,12 +1298,54 @@ class MINLSearchExplainer:
                     else:
                         raise ValueError("Invalid categorical combination encountered for indices {}: {}".format(feature_indices, current_values))
 
-                new_targets[combo_idx] = self.target - result - basic_prediction + coef_times_original #- unactionable_sum
+                new_targets[combo_idx] = self._pass_target(combo_idx, result) - result - basic_prediction + coef_times_original #- unactionable_sum
         else:
             # no categorical features
-            new_targets[0] = self.target - basic_prediction + coef_times_original
+            new_targets[0] = self._pass_target(0, 0.0) - basic_prediction + coef_times_original
 
         return new_targets
+
+    def _reachable_surrogate_range(self) -> tuple:
+        """Interval the Shapley-linear prediction can span inside the search bounds.
+
+        Interval arithmetic over ``basic_prediction + sum_i c_i (x_i - x_i^k)``,
+        which costs nothing and tells the pass whether the target is reachable
+        in one step of the current trust region.
+        """
+        lo_total = hi_total = float(self.basic_prediction)
+        bounds = self._search_bounds()
+        non_actionable = set(self.priorities_state.non_actionable_indices)
+        for idx, coeff in (self.sample_state.shap_coeffs or {}).items():
+            if idx in non_actionable:
+                continue
+            lo, hi = bounds.get(idx, (None, None))
+            if lo is None or hi is None:
+                continue
+            x = float(self.sample_state.sample[idx])
+            d_lo = float(coeff) * (float(lo) - x)
+            d_hi = float(coeff) * (float(hi) - x)
+            lo_total += min(d_lo, d_hi)
+            hi_total += max(d_lo, d_hi)
+        return lo_total, hi_total
+
+    def _pass_target(self, combo_idx: int, categorical_contribution: float) -> float:
+        """Target for this pass: the effective target, clipped to what is reachable.
+
+        When the trust region cannot span the whole gap, the pass aims at the
+        closest reachable surrogate value instead of an impossible one; the
+        next pass re-linearises there and continues toward the target.
+        """
+        wanted = self._effective_target()
+        lo, hi = self._reachable_surrogate_range()
+        lo += float(categorical_contribution)
+        hi += float(categorical_contribution)
+        clipped = min(max(wanted, lo), hi)
+        if abs(clipped - wanted) > 1e-9:
+            logger.info("[Stage 4.3] Combo %d: target %.4f is outside the reachable "
+                        "surrogate range [%.4f, %.4f]; aiming at %.4f this pass.",
+                        combo_idx, wanted, lo, hi, clipped)
+        self._pass_targets[combo_idx] = float(clipped)
+        return float(clipped)
 
     # function to create limited priorities based on SHAP values (4.1)
     def create_limited_priorities(self):
@@ -1406,6 +1466,7 @@ class MINLSearchExplainer:
         # 3. Prepare targets and coefficients for linear search
         logger.info("[Stage 4.3] Building per-combo LP targets and per-feature linear "
                     "coefficients from Shapley values.")
+        self._pass_targets = {}
         target_for_combo = self.extract_for_linear_search()
         logger.info("[Stage 4.3] LP targets per categorical combo: %s", target_for_combo)
         logger.debug("[Stage 4.3] Per-feature shap_coeffs (unit phi): %s",
@@ -1416,7 +1477,8 @@ class MINLSearchExplainer:
                     "their bounds for the LP solver.")
         indices_to_modify = [i for i in self.sample_state.shap_coeffs.keys() if i not in self.priorities_state.non_actionable_indices]
         coeff_to_linear_search = [self.sample_state.shap_coeffs[key] for key in indices_to_modify]
-        bounds_for_linear_search = [self.priorities_state.bounds[key] for key in indices_to_modify]
+        search_bounds = self._search_bounds()
+        bounds_for_linear_search = [search_bounds[key] for key in indices_to_modify]
         logger.info("[Stage 4.4] %d actionable numerical features: %s",
                     len(indices_to_modify), indices_to_modify)
         logger.debug("[Stage 4.4] LP coefficients=%s | bounds=%s",
@@ -1465,13 +1527,14 @@ class MINLSearchExplainer:
                 logger.debug("[Stage 4.5] Combo %d candidate vector: %s",
                              combination_id, dummy_x)
                 check_value = self.constraint_function(dummy_x, shap_dict, self.sample_state.sample, self.sample_state.target_exemplar, priorities_for_search, basic_prediction=self.basic_prediction)
-                assert abs(check_value - self.target) <= self.epsilon, \
-                    f"Constraint function value {check_value} exceeds tolerance {self.epsilon} from target {self.target}"
-                linear_gap = abs(float(check_value) - float(self.target))
+                pass_target = self._pass_targets.get(combination_id, self._effective_target())
+                assert abs(check_value - pass_target) <= self.epsilon, \
+                    f"Constraint function value {check_value} exceeds tolerance {self.epsilon} from target {pass_target}"
+                linear_gap = abs(float(check_value) - float(pass_target))
                 logger.info("[Stage 4.5] Combo %d sanity check: linearised h(x)=%.4f "
                             "(target=%.4f, |gap|=%.4f, epsilon=%.4f).",
                             combination_id, float(check_value),
-                            float(self.target), linear_gap, float(self.epsilon))
+                            float(pass_target), linear_gap, float(self.epsilon))
                 # Surrogate mismatch: true model prediction at the warm-start x0.
                 ws_model_pred = float(
                     np.asarray(self.model_pred([dummy_x])).reshape(-1)[0])
@@ -1722,6 +1785,7 @@ class MINLSearchExplainer:
                 self._generate_exemplar_in_range(
                     max_iterations=int(getattr(
                         self, "_fallback_random_max_iterations", 10000)),
+                    random_seed=getattr(self, "_random_seed", None),
                 )
                 self.exemplar_source = "random_in_range"
                 self.exemplar_pred_distance = self._exemplar_pred_distance()
@@ -1912,6 +1976,54 @@ class MINLSearchExplainer:
         logger.info("Non-actionable feature indices (frozen at sample values): %s",
                     self.priorities_state.non_actionable_indices)
 
+    def _effective_target(self) -> float:
+        """Target the *surrogate* must hit so the true model lands on ``target``.
+
+        Equals ``target`` unless a previous pass measured a residual
+        ``f(x) - h(x)`` that the additive correction is compensating for.
+        """
+        return float(self.target) - float(self._target_correction)
+
+    def _search_bounds(self) -> Dict[int, tuple]:
+        """Per-feature ``(lo, hi)`` for the LP and SLSQP, trust region included.
+
+        The trust region caps how far one pass may move each feature from the
+        current iterate, because the Shapley-linear surrogate is only accurate
+        near the point it was linearised at. Disabled -> the priority bounds.
+        """
+        bounds = self.priorities_state.bounds
+        if self._tr_fraction is None:
+            return dict(bounds)
+        center = np.asarray(self.sample_state.sample, dtype=float)
+        limited = {}
+        for idx, (lo, hi) in bounds.items():
+            if lo is None or hi is None:
+                limited[idx] = (lo, hi)
+                continue
+            lo, hi = float(lo), float(hi)
+            # The iterate can sit outside its own allowed range (the priority
+            # support need not contain the sample), so clamp before expanding.
+            c = min(max(float(center[idx]), lo), hi)
+            delta = float(self._tr_fraction) * (hi - lo)
+            limited[idx] = (max(lo, c - delta), min(hi, c + delta))
+        return limited
+
+    def _grow_trust_region(self) -> bool:
+        """Enlarge the trust region; ``False`` when already at full span."""
+        if self._tr_fraction is None or self._tr_fraction >= self._tr_max:
+            return False
+        self._tr_fraction = min(self._tr_max, self._tr_fraction * self._tr_expand)
+        logger.info("[Trust region] Enlarged to %.3f of each feature's allowed span.",
+                    self._tr_fraction)
+        return True
+
+    def _shrink_trust_region(self) -> None:
+        if self._tr_fraction is None:
+            return
+        self._tr_fraction = max(self._tr_min, self._tr_fraction * self._tr_shrink)
+        logger.info("[Trust region] Shrunk to %.3f of each feature's allowed span.",
+                    self._tr_fraction)
+
     def _run_one_pass(self, shap_approx, num_samples):
         """Execute stages 3, 4 and 5 once for the current ``sample_state.sample``.
 
@@ -1926,9 +2038,16 @@ class MINLSearchExplainer:
                     "between the prediction on the sample and on the target exemplar. "
                     "Numerical features get one value each; one-hot categorical groups "
                     "are consolidated into a single value per group.")
-        self.calc_shapley(self.sample_state.sample,
-                          use_approximation=shap_approx,
-                          num_samples=num_samples)
+        current_sample = [float(v) for v in np.asarray(self.sample_state.sample, dtype=float)]
+        if (self.sample_state.shapley_values is not None
+                and getattr(self, "_last_shapley_sample", None) == current_sample):
+            logger.info("[Stage 3] Iterate unchanged since the last pass: reusing the "
+                        "cached Shapley values (saves a full re-linearisation).")
+        else:
+            self.calc_shapley(self.sample_state.sample,
+                              use_approximation=shap_approx,
+                              num_samples=num_samples)
+            self._last_shapley_sample = current_sample
         logger.info("Shapley values (numerical): %s",
                     self.sample_state.shapley_values.get('numerical'))
         logger.info("Shapley values (categorical groups): %s",
@@ -1940,7 +2059,15 @@ class MINLSearchExplainer:
                     "(in the Shapley-linearised model) to find numerical values that "
                     "land within +/- epsilon of the target. These become warm starts "
                     "for the nonlinear SLSQP optimisation in stage 5.")
-        init_vals_per_combo = self.confirm_existence_of_solution_for_combo()
+        # An infeasible LP under a tight trust region means the region cannot
+        # reach the target, not that the problem is infeasible: enlarge and
+        # retry, reusing the Shapley values just computed (no model calls).
+        while True:
+            init_vals_per_combo = self.confirm_existence_of_solution_for_combo()
+            if init_vals_per_combo or not self._grow_trust_region():
+                break
+            logger.info("[Stage 4] No warm start inside the trust region; retrying "
+                        "with the enlarged region.")
         logger.info("Initial values per combination: %s", init_vals_per_combo)
         logger.info("Limited priorities used for search: %s",
                     self.sample_state.limited_priorities)
@@ -1950,7 +2077,7 @@ class MINLSearchExplainer:
         logger.info("Minimise the priority cost subject to the Shapley-linear constraint "
                     "h(x) in [target-epsilon, target+epsilon]. One run per categorical "
                     "combination; without categorical features the loop runs once.")
-        bounds = self.priorities_state.bounds
+        bounds = self._search_bounds()
         counterfactuals = []
         for i, values in init_vals_per_combo.items():
             logger.info("[combo %d/%d] Preparing input from initial LP solution and "
@@ -1984,13 +2111,17 @@ class MINLSearchExplainer:
             constraint_fun = lambda x: constraint_wrapper(x, self.sample_state.shapley_values, self.sample_state.sample, self.sample_state.target_exemplar, self.sample_state.limited_priorities, basic_prediction=self.basic_prediction, ready_input=prepared_input.copy())
             objective_fun = lambda x: -objective_wrapper(x, self.sample_state.limited_priorities, prepared_input.copy())
 
-            # Lower bound constraint: h(x) >= target - epsilon
-            def lower_constraint(x):
-                return constraint_fun(x) - (self.target - self.epsilon)
+            # Target of this pass: the real target unless the trust region can
+            # only reach part of the way (then the closest reachable value).
+            pass_target = self._pass_targets.get(i, self._effective_target())
 
-            # Upper bound constraint: h(x) <= target + epsilon
-            def upper_constraint(x):
-                return (self.target + self.epsilon) - constraint_fun(x)
+            # Lower bound constraint: h(x) >= pass_target - epsilon
+            def lower_constraint(x, _t=pass_target):
+                return constraint_fun(x) - (_t - self.epsilon)
+
+            # Upper bound constraint: h(x) <= pass_target + epsilon
+            def upper_constraint(x, _t=pass_target):
+                return (_t + self.epsilon) - constraint_fun(x)
 
             constraints = [
                 {'type': 'ineq', 'fun': lower_constraint},
@@ -2011,11 +2142,17 @@ class MINLSearchExplainer:
                             self._allowed_interval_constraint_value(float(x[_j]), _intervals)
                         ),
                     })
+            for j, (lo, hi) in enumerate(bounds_list):
+                if lo is not None:
+                    x0[j] = max(float(x0[j]), float(lo))
+                if hi is not None:
+                    x0[j] = min(float(x0[j]), float(hi))
             logger.info("[combo %d/%d] Initial numerical x0=%s",
                         i + 1, len(init_vals_per_combo), x0)
             logger.debug("[combo %d/%d] Constraints (bounded): h(x) in [%.4f, %.4f]",
                          i + 1, len(init_vals_per_combo),
-                         self.target - self.epsilon, self.target + self.epsilon)
+                         pass_target - self.epsilon,
+                         pass_target + self.epsilon)
             logger.debug("[combo %d/%d] Bounds list passed to SLSQP: %s",
                          i + 1, len(init_vals_per_combo), bounds_list)
             logger.info("[combo %d/%d] Running SLSQP (maximise priority weight subject "
@@ -2263,6 +2400,50 @@ class MINLSearchExplainer:
                     info["model_calls"])
         return list(cur), info
 
+    def _restore_to_band(self, cf, eval_info, max_steps: int = 3):
+        """Pull a near-miss candidate back into the target band.
+
+        Least-norm Shapley-Newton correction: distributing the measured
+        residual over the actionable features as ``dx = -r c / ||c||^2`` moves
+        the linearised prediction by exactly ``-r`` while changing the features
+        as little as possible, so most of the candidate's priority survives.
+        Costs at most ``max_steps`` model calls and is only attempted for
+        candidates SLSQP already produced.
+
+        Returns ``(cf, eval_info)`` when the point ends up inside the band,
+        otherwise ``(None, None)``.
+        """
+        coeffs = getattr(self.sample_state, "shap_coeffs", None)
+        if not coeffs:
+            return None, None
+        non_actionable = set(self.priorities_state.non_actionable_indices)
+        indices = [i for i in coeffs
+                   if i not in non_actionable and abs(float(coeffs[i])) > 1e-12]
+        if not indices:
+            return None, None
+        denom = sum(float(coeffs[i]) ** 2 for i in indices)
+        if denom < 1e-18:
+            return None, None
+
+        cur = np.asarray(cf, dtype=float).copy()
+        residual = float(eval_info["model_pred"]) - float(self.target)
+        for step in range(int(max_steps)):
+            for i in indices:
+                cur[i] = self._clip_to_allowed(
+                    i, float(cur[i]) - residual * float(coeffs[i]) / denom)
+            pred = float(np.asarray(self.model_pred([list(cur)])).reshape(-1)[0])
+            residual = pred - float(self.target)
+            if abs(residual) <= float(self.epsilon):
+                restored = self._evaluate_candidate(list(cur))
+                logger.info("[Restoration] Candidate pulled into the band in %d "
+                            "step(s): |f - target| %.4f -> %.4f | priority %s -> %s.",
+                            step + 1, eval_info["distance"], restored["distance"],
+                            eval_info["priority"], restored["priority"])
+                return list(cur), restored
+        logger.debug("[Restoration] Failed after %d step(s); |f - target|=%.4f.",
+                     int(max_steps), abs(residual))
+        return None, None
+
     def _select_best_candidate(self, counterfactuals):
         """Stage 6: pick the candidate with the highest priority benefit.
 
@@ -2335,7 +2516,14 @@ class MINLSearchExplainer:
                              return_when_fails=True,
                              fallback_random_max_iterations=10000,
                              peak_lock_in=True,
-                             peak_lock_in_max_sweeps=3):
+                             peak_lock_in_max_sweeps=3,
+                             random_seed=None,
+                             trust_region=True,
+                             trust_region_init=0.25,
+                             trust_region_min=0.02,
+                             trust_region_max=1.0,
+                             residual_correction=True,
+                             restoration=True):
         """Find a counterfactual via iterative Shapley re-linearisation.
 
         Stages 1 and 2 (locate target exemplar, gather bounds) run once.
@@ -2381,6 +2569,28 @@ class MINLSearchExplainer:
                 sweep (:meth:`_peak_lock_in`) on the feasible incumbent
                 before returning.
             peak_lock_in_max_sweeps: Maximum number of Stage 7 sweeps.
+            random_seed: Seeds the Stage 1 fallback anchor, the only
+                stochastic step of the search (approximate Shapley subset
+                sampling draws from the same global stream). Pass an int
+                for a reproducible run.
+            trust_region: If True (default) each pass may only move a
+                feature by a fraction of its allowed span, so SLSQP stays
+                where the Shapley-linear surrogate is accurate. The radius
+                grows after an accepted step and shrinks after a rejected
+                one; a pass whose warm-start LP is infeasible inside the
+                region enlarges it and retries without new model calls.
+            trust_region_init/min/max: Radius bounds as a fraction of each
+                feature's allowed span.
+            residual_correction: If True (default) a rejected candidate's
+                measured residual ``f(x) - h(x)`` is subtracted from the
+                target the surrogate aims at, so the next pass asks the
+                linear model for the change the true model actually needs.
+                Costs no extra model calls.
+            restoration: If True (default) a candidate that lands just
+                outside the band is pulled back in with a least-norm
+                Shapley-Newton correction (:meth:`_restore_to_band`)
+                instead of being discarded. Costs up to 3 model calls per
+                pass and keeps most of the candidate's priority.
 
         Returns:
             list | None: The selected counterfactual feature vector, or
@@ -2398,11 +2608,13 @@ class MINLSearchExplainer:
         logger.info("=" * 78)
         logger.info("MINLP COUNTERFACTUAL SEARCH | target=%.4f | epsilon=%.4f | "
                     "max_iterations=%d | patience=%d | shap_approx=%s | "
-                    "num_samples=%d | return_when_fails=%s",
+                    "num_samples=%d | return_when_fails=%s | trust_region=%s | "
+                    "residual_correction=%s",
                     float(self.target), float(self.epsilon),
                     int(max_iterations), int(patience),
                     bool(shap_approx), int(num_samples),
-                    bool(return_when_fails))
+                    bool(return_when_fails), bool(trust_region),
+                    bool(residual_correction))
         logger.info("=" * 78)
 
         self.exemplar_source = None
@@ -2411,6 +2623,18 @@ class MINLSearchExplainer:
         self._last_search_exception = None
         self._priority_peaks_cache = None
         self._fallback_random_max_iterations = int(fallback_random_max_iterations)
+        self._random_seed = None if random_seed is None else int(random_seed)
+        if self._random_seed is not None:
+            np.random.seed(self._random_seed)
+            random.seed(self._random_seed)
+        self._tr_fraction = float(trust_region_init) if trust_region else None
+        self._tr_min = float(trust_region_min)
+        self._tr_max = float(trust_region_max)
+        self._target_correction = 0.0
+        self._residual_correction_enabled = bool(residual_correction)
+        self._restoration_enabled = bool(restoration)
+        self._last_shapley_sample = None
+        self._pass_targets = {}
 
         # Stage 0: infer bounds directly from priority functions.
         self._derive_bounds_and_intervals_from_priorities()
@@ -2452,6 +2676,7 @@ class MINLSearchExplainer:
         no_progress = 0
         history = []
         stop_reason = "max_iterations"
+        restoration_hits = 0
 
         for iteration in range(int(max_iterations)):
             logger.info("############ REFINEMENT ITERATION %d/%d ############",
@@ -2468,8 +2693,27 @@ class MINLSearchExplainer:
                 break
 
             eval_info = self._evaluate_candidate(cf)
+            if not eval_info["feasible"] and self._restoration_enabled:
+                restored_cf, restored_eval = self._restore_to_band(cf, eval_info)
+                if restored_cf is not None:
+                    cf, eval_info = restored_cf, restored_eval
+                    restoration_hits += 1
             priority = eval_info["priority"]
             improved = False
+            # Surrogate agreement over this step: both models share the value
+            # ``basic_prediction`` at the current iterate, so no extra model
+            # call is needed to compare their predicted changes.
+            anchor_value = float(self.basic_prediction)
+            surrogate_change = float(eval_info["h_x"]) - anchor_value
+            model_change = float(eval_info["model_pred"]) - anchor_value
+            rho = (model_change / surrogate_change
+                   if abs(surrogate_change) > 1e-12 else float("nan"))
+            residual = float(eval_info["model_pred"]) - float(eval_info["h_x"])
+            # A step is worth taking when it lands in the band or simply gets
+            # closer to the target than the point it started from.
+            iterate_distance = abs(anchor_value - float(self.target))
+            accepted = bool(eval_info["feasible"]
+                            or eval_info["distance"] < iterate_distance - 1e-12)
 
             if eval_info["feasible"]:
                 # Inside the band: rank on the priority benefit only.
@@ -2499,14 +2743,34 @@ class MINLSearchExplainer:
             )
             logger.info("[Iter %d] model_pred(cf)=%.4f | h(x)=%.4f | distance=%.4f | "
                         "feasible=%s | priority=%s | best_priority=%s | "
-                        "best_distance=%s | improved_vs_best=%s",
+                        "best_distance=%s | improved_vs_best=%s | rho=%.3f | "
+                        "residual=%.4f | trust=%s",
                         iteration + 1,
                         eval_info["model_pred"], eval_info["h_x"],
                         eval_info["distance"], eval_info["feasible"],
                         f"{priority:.4f}" if priority is not None else "n/a",
-                        best_priority_so_far, best_distance_so_far, improved)
+                        best_priority_so_far, best_distance_so_far, improved,
+                        rho, residual,
+                        f"{self._tr_fraction:.3f}" if self._tr_fraction is not None else "off")
 
-            if improved:
+            if accepted:
+                self._target_correction = 0.0
+                if (self._tr_fraction is not None and np.isfinite(rho)
+                        and 0.5 <= rho <= 1.5):
+                    self._grow_trust_region()
+            else:
+                if self._residual_correction_enabled:
+                    self._target_correction = residual
+                    logger.info("[Iter %d] Residual correction: surrogate now aims at "
+                                "%.4f so the model lands on %.4f.",
+                                iteration + 1, self._effective_target(),
+                                float(self.target))
+                self._shrink_trust_region()
+
+            # An accepted step is progress even when it does not yet beat the
+            # incumbent: the trust-region walk needs several passes to cross
+            # the gap, and patience must not cut it short.
+            if improved or accepted:
                 no_progress = 0
             else:
                 no_progress += 1
@@ -2521,6 +2785,11 @@ class MINLSearchExplainer:
                 "feasible": eval_info["feasible"],
                 "priority": priority,
                 "improved_vs_best": improved,
+                "accepted_step": accepted,
+                "rho": (float(rho) if np.isfinite(rho) else None),
+                "residual": residual,
+                "trust_fraction": self._tr_fraction,
+                "target_correction": self._target_correction,
             })
 
             if no_progress >= int(patience):
@@ -2531,11 +2800,20 @@ class MINLSearchExplainer:
                                else "patience_exhausted")
                 break
 
-            # Always advance to the latest CF, even when it did not improve;
-            # the next iteration re-linearises against the same exemplar.
-            self.sample_state.sample = list(cf)
-            logger.info("[Iter %d] Advancing: next iteration's sample = current CF.",
-                        iteration + 1)
+            # Advance only on an accepted (in-band) step, so the surrogate is
+            # always re-linearised at a point the true model agrees with. With
+            # both step controls off, keep the historical behaviour of moving
+            # to every candidate.
+            step_control = (self._tr_fraction is not None) or self._residual_correction_enabled
+            if accepted or not step_control:
+                self.sample_state.sample = list(cf)
+                logger.info("[Iter %d] Advancing: next iteration's sample = current CF.",
+                            iteration + 1)
+            else:
+                logger.info("[Iter %d] Step rejected (|f - target|=%.4f > epsilon=%.4f); "
+                            "keeping the current iterate and retrying with a smaller "
+                            "step / corrected target.",
+                            iteration + 1, eval_info["distance"], float(self.epsilon))
 
         # Restore the original sample so explainer state stays consistent
         # for any caller that inspects sample_state after the search.
@@ -2593,6 +2871,15 @@ class MINLSearchExplainer:
             "anchor_distance": anchor_distance,
             "priority_gain_vs_anchor": priority_gain_vs_anchor,
             "peak_lock_in": peak_info,
+            "step_control": {
+                "trust_region_enabled": bool(trust_region),
+                "trust_fraction_final": self._tr_fraction,
+                "residual_correction_enabled": self._residual_correction_enabled,
+                "accepted_steps": sum(1 for h in history if h.get("accepted_step")),
+                "rejected_steps": sum(
+                    1 for h in history if h.get("accepted_step") is False),
+                "restoration_hits": int(restoration_hits),
+            },
         }
 
         logger.info("=" * 78)

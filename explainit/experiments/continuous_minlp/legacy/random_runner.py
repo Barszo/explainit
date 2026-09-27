@@ -1,4 +1,6 @@
-"""Stage 7: run random search as a baseline using the same priority sets.
+"""Stage 7 (LEGACY): run random search as a baseline using the same priority sets.
+
+Superseded by ``priority_methods/runner.py``; kept for reference.
 
 Reads ``minlp_test_config.yaml`` and, for each (experiment * sample *
 target) combination, invokes ``RandomSearchExplainer.generate_random_samples``
@@ -31,7 +33,7 @@ from typing import Any, Dict, List, Optional, Sequence
 import numpy as np
 import yaml
 
-PROJECT_ROOT = Path(__file__).resolve().parents[3]
+PROJECT_ROOT = Path(__file__).resolve().parents[4]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 

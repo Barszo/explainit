@@ -1,4 +1,8 @@
-"""Stage 6: run MINLP search using the registered priority sets.
+"""Stage 6 (LEGACY): run MINLP search using the registered priority sets.
+
+Superseded by ``priority_methods/runner.py`` (per-CF tables + priority
+metrics) and by ``explainit/experiments/paper`` (publication studies).
+Kept for reference and for reproducing the early per-pair JSON results.
 
 Reads ``minlp_test_config.yaml`` and, for each (experiment * sample *
 target) combination, invokes ``MINLSearchExplainer.find_counterfactuals``
@@ -31,7 +35,7 @@ from typing import Any, Dict, List, Optional, Sequence
 import numpy as np
 import yaml
 
-PROJECT_ROOT = Path(__file__).resolve().parents[3]
+PROJECT_ROOT = Path(__file__).resolve().parents[4]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 

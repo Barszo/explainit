@@ -40,17 +40,23 @@ explainit/experiments/continuous_minlp/
 ├── priority_sets.py              <- stage 3: declarative priority sets (edit me)
 ├── priorities_selection.py       <- stage 4: workbench for analyser plots
 ├── priorities_explorer.ipynb     <- notebook: inspect a sample's priorities
-├── minlp_test_config.yaml        <- stage 5: experiment configuration
-├── minlp_runner.py               <- stage 6: MINLP search runner
-├── random_runner.py              <- stage 7: random-search baseline runner
+├── dataset_priorities_explorer.ipynb <- notebook: author priorities for a dataset
+│
+├── legacy/                       <- superseded per-pair JSON runners (stages 5-7)
+│   ├── minlp_test_config.yaml
+│   ├── minlp_runner.py
+│   ├── random_runner.py
+│   ├── analysis_helper.ipynb
+│   └── results/<dataset_key>/<sample_idx>_<target>/{minlp.json, random.json}
 │
 ├── priority_methods/             <- packaged priority branch (runs after stage 2)
-│   ├── selection.py                     <- sample/target + priority context
+│   ├── selection.py                     <- sample/target + priority context + call counter
 │   ├── methods.py                       <- MINLP + random-search + priority_score
+│   ├── metrics.py                       <- per-CF metrics shared with the paper studies
 │   ├── config.yaml                      <- priority-methods configuration
 │   ├── runner.py                        <- runs the methods + writes results
 │   ├── results_explorer.ipynb           <- notebook: explore the run results
-│   └── results/<dataset_key>/{samples.csv, counterfactuals.csv,
+│   └── results/<dataset_key>/<priority_set>/{samples.csv, counterfactuals.csv,
 │                              metrics_summary.csv, summary.json,
 │                              run_config.json}
 │
@@ -70,9 +76,17 @@ explainit/experiments/continuous_minlp/
 ├── data/<dataset_key>/data.pkl
 ├── data_analysis/<dataset_key>/{numerical_features.csv, categorical_features.csv}
 ├── models/<dataset_key>/model.keras
-├── analysis/<dataset_key>/<sample_idx>_<target>/{coverage.txt, dataset/, priorities/, analysis_summary.txt}
-└── results/<dataset_key>/<sample_idx>_<target>/{minlp.json, random.json}
+└── analysis/<dataset_key>/<sample_idx>_<target>/{coverage.txt, dataset/, priorities/, analysis_summary.txt}
 ```
+
+> Publication studies (hyperparameter sweeps, factor studies, method
+> comparison) live in `explainit/experiments/paper` and import this package as
+> a library; see that package's `__init__.py` and
+> `python -m explainit.experiments.paper.run_study --help`.
+>
+> **Results are not tracked by git.** `priority_methods/runner.py` refuses to
+> overwrite an existing `results/<dataset>/<set>/` unless you pass `--force`;
+> use `--out-dir` when trying things out.
 
 ## End-to-end flow
 
@@ -543,8 +557,14 @@ zero counterfactuals rather than aborting the run.
 Written to `priority_methods/results/<dataset_key>/`, identical in shape to the
 standard-methods outputs with two additions:
 
-* `counterfactuals.csv` — adds a **`priority_score`** column (per CF).
-* `metrics_summary.csv` — adds **`avg_priority_score`** (over valid CFs).
+* `counterfactuals.csv` — adds **`priority_score`**, its normalised form
+  **`priority_score_normalised`** (`priority_score / max_attainable_priority`,
+  comparable across datasets and priority sets) and the budget columns
+  **`model_rows`** / **`model_calls`** (feature vectors scored by the method
+  for that sample, the fair cost axis when comparing methods).
+* `metrics_summary.csv` — adds **`avg_priority_score`**,
+  **`avg_priority_score_normalised`**, **`avg_model_rows`**,
+  **`avg_model_calls`** (over valid CFs).
 * `samples.csv`, `summary.json`, `run_config.json` — as in the standard branch
   (`run_config.json` also records the `priority_set`).
 
@@ -864,9 +884,9 @@ Recommended iteration loop:
 4. Repeat until priorities look right.
 5. Only then run `minlp_runner.py`.
 
-### 5. Configure the experiment
+### 5. Configure the experiment (legacy)
 
-Edit `minlp_test_config.yaml`. The top-level structure is:
+Edit `legacy/minlp_test_config.yaml`. The top-level structure is:
 
 ```yaml
 defaults:
@@ -884,25 +904,25 @@ experiments:
 Each experiment runs every cartesian `(sample, target)` pair. Per-entry
 keys override the `defaults` block.
 
-### 6. Run MINLP search
+### 6. Run MINLP search (legacy)
 
 ```bash
-python -m explainit.experiments.continuous_minlp.minlp_runner
-python -m explainit.experiments.continuous_minlp.minlp_runner --config minlp_test_config.yaml
-python -m explainit.experiments.continuous_minlp.minlp_runner --dataset diabetes
+python -m explainit.experiments.continuous_minlp.legacy.minlp_runner
+python -m explainit.experiments.continuous_minlp.legacy.minlp_runner --config legacy/minlp_test_config.yaml
+python -m explainit.experiments.continuous_minlp.legacy.minlp_runner --dataset diabetes
 ```
 
-Each pair produces `results/<dataset_key>/<sample_idx>_<target>/minlp.json`
+Each pair produces `legacy/results/<dataset_key>/<sample_idx>_<target>/minlp.json`
 with the headline metrics (validity, iterations, time) plus the resulting
 counterfactual vector and the full per-iteration history.
 
-### 7. Run random-search baseline
+### 7. Run random-search baseline (legacy)
 
 ```bash
-python -m explainit.experiments.continuous_minlp.random_runner
+python -m explainit.experiments.continuous_minlp.legacy.random_runner
 ```
 
-Writes `results/<dataset_key>/<sample_idx>_<target>/random.json` next to
+Writes `legacy/results/<dataset_key>/<sample_idx>_<target>/random.json` next to
 the MINLP result, so the two files can be diffed directly.
 
 ## Persisted metrics (today)

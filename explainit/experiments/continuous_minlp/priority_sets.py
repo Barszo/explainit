@@ -58,6 +58,7 @@ from __future__ import annotations
 
 import logging
 import sys
+import json
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence
@@ -746,6 +747,258 @@ PRIORITY_SETS: Dict[str, Dict[str, Dict[str, Any]]] = {
     #     },
     # },
 }
+
+
+# ---------------------------------------------------------------------------
+# Generic strictness family (loose / medium / strict)
+# ---------------------------------------------------------------------------
+#
+# Hand-writing one function per feature does not scale to the datasets the
+# publication studies use, and it turns "how strict are the priorities?" into a
+# per-dataset judgement call that cannot be compared across datasets. Instead
+# each dataset declares a compact *spec* -- what each feature means for the
+# decision maker -- and the same three strictness levels are materialised from
+# it, so strictness becomes a controlled experimental factor.
+#
+# Numerical rules:
+#   "free"           peaks at the sample, decays both ways
+#   "increase_only"  values below the sample are forbidden (priority 0)
+#   "decrease_only"  values above the sample are forbidden
+#   "immutable"      NON_ACTIONABLE (pinned to the sample's value)
+# Categorical rules (declared as ``(rule, codes)``; every code must be listed):
+#   "free"                 all categories allowed and equally preferred
+#   "immutable"            NON_ACTIONABLE (pinned to the sample's category)
+#   ("preferred", code)    that code weighs 1.0, the rest less at stricter levels
+#
+# Decay widths are fractions of each feature's dataset range, so a level means
+# the same thing on every dataset regardless of feature scale.
+
+_STRICTNESS_LEVELS: Dict[str, Dict[str, float]] = {
+    "loose": {"width_pct": 1.00, "a": 2.0, "other_category_weight": 0.80},
+    "medium": {"width_pct": 0.50, "a": 4.0, "other_category_weight": 0.50},
+    "strict": {"width_pct": 0.20, "a": 6.0, "other_category_weight": 0.20},
+}
+
+
+def _numerical_from_rule(rule: str, level: Dict[str, float]) -> Any:
+    if rule == "immutable":
+        return NON_ACTIONABLE
+    if rule not in {"free", "increase_only", "decrease_only"}:
+        raise ValueError(f"Unknown numerical rule {rule!r}.")
+    width = float(level["width_pct"])
+    return peak_priority(
+        peak_at=at_sample(), peak_value=1.0,
+        left=None if rule == "increase_only" else at_sample(pct=-width),
+        left_shape="exponential",
+        right=None if rule == "decrease_only" else at_sample(pct=width),
+        right_shape="exponential_out",
+        a=float(level["a"]),
+    )
+
+
+def _categorical_from_rule(
+    rule: Any, codes: Sequence[int], level: Dict[str, float],
+) -> Any:
+    if rule == "immutable":
+        return NON_ACTIONABLE
+    if rule == "free":
+        return {int(code): 1.0 for code in codes}
+    if isinstance(rule, tuple) and rule and rule[0] == "preferred":
+        preferred = rule[1]
+        other = float(level["other_category_weight"])
+        return {int(code): (1.0 if code == preferred else other) for code in codes}
+    raise ValueError(f"Unknown categorical rule {rule!r}.")
+
+
+# Per-dataset specs. Category code lists must match ``data_setup.py``'s
+# encoding; ``build_priorities`` raises a clear error if they drift.
+_DATASET_SPECS: Dict[str, Dict[str, Any]] = {
+    # Scenario: lower my medical charges. Age and family size cannot be acted
+    # on; weight can; quitting smoking is the preferred category change.
+    "insurance_charges": {
+        "numerical": {
+            "age": "immutable",
+            "bmi": "free",
+        },
+        "categorical": {
+            "sex": ("immutable", [0, 1]),
+            "children": ("immutable", [0, 1, 2, 3, 4, 5]),
+            "smoker": (("preferred", 0), [0, 1]),
+            "region": ("free", [0, 1, 2, 3]),
+        },
+    },
+    # Scenario: a retailer raising sales. Competitor price, local income,
+    # population and population age are market facts; price and advertising
+    # spend are the levers.
+    "carseats": {
+        "numerical": {
+            "CompPrice": "immutable",
+            "Income": "immutable",
+            "Advertising": "increase_only",
+            "Population": "immutable",
+            "Price": "free",
+            "Age": "immutable",
+        },
+        "categorical": {
+            "ShelveLoc": ("free", [0, 1, 2]),
+            "Education": ("immutable", [0, 1, 2, 3, 4, 5, 6, 7, 8]),
+            "Urban": ("immutable", [0, 1]),
+            "US": ("immutable", [0, 1]),
+        },
+    },
+    # Scenario: design a more fuel-efficient car. Engine and body properties
+    # are design choices; the model year and the market of origin are not.
+    "auto_mpg": {
+        "numerical": {
+            "displacement": "free",
+            "horsepower": "free",
+            "weight": "decrease_only",
+            "acceleration": "free",
+        },
+        "categorical": {
+            "cylinders": ("free", [0, 1, 2, 3, 4]),
+            "model_year": ("immutable", list(range(13))),
+            "origin": ("immutable", [0, 1, 2]),
+        },
+    },
+    # Scenario: find a stone at a different price point. Every physical
+    # property and grade is a choice; nothing is pinned.
+    "diamonds": {
+        "numerical": {
+            "carat": "free",
+            "depth": "free",
+            "table": "free",
+            "x": "free",
+            "y": "free",
+            "z": "free",
+        },
+        "categorical": {
+            "cut": ("free", [0, 1, 2, 3, 4]),
+            "color": ("free", [0, 1, 2, 3, 4, 5, 6]),
+            "clarity": ("free", [0, 1, 2, 3, 4, 5, 6, 7]),
+        },
+    },
+    # Scenario: "under what conditions would demand reach this level?" -- a
+    # what-if over weather and calendar slot. Weather is continuous and the
+    # calendar slot is categorical, so this is the combinatorial stress case:
+    # 3 multi-category groups (hour, weekday, working day) on top of 4
+    # actionable numerical features.
+    "bike_sharing_hourly": {
+        "numerical": {
+            "temp": "free",
+            "atemp": "free",
+            "hum": "free",
+            "windspeed": "free",
+        },
+        "categorical": {
+            "season": ("immutable", [0, 1, 2, 3]),
+            "yr": ("immutable", [0, 1]),
+            "mnth": ("immutable", list(range(12))),
+            "hr": ("free", list(range(24))),
+            "holiday": ("immutable", [0, 1]),
+            "weekday": ("free", list(range(7))),
+            "workingday": ("free", [0, 1]),
+            "weathersit": ("immutable", [0, 1, 2, 3]),
+        },
+    },
+    # Scenario: what property would rent at the target price. Location and
+    # layout are choices; 7 categorical groups, several with many categories.
+    "brazilian_houses_to_rent": {
+        "numerical": {
+            "area": "free",
+            "hoa (R$)": "free",
+            "property tax (R$)": "free",
+            "fire insurance (R$)": "free",
+        },
+        "categorical": {
+            "city": ("free", [0, 1, 2, 3, 4]),
+            "rooms": ("free", list(range(11))),
+            "bathroom": ("free", list(range(10))),
+            "parking spaces": ("free", list(range(11))),
+            "floor": ("free", list(range(35))),
+            "animal": ("free", [0, 1]),
+            "furniture": ("free", [0, 1]),
+        },
+    },
+}
+
+
+def build_strictness_sets() -> Dict[str, Dict[str, Dict[str, Any]]]:
+    """Materialise ``loose`` / ``medium`` / ``strict`` sets from the specs."""
+    built: Dict[str, Dict[str, Dict[str, Any]]] = {}
+    for dataset_key, spec in _DATASET_SPECS.items():
+        sets: Dict[str, Dict[str, Any]] = {}
+        for level_name, level in _STRICTNESS_LEVELS.items():
+            sets[level_name] = {
+                "numerical": {
+                    name: _numerical_from_rule(rule, level)
+                    for name, rule in spec["numerical"].items()
+                },
+                "categorical": {
+                    name: _categorical_from_rule(rule, codes, level)
+                    for name, (rule, codes) in spec["categorical"].items()
+                },
+            }
+        built[dataset_key] = sets
+    return built
+
+
+for _dataset_key, _generated_sets in build_strictness_sets().items():
+    PRIORITY_SETS.setdefault(_dataset_key, {}).update(_generated_sets)
+
+#: Public alias so the factor-variant builder can inherit a dataset's spec.
+DATASET_SPECS = _DATASET_SPECS
+
+
+def register_variant_priority_sets(data_dir: Optional[Path] = None) -> List[str]:
+    """Give every factor variant the same strictness family as its base dataset.
+
+    ``study2_factors/factor_datasets.py`` writes ``priority_spec.json`` next to
+    each variant's pickle, holding its base dataset's spec filtered to the
+    features the variant still has. Reading those files (cheap JSON, no pickle
+    load) keeps variant keys usable anywhere a dataset key is expected.
+    """
+    root = Path(data_dir) if data_dir is not None else (
+        Path(__file__).resolve().parent / "data")
+    registered: List[str] = []
+    if not root.exists():
+        return registered
+    for spec_path in sorted(root.glob("*/priority_spec.json")):
+        variant = spec_path.parent.name
+        try:
+            with open(spec_path, "r", encoding="utf-8") as handle:
+                raw = json.load(handle)
+            spec = {
+                "numerical": dict(raw.get("numerical", {})),
+                "categorical": {
+                    name: (
+                        tuple(rule) if isinstance(rule, list) else rule,
+                        [int(c) for c in codes],
+                    )
+                    for name, (rule, codes) in raw.get("categorical", {}).items()
+                },
+            }
+            sets = {
+                level_name: {
+                    "numerical": {
+                        name: _numerical_from_rule(rule, level)
+                        for name, rule in spec["numerical"].items()
+                    },
+                    "categorical": {
+                        name: _categorical_from_rule(rule, codes, level)
+                        for name, (rule, codes) in spec["categorical"].items()
+                    },
+                }
+                for level_name, level in _STRICTNESS_LEVELS.items()
+            }
+        except Exception:  # a malformed variant must not break imports
+            continue
+        PRIORITY_SETS.setdefault(variant, {}).update(sets)
+        registered.append(variant)
+    return registered
+
+
+register_variant_priority_sets()
 
 
 def get_priority_set(dataset_key: str, name: str = "default") -> Dict[str, Any]:
