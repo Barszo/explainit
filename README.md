@@ -1,16 +1,8 @@
 # explainit
 
-Lightweight workspace for experimenting with preference-based counterfactual explanations.
+`explainit` is a Python package for building preference-based counterfactual explanations for machine learning models. It lets you describe which feature changes are more desirable, sample or optimize candidate counterfactuals, and visualize both the preference structure and the data around it.
 
-After the recent cleanup, the active repository is much smaller than before: the maintained code now lives in the `explainit/` package, while older notebooks, experiments, datasets, and notes have been moved out of the main project flow into `trash/`.
-
-## Current repository status
-
-- **Active code**: core explainers, priority functions, plotting, and analysis utilities
-- **Archived material**: older notebooks, experiments, model artifacts, and reference notes in `trash/`
-- **Tests**: `tests/` is currently only a placeholder package
-
-## Active project structure
+## Project structure
 
 ```text
 explainit_project/
@@ -29,58 +21,79 @@ explainit_project/
 │       ├── priorities_analyser.py
 │       └── priority_plots.py
 ├── tests/
-├── trash/
 ├── CONTRIBUTING.md
 ├── LICENSE
 ├── requirements.txt
 └── setup.py
 ```
 
-## What is currently included
+## Main components
 
 ### Explainers
 
-- **`RandomSearchExplainer`** (`explainit/explainers/random_search.py`)
-  - samples candidate points from user-defined numerical and categorical priorities
-  - supports regression-style targets and binary classification thresholds
-  - includes preference scoring, per-feature breakdowns, and probability-distribution visualizations
+#### `RandomSearchExplainer`
 
-- **`MINLSearchExplainer`** (`explainit/explainers/minlp_search.py`)
-  - iterative counterfactual search based on Shapley re-linearisation
-  - includes bound derivation from priority functions, trust-region control, restoration, and priority-guided candidate selection
-  - exposes priority plotting for the configured search space
+Defined in `explainit/explainers/random_search.py`.
+
+Use it when you want to generate counterfactual candidates by sampling from user-defined priorities.
+
+Current capabilities:
+- handles numerical and categorical priorities
+- supports regression-style targets with an `epsilon` tolerance
+- supports binary-classification search with a decision threshold
+- computes aggregate preference scores for found candidates
+- provides per-feature preference breakdowns
+- can visualize priorities and sampling distributions
+
+#### `MINLSearchExplainer`
+
+Defined in `explainit/explainers/minlp_search.py`.
+
+Use it when you want a more optimization-driven search procedure based on iterative Shapley re-linearisation.
+
+Current capabilities:
+- derives feasible bounds from priority functions
+- uses exemplar-based search initialization
+- supports trust-region updates and residual correction
+- restores near-feasible candidates back into the target band
+- scores and selects candidates using configured priorities
+- can visualize configured priorities
 
 ### Priority functions
 
-- **`explainit/priorities/linear.py`**
-  - `basic_linear`
+Priority functions describe how desirable feature values are. They are used in the `priorities["numerical"]` configuration and are expected to return values in the `[0, 1]` range.
 
-- **`explainit/priorities/nonlinear.py`**
-  - `exponential`
-  - `basic_linear_step`
+Available helpers:
 
-These functions return values in the `[0, 1]` range and are used to encode how desirable different feature values are.
+- `explainit.priorities.linear.basic_linear`
+- `explainit.priorities.nonlinear.exponential`
+- `explainit.priorities.nonlinear.basic_linear_step`
 
 ### Utilities
 
-- **`priority_plots.py`**
-  - plots numerical and categorical priorities
-  - plots sampling-oriented probability distributions
-  - can save generated figures to disk
+#### `priority_plots.py`
 
-- **`dataset_analyzer.py`**
-  - analyzes datasets feature-by-feature
-  - infers feature/target types
-  - produces summary text and plots for distributions and correlations
+Plotting helpers for:
+- numerical priority functions
+- categorical priority mappings
+- probability-style views of sampling behavior
 
-- **`priorities_analyser.py`**
-  - reports how configured priorities cover the dataset
-  - finds closest exemplars for target predictions
-  - combines coverage reporting with dataset and priority visualizations
+#### `dataset_analyzer.py`
+
+Dataset diagnostics for:
+- feature and target type inference
+- per-feature descriptive summaries
+- feature distributions
+- correlation plots and target relationships
+
+#### `priorities_analyser.py`
+
+Analysis helpers for:
+- checking how priorities cover a dataset
+- locating dataset rows closest to target predictions
+- generating combined priority and dataset diagnostics
 
 ## Installation
-
-For the current cleaned-down repo, the most reliable setup is:
 
 ```bash
 python -m venv .venv
@@ -89,13 +102,62 @@ pip install -r requirements.txt
 pip install -e .
 ```
 
-`CONTRIBUTING.md` currently uses the same editable install command:
+## How priorities are structured
 
-```bash
-pip install -e .
+Both explainers expect a priorities dictionary with `numerical` and `categorical` sections.
+
+### Numerical priorities
+
+Each actionable numerical feature is typically defined as:
+
+```python
+{
+    feature_index: {
+        "min": lower_bound,
+        "max": upper_bound,
+        "function": priority_function,
+    }
+}
 ```
 
-## Minimal usage example
+Example:
+
+```python
+from explainit.priorities.nonlinear import exponential
+
+priorities = {
+    "numerical": {
+        0: {
+            "min": 0.0,
+            "max": 1.0,
+            "function": lambda x: exponential(x, 0.4, 0.9, increasing=True),
+        }
+    },
+    "categorical": {},
+}
+```
+
+### Categorical priorities
+
+Categorical features are grouped by tuples of column indices, and each allowed category combination is assigned a weight.
+
+Example:
+
+```python
+priorities = {
+    "numerical": {},
+    "categorical": {
+        (2, 3): {
+            (1, 0): 1.0,
+            (0, 1): 0.4,
+        }
+    },
+}
+```
+
+## Usage
+
+### 1. Random search explainer
 
 ```python
 import numpy as np
@@ -135,18 +197,109 @@ counterfactuals, predictions, scores, iterations = explainer.generate_random_sam
 )
 ```
 
-## Archived material
+Useful methods:
+- `generate_random_samples(...)`
+- `generate_for_binary(...)`
+- `calculate_preference_score(sample)`
+- `get_preference_breakdown(sample)`
+- `display_priorities(...)`
+- `investigate_probability_distribution(...)`
 
-The `trash/` directory now acts as a holding area for material removed from the active repo structure, including:
+### 2. MINLP-style explainer
 
-- notebooks and exploratory scripts
-- older experiment folders
-- model-training assets and datasets
-- draft documentation and theory notes
+```python
+import numpy as np
 
-That content may still be useful as reference, but it should be treated as archived rather than part of the maintained package surface.
+from explainit.explainers.minlp_search import MINLSearchExplainer
+from explainit.priorities.linear import basic_linear
 
-## Notes
 
-- The README no longer documents the old examples/experiments/model folders as active top-level project components, because they are no longer part of the cleaned main structure.
-- If you are rebuilding the project from this slimmer base, start from `explainit/` and ignore `trash/` unless you need historical context.
+def model_pred(X):
+    X = np.asarray(X)
+    return X[:, 0] + 0.5 * X[:, 1]
+
+
+dataset = np.array([
+    [0.1, 0.2],
+    [0.3, 0.4],
+    [0.6, 0.5],
+    [0.8, 0.9],
+])
+
+sample = np.array([0.1, 0.2])
+target = 1.0
+
+priorities = {
+    "numerical": {
+        0: {"min": 0.0, "max": 1.0, "function": lambda x: basic_linear(x, 0.2, 0.8, increasing=True)},
+        1: {"min": 0.0, "max": 1.0, "function": lambda x: basic_linear(x, 0.1, 0.7, increasing=True)},
+    },
+    "categorical": {},
+}
+
+explainer = MINLSearchExplainer(
+    model_pred=model_pred,
+    priorities=priorities,
+    sample=sample,
+    target=target,
+    dataset=dataset,
+)
+
+counterfactual = explainer.find_counterfactuals()
+```
+
+Useful methods:
+- `find_counterfactuals(...)`
+- `find_counterfactuals_for_binary(...)`
+- `display_priorities(...)`
+
+### 3. Plot priorities directly
+
+```python
+from explainit.utils.priority_plots import plot_priorities
+
+plot_priorities(priorities, sample=sample, show=True)
+```
+
+### 4. Analyze a dataset
+
+```python
+from pathlib import Path
+
+from explainit.utils.dataset_analyzer import analyze_dataset
+
+report = analyze_dataset(
+    X=dataset,
+    y=model_pred(dataset),
+    feature_names=["feature_0", "feature_1"],
+    dataset_key="demo_dataset",
+    output_dir=Path("analysis_output"),
+)
+```
+
+### 5. Analyze priorities against a dataset
+
+```python
+from pathlib import Path
+
+from explainit.utils.priorities_analyser import analyse_priorities
+
+report = analyse_priorities(
+    model=model_pred,
+    dataset=dataset,
+    target_values=[target],
+    priorities=priorities,
+    feature_names=["feature_0", "feature_1"],
+    output_dir=Path("priority_analysis_output"),
+)
+```
+
+## Development
+
+Editable installation:
+
+```bash
+pip install -e .
+```
+
+The package version is defined in `explainit/__init__.py`.
