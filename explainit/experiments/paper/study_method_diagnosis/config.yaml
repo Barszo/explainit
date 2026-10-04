@@ -1,0 +1,119 @@
+# Diagnosis of the *existing* method (badania: what goes wrong and where).
+#
+# Every MINLP arm here runs the method as it stands: the Step-2 extensions
+# (trust region, residual correction, restoration) are explicitly disabled, so
+# this study characterises the shipped search, not an improved one. Stage 7
+# peak lock-in is run as a separate arm because it is part of the current
+# method but post-hoc, and the diagnosis must show what the *search* produces
+# before the polish.
+#
+# What it measures (see `analyse_study.py --by arm`, diagnostics table):
+#   * no_cf_rate                   -- cells where nothing was returned
+#   * anchor_rate                  -- returned CF is the Stage 1 random anchor,
+#                                     i.e. the optimiser contributed nothing
+#   * exemplar_random_rate         -- the dataset exemplar path failed
+#   * warm_start_gap_over_eps_rate -- the Shapley surrogate is already outside
+#                                     the tolerance band at the warm start
+#   * priority vs the random-search baseline on identical priorities
+#
+# Hyperparameters: the Badania I defaults (shap 100, patience 3, one Stage 7
+# sweep) - quality is flat above them and they are ~4x cheaper.
+#
+# Datasets: diabetes (the original example) plus three with the generic
+# loose/medium/strict family, so "priority strictness" is a controlled factor.
+# Run `priority_sets_check.py` first: cells whose allowed region cannot reach
+# the target are priority-infeasible, not method failures.
+
+study: method_diagnosis
+
+defaults:
+  epsilon: 0.05
+  n_cfs: 1
+  seeds: [0, 1, 2]
+  selection:
+    strategy: random
+    n_samples: 10
+    seed: 7
+    target_offset_pred_std: -1.0     # one prediction std down, scale-free
+    skip_if_target_below: 0.0
+
+arms:
+  - name: minlp_search_only
+    method: minlp
+    dataset: [diabetes]
+    priority_set: [set1, set2]
+    params:
+      shap_approx: true
+      shap_num_samples: 100
+      max_iterations: 10
+      patience: 3
+      target_exemplar_epsilon: 0.10
+      peak_lock_in: false
+      trust_region: false
+      residual_correction: false
+      restoration: false
+
+  - name: minlp_with_peak_lock_in
+    method: minlp
+    dataset: [diabetes]
+    priority_set: [set1, set2]
+    params:
+      shap_approx: true
+      shap_num_samples: 100
+      max_iterations: 10
+      patience: 3
+      target_exemplar_epsilon: 0.10
+      peak_lock_in: true
+      peak_lock_in_max_sweeps: 1
+      trust_region: false
+      residual_correction: false
+      restoration: false
+
+  - name: random_search_baseline
+    method: random_search
+    dataset: [diabetes]
+    priority_set: [set1, set2]
+    n_cfs: 1
+    params:
+      max_iterations: 10000
+      use_monte_carlo: true
+
+  - name: minlp_search_only_generic
+    method: minlp
+    dataset: [insurance_charges, carseats, auto_mpg]
+    priority_set: [loose, medium, strict]
+    params:
+      shap_approx: true
+      shap_num_samples: 100
+      max_iterations: 10
+      patience: 3
+      target_exemplar_epsilon: 0.10
+      peak_lock_in: false
+      trust_region: false
+      residual_correction: false
+      restoration: false
+
+  - name: minlp_with_peak_lock_in_generic
+    method: minlp
+    dataset: [insurance_charges, carseats, auto_mpg]
+    priority_set: [loose, medium, strict]
+    params:
+      shap_approx: true
+      shap_num_samples: 100
+      max_iterations: 10
+      patience: 3
+      target_exemplar_epsilon: 0.10
+      peak_lock_in: true
+      peak_lock_in_max_sweeps: 1
+      trust_region: false
+      residual_correction: false
+      restoration: false
+
+  - name: random_search_baseline_generic
+    method: random_search
+    dataset: [insurance_charges, carseats, auto_mpg]
+    priority_set: [loose, medium, strict]
+    n_cfs: 1
+    params:
+      max_iterations: 10000
+      use_monte_carlo: true

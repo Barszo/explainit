@@ -17,7 +17,7 @@ experiment_results.csv
 priorities_random_dice/
 priorities_random_dice_2/
 priorities_with_random_search/
-
+explainit/experiments/paper/results/
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
@@ -29,7 +29,16 @@ __pycache__/
 *.csv
 *.keras
 *.pkl
+managing_droid_sessions.md
+minlp_theory_review_suggestions.md
+session_reader.py
 
+# Publication study results are small text tables and must stay reproducible,
+# so they are versioned despite the global *.csv / *.json rules above.
+!explainit/experiments/paper/results/**/*.csv
+!explainit/experiments/paper/results/**/*.json
+# ... except the throwaway smoke study.
+explainit/experiments/paper/results/smoke/
 # C extensions
 *.so
 DiCE/

@@ -110,6 +110,38 @@ class MINLSearchExplainer:
         self.epsilon = epsilon
         self.workflow_logger = workflow_logger
         self.feature_names = list(feature_names) if feature_names is not None else None
+        # Cached argmax of every actionable priority function (Stage 7).
+        self._priority_peaks_cache = None
+        # Records which strategy produced the target exemplar for the last run
+        # (see ``_stage1_find_exemplar``): one of ``dataset_priority_filtered``,
+        # ``dataset_actionable``, ``random_in_range`` or ``none``.
+        self.exemplar_source = None
+        # |model_pred(target_exemplar) - target| for the anchor of the last run.
+        self.exemplar_pred_distance = None
+        # Warm-start (Stage 4 LP) health captured on the first refinement pass.
+        self._warm_start_info = None
+        # Exception text if a refinement pass aborted (stop_reason=search_failed).
+        self._last_search_exception = None
+        self.last_search_result = {}
+        self._fallback_random_max_iterations = 10000
+        # Seed for the only stochastic part of the search (the Stage 1
+        # fallback anchor); set per run by ``find_counterfactuals``.
+        self._random_seed = None
+        # Step-limiting state (Stage 4/5). ``_tr_fraction`` is the trust-region
+        # radius as a fraction of each feature's allowed span; ``None`` when the
+        # trust region is disabled.
+        self._tr_fraction = None
+        self._tr_min = 0.02
+        self._tr_max = 1.0
+        self._tr_expand = 2.0
+        self._tr_shrink = 0.5
+        # Additive surrogate correction: the linear constraint aims at
+        # ``target - _target_correction`` so the surrogate reproduces the last
+        # measured model residual.
+        self._target_correction = 0.0
+        self._residual_correction_enabled = False
+        self._pass_targets = {}
+        self._restoration_enabled = False
 
     def _workflow_log(self, message, *args):
         if self.workflow_logger is not None:
@@ -1266,12 +1298,54 @@ class MINLSearchExplainer:
                     else:
                         raise ValueError("Invalid categorical combination encountered for indices {}: {}".format(feature_indices, current_values))
 
-                new_targets[combo_idx] = self.target - result - basic_prediction + coef_times_original #- unactionable_sum
+                new_targets[combo_idx] = self._pass_target(combo_idx, result) - result - basic_prediction + coef_times_original #- unactionable_sum
         else:
             # no categorical features
-            new_targets[0] = self.target - basic_prediction + coef_times_original
+            new_targets[0] = self._pass_target(0, 0.0) - basic_prediction + coef_times_original
 
         return new_targets
+
+    def _reachable_surrogate_range(self) -> tuple:
+        """Interval the Shapley-linear prediction can span inside the search bounds.
+
+        Interval arithmetic over ``basic_prediction + sum_i c_i (x_i - x_i^k)``,
+        which costs nothing and tells the pass whether the target is reachable
+        in one step of the current trust region.
+        """
+        lo_total = hi_total = float(self.basic_prediction)
+        bounds = self._search_bounds()
+        non_actionable = set(self.priorities_state.non_actionable_indices)
+        for idx, coeff in (self.sample_state.shap_coeffs or {}).items():
+            if idx in non_actionable:
+                continue
+            lo, hi = bounds.get(idx, (None, None))
+            if lo is None or hi is None:
+                continue
+            x = float(self.sample_state.sample[idx])
+            d_lo = float(coeff) * (float(lo) - x)
+            d_hi = float(coeff) * (float(hi) - x)
+            lo_total += min(d_lo, d_hi)
+            hi_total += max(d_lo, d_hi)
+        return lo_total, hi_total
+
+    def _pass_target(self, combo_idx: int, categorical_contribution: float) -> float:
+        """Target for this pass: the effective target, clipped to what is reachable.
+
+        When the trust region cannot span the whole gap, the pass aims at the
+        closest reachable surrogate value instead of an impossible one; the
+        next pass re-linearises there and continues toward the target.
+        """
+        wanted = self._effective_target()
+        lo, hi = self._reachable_surrogate_range()
+        lo += float(categorical_contribution)
+        hi += float(categorical_contribution)
+        clipped = min(max(wanted, lo), hi)
+        if abs(clipped - wanted) > 1e-9:
+            logger.info("[Stage 4.3] Combo %d: target %.4f is outside the reachable "
+                        "surrogate range [%.4f, %.4f]; aiming at %.4f this pass.",
+                        combo_idx, wanted, lo, hi, clipped)
+        self._pass_targets[combo_idx] = float(clipped)
+        return float(clipped)
 
     # function to create limited priorities based on SHAP values (4.1)
     def create_limited_priorities(self):
@@ -1392,6 +1466,7 @@ class MINLSearchExplainer:
         # 3. Prepare targets and coefficients for linear search
         logger.info("[Stage 4.3] Building per-combo LP targets and per-feature linear "
                     "coefficients from Shapley values.")
+        self._pass_targets = {}
         target_for_combo = self.extract_for_linear_search()
         logger.info("[Stage 4.3] LP targets per categorical combo: %s", target_for_combo)
         logger.debug("[Stage 4.3] Per-feature shap_coeffs (unit phi): %s",
@@ -1402,7 +1477,8 @@ class MINLSearchExplainer:
                     "their bounds for the LP solver.")
         indices_to_modify = [i for i in self.sample_state.shap_coeffs.keys() if i not in self.priorities_state.non_actionable_indices]
         coeff_to_linear_search = [self.sample_state.shap_coeffs[key] for key in indices_to_modify]
-        bounds_for_linear_search = [self.priorities_state.bounds[key] for key in indices_to_modify]
+        search_bounds = self._search_bounds()
+        bounds_for_linear_search = [search_bounds[key] for key in indices_to_modify]
         logger.info("[Stage 4.4] %d actionable numerical features: %s",
                     len(indices_to_modify), indices_to_modify)
         logger.debug("[Stage 4.4] LP coefficients=%s | bounds=%s",
@@ -1420,6 +1496,9 @@ class MINLSearchExplainer:
         priorities_for_search = self.sample_state.limited_priorities
         shap_coefficients = self.sample_state.shap_coeffs
         basic_prediction = self.basic_prediction
+        # (true model gap, linearised gap) at each feasible warm-start x0, used
+        # to diagnose warm-start health / surrogate mismatch.
+        warm_gaps = []
 
         for combination_id, temp_target in target_for_combo.items():
             logger.info("[Stage 4.5] Combo %d/%d -> LP target=%.4f",
@@ -1448,18 +1527,42 @@ class MINLSearchExplainer:
                 logger.debug("[Stage 4.5] Combo %d candidate vector: %s",
                              combination_id, dummy_x)
                 check_value = self.constraint_function(dummy_x, shap_dict, self.sample_state.sample, self.sample_state.target_exemplar, priorities_for_search, basic_prediction=self.basic_prediction)
-                assert abs(check_value - self.target) <= self.epsilon, \
-                    f"Constraint function value {check_value} exceeds tolerance {self.epsilon} from target {self.target}"
+                pass_target = self._pass_targets.get(combination_id, self._effective_target())
+                assert abs(check_value - pass_target) <= self.epsilon, \
+                    f"Constraint function value {check_value} exceeds tolerance {self.epsilon} from target {pass_target}"
+                linear_gap = abs(float(check_value) - float(pass_target))
                 logger.info("[Stage 4.5] Combo %d sanity check: linearised h(x)=%.4f "
                             "(target=%.4f, |gap|=%.4f, epsilon=%.4f).",
                             combination_id, float(check_value),
-                            float(self.target),
-                            abs(float(check_value) - float(self.target)),
-                            float(self.epsilon))
+                            float(pass_target), linear_gap, float(self.epsilon))
+                # Surrogate mismatch: true model prediction at the warm-start x0.
+                ws_model_pred = float(
+                    np.asarray(self.model_pred([dummy_x])).reshape(-1)[0])
+                ws_model_gap = abs(ws_model_pred - float(self.target))
+                warm_gaps.append((ws_model_gap, linear_gap))
+                logger.info("[Stage 4.5] Combo %d warm-start true model_pred=%.4f "
+                            "(|model gap|=%.4f vs linear gap=%.4f).",
+                            combination_id, ws_model_pred, ws_model_gap, linear_gap)
 
         logger.info("[Stage 4.6] %d/%d categorical combination(s) yielded an initial "
                     "feasible solution.",
                     len(combo_and_initial_solutions), len(target_for_combo))
+
+        # Capture warm-start health once per find_counterfactuals run (first pass).
+        if self._warm_start_info is None:
+            best = min(warm_gaps, key=lambda t: t[0]) if warm_gaps else (None, None)
+            self._warm_start_info = {
+                "total_combos": int(len(target_for_combo)),
+                "feasible_combos": int(len(combo_and_initial_solutions)),
+                "best_warmstart_model_gap": (float(best[0]) if best[0] is not None else None),
+                "best_warmstart_linear_gap": (float(best[1]) if best[1] is not None else None),
+            }
+            logger.info("[Stage 4.6] Warm-start health: %d/%d combos feasible; best "
+                        "warm-start model |gap|=%s | linear |gap|=%s.",
+                        self._warm_start_info["feasible_combos"],
+                        self._warm_start_info["total_combos"],
+                        self._warm_start_info["best_warmstart_model_gap"],
+                        self._warm_start_info["best_warmstart_linear_gap"])
 
         # 6. If no feasible solutions were found, analyze why and suggest bounds adjustments
         # TODO: It worked fine when there were no categorical fatures - I need to rethink this part
@@ -1639,21 +1742,230 @@ class MINLSearchExplainer:
     #################################################################
 
     def _stage1_find_exemplar(self):
-        """Locate the dataset row whose prediction is closest to ``target``.
+        """Locate the anchor exemplar, with one fallback.
 
-        Sets ``self.sample_state.target_exemplar``. Runs once per
-        ``find_counterfactuals`` call; the exemplar is the fixed anchor
-        every refinement iteration linearises against.
+        Selection strategy, tried in order (the first that succeeds wins):
+
+          1. ``dataset_priority_filtered`` -- original behaviour: the
+             priority-feasible dataset row whose prediction is closest to the
+             target (:meth:`find_closest_elem`).
+          2. ``random_in_range`` -- if (1) finds no feasible row, randomly
+             generate an exemplar by sampling each actionable feature's allowed
+             range and taking the first point within ``epsilon`` of the target.
+             This is **not** the random-search comparison method: preference /
+             priority score is deliberately ignored here; we only need any
+             reachable, in-range anchor for MINLP to then optimise for the
+             highest preference score.
+
+        Sets ``self.sample_state.target_exemplar``, records the chosen strategy
+        on ``self.exemplar_source`` and the anchor's ``|pred - target|`` on
+        ``self.exemplar_pred_distance``. Runs once per ``find_counterfactuals``
+        call; the exemplar is the fixed anchor every refinement iteration
+        linearises against.
         """
-        logger.info("--- STAGE 1/6: Locate target exemplar in dataset ---")
-        logger.info("Goal: pick a real training point whose model prediction is closest "
-                    "to the requested target (within target_exemplar_epsilon=%.4f). "
-                    "It anchors the linear (Shapley) approximation used in later stages.",
-                    float(self.target_exemplar_epsilon))
-        self.find_closest_elem()
-        logger.info("Target exemplar selected: prediction=%.4f (target=%.4f)",
-                    float(self.model_pred([self.sample_state.target_exemplar])[0]),
-                    float(self.target))
+        logger.info("--- STAGE 1/6: Locate target exemplar (with fallbacks) ---")
+        logger.info("Goal: pick an anchor whose model prediction is close to the "
+                    "requested target. It anchors the linear (Shapley) approximation "
+                    "used in later stages.")
+
+        try:
+            self.find_closest_elem()
+            self.exemplar_source = "dataset_priority_filtered"
+            self.exemplar_pred_distance = self._exemplar_pred_distance()
+            logger.info("Target exemplar via '%s': |pred - target|=%.4f "
+                        "(target=%.4f).",
+                        self.exemplar_source,
+                        self.exemplar_pred_distance,
+                        float(self.target))
+            return
+        except Exception as primary_exc:
+            logger.warning("[Stage 1] Primary exemplar selection "
+                           "('dataset_priority_filtered') failed: %s", primary_exc)
+            try:
+                self._generate_exemplar_in_range(
+                    max_iterations=int(getattr(
+                        self, "_fallback_random_max_iterations", 10000)),
+                    random_seed=getattr(self, "_random_seed", None),
+                )
+                self.exemplar_source = "random_in_range"
+                self.exemplar_pred_distance = self._exemplar_pred_distance()
+                logger.warning("[Stage 1] Randomly generated in-range exemplar "
+                               "(|pred - target|=%.4f).",
+                               self.exemplar_pred_distance)
+                return
+            except Exception as rnd_exc:
+                self.exemplar_source = "none"
+                logger.error("[Stage 1] Could not obtain any exemplar (dataset or "
+                             "random in-range): %s", rnd_exc)
+                raise
+
+    def _exemplar_pred_distance(self) -> float:
+        """``|model_pred(target_exemplar) - target|`` for the current exemplar."""
+        pred = float(
+            np.asarray(self.model_pred([self.sample_state.target_exemplar])).reshape(-1)[0])
+        return abs(pred - float(self.target))
+
+    def _sample_from_allowed_region(self, cfg: dict) -> float:
+        """Draw a uniform value from a numerical feature's allowed region."""
+        intervals = cfg.get("allowed_intervals") if isinstance(cfg, dict) else None
+        if not intervals:
+            lo = cfg.get("min")
+            hi = cfg.get("max")
+            if lo is None or hi is None:
+                raise Exception("Feature has no allowed region to sample from.")
+            return float(np.random.uniform(float(lo), float(hi)))
+        lengths = np.array(
+            [max(0.0, float(hi) - float(lo)) for lo, hi in intervals], dtype=float)
+        total = float(lengths.sum())
+        if total <= 0.0:
+            lo, _hi = intervals[int(np.random.randint(len(intervals)))]
+            return float(lo)
+        pick = intervals[int(np.random.choice(len(intervals), p=lengths / total))]
+        return float(np.random.uniform(float(pick[0]), float(pick[1])))
+
+    def _sample_candidate_in_allowed_region(self) -> np.ndarray:
+        """Assemble one random candidate inside the allowed region.
+
+        Actionable numerical features are drawn uniformly from their allowed
+        interval(s); actionable categorical groups pick uniformly among allowed
+        combinations (priority weights are ignored on purpose); non-actionable
+        features stay frozen at the sample value.
+        """
+        sample = np.asarray(self.sample_state.sample, dtype=float)
+        cand = sample.copy()
+        for idx, cfg in self.priorities_state.numerical_priorities.items():
+            if not isinstance(cfg, dict) or cfg.get("function") is None:
+                cand[idx] = float(sample[idx])  # non-actionable: frozen
+                continue
+            cand[idx] = self._sample_from_allowed_region(cfg)
+        for group, mapping in self.priorities_state.categorical_priorities.items():
+            allowed = [combo for combo, weight in mapping.items()
+                       if weight is not None and float(weight) > 0.0]
+            if not allowed:
+                raise Exception(f"Categorical group {group} has no allowed "
+                                f"combinations to sample from.")
+            combo = allowed[int(np.random.randint(len(allowed)))]
+            for j, idx in enumerate(group):
+                cand[idx] = float(combo[j])
+        return cand
+
+    def _generate_exemplar_in_range(
+        self, max_iterations: int = 10000, random_seed=None,
+    ) -> float:
+        """Randomly generate an in-range exemplar near the target.
+
+        Samples the allowed region (see :meth:`_sample_candidate_in_allowed_region`)
+        and accepts the first candidate whose prediction lands within ``epsilon``
+        of the target, without regard to its priority score. This is *not* the
+        random-search comparison method - it only produces a reachable anchor for
+        MINLP; the subsequent optimisation is what maximises the preference score.
+        Returns ``|prediction - target|`` of the accepted point.
+        """
+        logger.info("[Stage 1 - fallback] Randomly generating an in-range exemplar: "
+                    "sampling the allowed region for a point within epsilon=%.4f of "
+                    "target (max_iterations=%d).", float(self.epsilon), int(max_iterations))
+        if random_seed is not None:
+            np.random.seed(int(random_seed))
+
+        for i in range(int(max_iterations)):
+            cand = self._sample_candidate_in_allowed_region()
+            pred = float(np.asarray(self.model_pred(cand.reshape(1, -1))).reshape(-1)[0])
+            if abs(pred - float(self.target)) <= float(self.epsilon):
+                self.sample_state.target_exemplar = cand
+                logger.info("[Stage 1 - fallback] In-range exemplar found at iteration "
+                            "%d (|pred - target|=%.4f).",
+                            i + 1, abs(pred - float(self.target)))
+                return abs(pred - float(self.target))
+
+        raise Exception(f"Could not randomly generate an in-range point within "
+                        f"epsilon={self.epsilon} of target after {max_iterations} "
+                        f"iterations.")
+
+    def probe_allowed_region_feasibility(
+        self, max_iterations: int = 5000, random_seed=None,
+    ) -> dict:
+        """Measure whether the allowed region can reach the target at all.
+
+        Randomly samples the allowed region (ignoring preference, exactly like
+        :meth:`_generate_exemplar_in_range`) and reports whether any point lands
+        within ``epsilon`` of the target and the smallest ``|pred - target|``
+        seen. This separates *feasibility* (region cannot reach target) from
+        *convergence* (region can, but MINLP's optimiser did not) failures.
+
+        Does not touch ``sample_state.target_exemplar``. Runs Stage 0 first so
+        the allowed intervals exist.
+        """
+        self._derive_bounds_and_intervals_from_priorities()
+        if random_seed is not None:
+            np.random.seed(int(random_seed))
+
+        min_dist = float("inf")
+        found_iter = None
+        for i in range(int(max_iterations)):
+            cand = self._sample_candidate_in_allowed_region()
+            pred = float(np.asarray(self.model_pred(cand.reshape(1, -1))).reshape(-1)[0])
+            dist = abs(pred - float(self.target))
+            if dist < min_dist:
+                min_dist = dist
+            if dist <= float(self.epsilon):
+                found_iter = i + 1
+                break
+        return {
+            "feasible_within_epsilon": found_iter is not None,
+            "min_pred_distance": float(min_dist),
+            "iterations_run": int(found_iter if found_iter is not None else max_iterations),
+        }
+
+    def _find_exemplar_random_fallback(
+        self, max_iterations: int = 10000, random_seed=None,
+    ) -> float:
+        """Sample points from the allowed region; return the first near the target.
+
+        Each actionable numerical feature is drawn uniformly from its allowed
+        interval(s); each actionable categorical group picks uniformly among its
+        allowed combinations (priority weights are ignored on purpose).
+        Non-actionable features are frozen at the sample value. The first
+        candidate whose prediction lands within ``epsilon`` of the target is
+        accepted, without regard to its priority score. Returns
+        ``|prediction - target|`` of the accepted point.
+        """
+        logger.info("[Stage 1 - fallback] Random-search exemplar: sampling the allowed "
+                    "region for a point within epsilon=%.4f of target "
+                    "(max_iterations=%d).", float(self.epsilon), int(max_iterations))
+        if random_seed is not None:
+            np.random.seed(int(random_seed))
+
+        sample = np.asarray(self.sample_state.sample, dtype=float)
+        num_priorities = self.priorities_state.numerical_priorities
+        cat_priorities = self.priorities_state.categorical_priorities
+
+        for i in range(int(max_iterations)):
+            cand = sample.copy()
+            for idx, cfg in num_priorities.items():
+                if not isinstance(cfg, dict) or cfg.get("function") is None:
+                    cand[idx] = float(sample[idx])  # non-actionable: frozen
+                    continue
+                cand[idx] = self._sample_from_allowed_region(cfg)
+            for group, mapping in cat_priorities.items():
+                allowed = [combo for combo, weight in mapping.items()
+                           if weight is not None and float(weight) > 0.0]
+                if not allowed:
+                    raise Exception(f"Categorical group {group} has no allowed "
+                                    f"combinations to sample from.")
+                combo = allowed[int(np.random.randint(len(allowed)))]
+                for j, idx in enumerate(group):
+                    cand[idx] = float(combo[j])
+            pred = float(np.asarray(self.model_pred(cand.reshape(1, -1))).reshape(-1)[0])
+            if abs(pred - float(self.target)) <= float(self.epsilon):
+                self.sample_state.target_exemplar = cand
+                logger.info("[Stage 1 - fallback] Random-search found a point at "
+                            "iteration %d (|pred - target|=%.4f).",
+                            i + 1, abs(pred - float(self.target)))
+                return abs(pred - float(self.target))
+
+        raise Exception(f"Random-search fallback could not find a point within "
+                        f"epsilon={self.epsilon} of target after {max_iterations} "
+                        f"iterations.")
 
     def _stage2_log_bounds(self):
         """Surface the numerical bounds used by both LP and SLSQP."""
@@ -1663,6 +1975,54 @@ class MINLSearchExplainer:
         logger.info("Bounds for numerical features: %s", self.priorities_state.bounds)
         logger.info("Non-actionable feature indices (frozen at sample values): %s",
                     self.priorities_state.non_actionable_indices)
+
+    def _effective_target(self) -> float:
+        """Target the *surrogate* must hit so the true model lands on ``target``.
+
+        Equals ``target`` unless a previous pass measured a residual
+        ``f(x) - h(x)`` that the additive correction is compensating for.
+        """
+        return float(self.target) - float(self._target_correction)
+
+    def _search_bounds(self) -> Dict[int, tuple]:
+        """Per-feature ``(lo, hi)`` for the LP and SLSQP, trust region included.
+
+        The trust region caps how far one pass may move each feature from the
+        current iterate, because the Shapley-linear surrogate is only accurate
+        near the point it was linearised at. Disabled -> the priority bounds.
+        """
+        bounds = self.priorities_state.bounds
+        if self._tr_fraction is None:
+            return dict(bounds)
+        center = np.asarray(self.sample_state.sample, dtype=float)
+        limited = {}
+        for idx, (lo, hi) in bounds.items():
+            if lo is None or hi is None:
+                limited[idx] = (lo, hi)
+                continue
+            lo, hi = float(lo), float(hi)
+            # The iterate can sit outside its own allowed range (the priority
+            # support need not contain the sample), so clamp before expanding.
+            c = min(max(float(center[idx]), lo), hi)
+            delta = float(self._tr_fraction) * (hi - lo)
+            limited[idx] = (max(lo, c - delta), min(hi, c + delta))
+        return limited
+
+    def _grow_trust_region(self) -> bool:
+        """Enlarge the trust region; ``False`` when already at full span."""
+        if self._tr_fraction is None or self._tr_fraction >= self._tr_max:
+            return False
+        self._tr_fraction = min(self._tr_max, self._tr_fraction * self._tr_expand)
+        logger.info("[Trust region] Enlarged to %.3f of each feature's allowed span.",
+                    self._tr_fraction)
+        return True
+
+    def _shrink_trust_region(self) -> None:
+        if self._tr_fraction is None:
+            return
+        self._tr_fraction = max(self._tr_min, self._tr_fraction * self._tr_shrink)
+        logger.info("[Trust region] Shrunk to %.3f of each feature's allowed span.",
+                    self._tr_fraction)
 
     def _run_one_pass(self, shap_approx, num_samples):
         """Execute stages 3, 4 and 5 once for the current ``sample_state.sample``.
@@ -1678,9 +2038,16 @@ class MINLSearchExplainer:
                     "between the prediction on the sample and on the target exemplar. "
                     "Numerical features get one value each; one-hot categorical groups "
                     "are consolidated into a single value per group.")
-        self.calc_shapley(self.sample_state.sample,
-                          use_approximation=shap_approx,
-                          num_samples=num_samples)
+        current_sample = [float(v) for v in np.asarray(self.sample_state.sample, dtype=float)]
+        if (self.sample_state.shapley_values is not None
+                and getattr(self, "_last_shapley_sample", None) == current_sample):
+            logger.info("[Stage 3] Iterate unchanged since the last pass: reusing the "
+                        "cached Shapley values (saves a full re-linearisation).")
+        else:
+            self.calc_shapley(self.sample_state.sample,
+                              use_approximation=shap_approx,
+                              num_samples=num_samples)
+            self._last_shapley_sample = current_sample
         logger.info("Shapley values (numerical): %s",
                     self.sample_state.shapley_values.get('numerical'))
         logger.info("Shapley values (categorical groups): %s",
@@ -1692,7 +2059,15 @@ class MINLSearchExplainer:
                     "(in the Shapley-linearised model) to find numerical values that "
                     "land within +/- epsilon of the target. These become warm starts "
                     "for the nonlinear SLSQP optimisation in stage 5.")
-        init_vals_per_combo = self.confirm_existence_of_solution_for_combo()
+        # An infeasible LP under a tight trust region means the region cannot
+        # reach the target, not that the problem is infeasible: enlarge and
+        # retry, reusing the Shapley values just computed (no model calls).
+        while True:
+            init_vals_per_combo = self.confirm_existence_of_solution_for_combo()
+            if init_vals_per_combo or not self._grow_trust_region():
+                break
+            logger.info("[Stage 4] No warm start inside the trust region; retrying "
+                        "with the enlarged region.")
         logger.info("Initial values per combination: %s", init_vals_per_combo)
         logger.info("Limited priorities used for search: %s",
                     self.sample_state.limited_priorities)
@@ -1702,7 +2077,7 @@ class MINLSearchExplainer:
         logger.info("Minimise the priority cost subject to the Shapley-linear constraint "
                     "h(x) in [target-epsilon, target+epsilon]. One run per categorical "
                     "combination; without categorical features the loop runs once.")
-        bounds = self.priorities_state.bounds
+        bounds = self._search_bounds()
         counterfactuals = []
         for i, values in init_vals_per_combo.items():
             logger.info("[combo %d/%d] Preparing input from initial LP solution and "
@@ -1736,13 +2111,17 @@ class MINLSearchExplainer:
             constraint_fun = lambda x: constraint_wrapper(x, self.sample_state.shapley_values, self.sample_state.sample, self.sample_state.target_exemplar, self.sample_state.limited_priorities, basic_prediction=self.basic_prediction, ready_input=prepared_input.copy())
             objective_fun = lambda x: -objective_wrapper(x, self.sample_state.limited_priorities, prepared_input.copy())
 
-            # Lower bound constraint: h(x) >= target - epsilon
-            def lower_constraint(x):
-                return constraint_fun(x) - (self.target - self.epsilon)
+            # Target of this pass: the real target unless the trust region can
+            # only reach part of the way (then the closest reachable value).
+            pass_target = self._pass_targets.get(i, self._effective_target())
 
-            # Upper bound constraint: h(x) <= target + epsilon
-            def upper_constraint(x):
-                return (self.target + self.epsilon) - constraint_fun(x)
+            # Lower bound constraint: h(x) >= pass_target - epsilon
+            def lower_constraint(x, _t=pass_target):
+                return constraint_fun(x) - (_t - self.epsilon)
+
+            # Upper bound constraint: h(x) <= pass_target + epsilon
+            def upper_constraint(x, _t=pass_target):
+                return (_t + self.epsilon) - constraint_fun(x)
 
             constraints = [
                 {'type': 'ineq', 'fun': lower_constraint},
@@ -1763,11 +2142,17 @@ class MINLSearchExplainer:
                             self._allowed_interval_constraint_value(float(x[_j]), _intervals)
                         ),
                     })
+            for j, (lo, hi) in enumerate(bounds_list):
+                if lo is not None:
+                    x0[j] = max(float(x0[j]), float(lo))
+                if hi is not None:
+                    x0[j] = min(float(x0[j]), float(hi))
             logger.info("[combo %d/%d] Initial numerical x0=%s",
                         i + 1, len(init_vals_per_combo), x0)
             logger.debug("[combo %d/%d] Constraints (bounded): h(x) in [%.4f, %.4f]",
                          i + 1, len(init_vals_per_combo),
-                         self.target - self.epsilon, self.target + self.epsilon)
+                         pass_target - self.epsilon,
+                         pass_target + self.epsilon)
             logger.debug("[combo %d/%d] Bounds list passed to SLSQP: %s",
                          i + 1, len(init_vals_per_combo), bounds_list)
             logger.info("[combo %d/%d] Running SLSQP (maximise priority weight subject "
@@ -1814,29 +2199,281 @@ class MINLSearchExplainer:
 
         return counterfactuals
 
-    def _select_best_candidate(self, counterfactuals):
-        """Stage 6: pick the candidate with the lowest priority cost.
+    def _priority_benefit(self, cf):
+        """``calculate_total_weight(cf)`` or ``None`` when ``cf`` is out of range.
 
-        With no categorical features there is exactly one candidate so this
-        just returns it. Raises :class:`RuntimeError` if no candidates are
-        available so the iterative loop can mark the iteration as failed.
+        ``calculate_total_weight`` is the *priority benefit* that the search
+        maximises (higher is better, same quantity as
+        ``priority_methods.methods.compute_priority_score``). It raises for
+        values outside the allowed range / inside a zero-priority gap, which
+        SLSQP can still produce, so callers get ``None`` instead of an
+        exception.
+        """
+        try:
+            return float(self.calculate_total_weight(cf))
+        except ValueError as exc:
+            logger.debug("Priority benefit unavailable for candidate: %s", exc)
+            return None
+
+    def _feature_priority(self, idx: int, value: float) -> float:
+        """Priority weight of a single numerical feature at ``value`` (0 if invalid)."""
+        cfg = self.priorities_state.numerical_priorities.get(idx, {})
+        fn = cfg.get("function") if isinstance(cfg, dict) else None
+        if fn is None:
+            return 0.0
+        try:
+            w = float(np.asarray(fn(float(value))).squeeze())
+        except Exception:
+            return 0.0
+        return w if np.isfinite(w) else 0.0
+
+    def _priority_peaks(self, grid_size: int = 1000) -> Dict[int, tuple]:
+        """``{feature_index: (peak_value, peak_weight)}`` for actionable features.
+
+        The peak is the argmax of the feature's priority function over its
+        allowed intervals. Priority functions are analytic, so this costs no
+        model calls; the result is cached because priorities do not change
+        during a run.
+        """
+        if getattr(self, "_priority_peaks_cache", None) is not None:
+            return self._priority_peaks_cache
+        peaks: Dict[int, tuple] = {}
+        for idx, cfg in self.priorities_state.numerical_priorities.items():
+            if not isinstance(cfg, dict) or cfg.get("function") is None:
+                continue
+            intervals = cfg.get("allowed_intervals") or [(cfg["min"], cfg["max"])]
+            best_v, best_w = None, float("-inf")
+            for lo, hi in intervals:
+                xs = np.linspace(float(lo), float(hi), int(grid_size))
+                ws = np.array([self._feature_priority(idx, v) for v in xs])
+                k = int(ws.argmax())
+                if ws[k] > best_w:
+                    best_w, best_v = float(ws[k]), float(xs[k])
+            if best_v is not None:
+                peaks[idx] = (best_v, best_w)
+        self._priority_peaks_cache = peaks
+        return peaks
+
+    def _clip_to_allowed(self, idx: int, value: float) -> float:
+        cfg = self.priorities_state.numerical_priorities.get(idx, {})
+        intervals = cfg.get("allowed_intervals") if isinstance(cfg, dict) else None
+        v = float(value)
+        if intervals:
+            v = self._project_to_allowed_intervals(v, intervals)
+        lo, hi = self.priorities_state.bounds.get(idx, (None, None))
+        if lo is not None:
+            v = max(v, float(lo))
+        if hi is not None:
+            v = min(v, float(hi))
+        return v
+
+    def _peak_lock_in(self, cf, max_sweeps: int = 3, max_compensators: int = 3):
+        """Stage 7: greedy peak lock-in with Shapley compensation.
+
+        Post-optimisation sweep over a *feasible* counterfactual ``cf``. For
+        each actionable numerical feature ``i`` (best potential gain first) it
+        proposes ``x_i = peak_i`` and pays for the resulting change of the
+        Shapley-linearised prediction, ``dh = c_i (peak_i - x_i)``, by moving the
+        feature ``j`` whose priority loses the least per unit of prediction
+        change: ``x_j -= dh / c_j``. One model call verifies the swap; if it
+        leaves the target band, one restoration step on ``j`` using the measured
+        residual is tried, and up to ``max_compensators`` alternative
+        compensating features are attempted before giving up on the feature. A
+        move is kept only when the point is inside the band *and* the total
+        priority benefit increased, so the incoming ``cf`` can never be made
+        worse.
+
+        Returns ``(cf, info)`` where ``info`` reports the priority before/after,
+        the accepted moves and the number of model calls spent.
+        """
+        info = {
+            "applied": False,
+            "sweeps_run": 0,
+            "accepted_moves": 0,
+            "model_calls": 0,
+            "priority_before": None,
+            "priority_after": None,
+            "priority_gain": 0.0,
+            "final_prediction": None,
+        }
+        coeffs_all = getattr(self.sample_state, "shap_coeffs", None)
+        if cf is None or not coeffs_all:
+            return cf, info
+
+        non_actionable = set(self.priorities_state.non_actionable_indices)
+        peaks = self._priority_peaks()
+        actionable = [i for i in peaks
+                      if i not in non_actionable
+                      and abs(float(coeffs_all.get(i, 0.0))) > 1e-12]
+        if not actionable:
+            return cf, info
+
+        cur = np.asarray(cf, dtype=float).copy()
+        cur_priority = self._priority_benefit(list(cur))
+        if cur_priority is None:
+            return cf, info
+        info["applied"] = True
+        info["priority_before"] = cur_priority
+
+        logger.info("--- STAGE 7/7: Peak lock-in with Shapley compensation ---")
+        logger.info("Sweeping %d actionable feature(s); start priority=%.4f. Each move "
+                    "locks a feature on its priority peak and pays for the linearised "
+                    "prediction change with the cheapest compensating feature.",
+                    len(actionable), cur_priority)
+
+        for sweep in range(int(max_sweeps)):
+            info["sweeps_run"] = sweep + 1
+            accepted_in_sweep = 0
+            order = sorted(
+                actionable,
+                key=lambda i: -(peaks[i][1] - self._feature_priority(i, cur[i])),
+            )
+            for i in order:
+                peak_v, peak_w = peaks[i]
+                gain = peak_w - self._feature_priority(i, cur[i])
+                if gain <= 1e-6:
+                    continue
+                c_i = float(coeffs_all[i])
+                dh = c_i * (peak_v - float(cur[i]))
+
+                compensators = []
+                for j in actionable:
+                    if j == i:
+                        continue
+                    c_j = float(coeffs_all[j])
+                    v_j = self._clip_to_allowed(j, float(cur[j]) - dh / c_j)
+                    cost = self._feature_priority(j, cur[j]) - self._feature_priority(j, v_j)
+                    if cost < gain:
+                        compensators.append((cost, j, v_j))
+                compensators.sort(key=lambda t: t[0])
+
+                accepted = None
+                for _cost, j, v_j in compensators[:max_compensators]:
+                    cand = cur.copy()
+                    cand[i] = peak_v
+                    cand[j] = v_j
+                    pred = float(np.asarray(self.model_pred([list(cand)])).reshape(-1)[0])
+                    info["model_calls"] += 1
+                    residual = pred - float(self.target)
+                    if abs(residual) > float(self.epsilon):
+                        # One restoration step on the compensating feature, using
+                        # the residual measured against the real model.
+                        cand[j] = self._clip_to_allowed(
+                            j, float(cand[j]) - residual / float(coeffs_all[j]))
+                        pred = float(np.asarray(self.model_pred([list(cand)])).reshape(-1)[0])
+                        info["model_calls"] += 1
+                        residual = pred - float(self.target)
+                        if abs(residual) > float(self.epsilon):
+                            logger.debug("[Stage 7] %s -> peak, compensated by %s: "
+                                         "rejected, |pred - target|=%.4f > epsilon.",
+                                         self._feature_label(i),
+                                         self._feature_label(j), abs(residual))
+                            continue
+                    cand_priority = self._priority_benefit(list(cand))
+                    if cand_priority is None or cand_priority <= cur_priority + 1e-9:
+                        continue
+                    accepted = (cand, cand_priority, pred, j)
+                    break
+
+                if accepted is None:
+                    continue
+                cand, cand_priority, pred, j = accepted
+                logger.info("[Stage 7] Accepted: %s -> peak %.4f, compensated by %s "
+                            "-> %.4f | priority %.4f -> %.4f | pred=%.4f.",
+                            self._feature_label(i), peak_v,
+                            self._feature_label(j), float(cand[j]),
+                            cur_priority, cand_priority, pred)
+                cur, cur_priority = cand, cand_priority
+                accepted_in_sweep += 1
+                info["accepted_moves"] += 1
+                info["final_prediction"] = pred
+
+            if accepted_in_sweep == 0:
+                break
+
+        info["priority_after"] = cur_priority
+        info["priority_gain"] = float(cur_priority - info["priority_before"])
+        logger.info("[Stage 7] Done: %d move(s) accepted over %d sweep(s) | "
+                    "priority %.4f -> %.4f (+%.4f) | model calls=%d.",
+                    info["accepted_moves"], info["sweeps_run"],
+                    info["priority_before"], cur_priority, info["priority_gain"],
+                    info["model_calls"])
+        return list(cur), info
+
+    def _restore_to_band(self, cf, eval_info, max_steps: int = 3):
+        """Pull a near-miss candidate back into the target band.
+
+        Least-norm Shapley-Newton correction: distributing the measured
+        residual over the actionable features as ``dx = -r c / ||c||^2`` moves
+        the linearised prediction by exactly ``-r`` while changing the features
+        as little as possible, so most of the candidate's priority survives.
+        Costs at most ``max_steps`` model calls and is only attempted for
+        candidates SLSQP already produced.
+
+        Returns ``(cf, eval_info)`` when the point ends up inside the band,
+        otherwise ``(None, None)``.
+        """
+        coeffs = getattr(self.sample_state, "shap_coeffs", None)
+        if not coeffs:
+            return None, None
+        non_actionable = set(self.priorities_state.non_actionable_indices)
+        indices = [i for i in coeffs
+                   if i not in non_actionable and abs(float(coeffs[i])) > 1e-12]
+        if not indices:
+            return None, None
+        denom = sum(float(coeffs[i]) ** 2 for i in indices)
+        if denom < 1e-18:
+            return None, None
+
+        cur = np.asarray(cf, dtype=float).copy()
+        residual = float(eval_info["model_pred"]) - float(self.target)
+        for step in range(int(max_steps)):
+            for i in indices:
+                cur[i] = self._clip_to_allowed(
+                    i, float(cur[i]) - residual * float(coeffs[i]) / denom)
+            pred = float(np.asarray(self.model_pred([list(cur)])).reshape(-1)[0])
+            residual = pred - float(self.target)
+            if abs(residual) <= float(self.epsilon):
+                restored = self._evaluate_candidate(list(cur))
+                logger.info("[Restoration] Candidate pulled into the band in %d "
+                            "step(s): |f - target| %.4f -> %.4f | priority %s -> %s.",
+                            step + 1, eval_info["distance"], restored["distance"],
+                            eval_info["priority"], restored["priority"])
+                return list(cur), restored
+        logger.debug("[Restoration] Failed after %d step(s); |f - target|=%.4f.",
+                     int(max_steps), abs(residual))
+        return None, None
+
+    def _select_best_candidate(self, counterfactuals):
+        """Stage 6: pick the candidate with the highest priority benefit.
+
+        ``calculate_total_weight`` is maximised by the SLSQP objective (which
+        minimises its negation), so selection across categorical combinations
+        must pick the *largest* value. With no categorical features there is
+        exactly one candidate so this just returns it. Raises
+        :class:`RuntimeError` if no candidates are available so the iterative
+        loop can mark the iteration as failed.
         """
         logger.info("--- STAGE 6/6: Pick best counterfactual ---")
-        logger.info("Among %d candidate(s), pick the one with the lowest priority "
-                    "cost (calculate_total_weight). With no categorical features there "
-                    "is exactly one candidate.", len(counterfactuals))
+        logger.info("Among %d candidate(s), pick the one with the highest priority "
+                    "benefit (calculate_total_weight). With no categorical features "
+                    "there is exactly one candidate.", len(counterfactuals))
         if not counterfactuals:
             raise RuntimeError("No counterfactual candidates produced for selection.")
         if len(counterfactuals) > 1:
             best_counterfactual = None
-            best_weight = float('inf')
+            best_benefit = float('-inf')
             for cf in counterfactuals:
-                weight = self.calculate_total_weight(cf)
-                logger.debug("Candidate weight=%.4f", weight)
-                if weight < best_weight:
-                    best_weight = weight
+                benefit = self._priority_benefit(cf)
+                logger.debug("Candidate priority benefit=%s", benefit)
+                if benefit is not None and benefit > best_benefit:
+                    best_benefit = benefit
                     best_counterfactual = cf
-            logger.info("Selected candidate weight=%.4f", best_weight)
+            if best_counterfactual is None:
+                logger.warning("No candidate had an evaluable priority benefit; "
+                               "falling back to the first candidate.")
+                return counterfactuals[0]
+            logger.info("Selected candidate priority benefit=%.4f", best_benefit)
             return best_counterfactual
         return counterfactuals[0]
 
@@ -1847,8 +2484,11 @@ class MINLSearchExplainer:
           * ``model_pred``: real model output on ``cf``.
           * ``h_x``: surrogate prediction (Shapley-linear approximation).
             Falls back to NaN if the surrogate cannot be evaluated yet.
-          * ``distance``: ``|model_pred - target|`` used as the iteration
-            improvement metric.
+          * ``distance``: ``|model_pred - target|``, used to rank candidates
+            only while no candidate satisfies the target band.
+          * ``priority``: priority benefit (``None`` if not evaluable), used
+            to rank candidates that do satisfy the band.
+          * ``feasible``: ``distance <= epsilon`` against the real model.
         """
         model_pred = float(self.model_pred([cf])[0])
         try:
@@ -1862,29 +2502,55 @@ class MINLSearchExplainer:
             ))
         except Exception:
             h_x = float("nan")
+        distance = abs(model_pred - float(self.target))
         return {
             "model_pred": model_pred,
             "h_x": h_x,
-            "distance": abs(model_pred - float(self.target)),
+            "distance": distance,
+            "priority": self._priority_benefit(cf),
+            "feasible": distance <= float(self.epsilon),
         }
 
     def find_counterfactuals(self, shap_approx=False, num_samples=200,
                              max_iterations=10, patience=5,
-                             return_when_fails=True):
+                             return_when_fails=True,
+                             fallback_random_max_iterations=10000,
+                             peak_lock_in=True,
+                             peak_lock_in_max_sweeps=3,
+                             random_seed=None,
+                             trust_region=True,
+                             trust_region_init=0.25,
+                             trust_region_min=0.02,
+                             trust_region_max=1.0,
+                             residual_correction=True,
+                             restoration=True):
         """Find a counterfactual via iterative Shapley re-linearisation.
 
         Stages 1 and 2 (locate target exemplar, gather bounds) run once.
         Stages 3-6 (Shapley, LP warm starts, SLSQP, candidate selection)
         run inside a refinement loop: after each pass we evaluate the
-        chosen candidate with the real model. While we are still outside
-        ``epsilon`` of ``target`` we advance the working sample to the
-        new candidate and re-linearise against the same exemplar.
+        chosen candidate with the real model and advance the working sample
+        to it, re-linearising against the same exemplar.
+
+        Two incumbents are tracked, so that the priority benefit (the
+        quantity the optimisation claims to maximise) is what decides the
+        returned counterfactual:
+
+          * ``best_feasible``: among candidates inside the target band
+            (``|model_pred - target| <= epsilon``), the one with the highest
+            priority benefit. Returned whenever it exists.
+          * ``best_infeasible``: only used while no candidate has entered the
+            band; ranked by ``|model_pred - target|``.
+
+        The loop therefore does *not* stop when the band is first reached: the
+        band becomes a hard constraint and the search keeps trying to improve
+        the priority benefit inside it.
 
         The loop stops when:
-          * the real model prediction is within ``epsilon`` of ``target``, or
           * ``max_iterations`` passes have been executed, or
-          * ``patience`` consecutive iterations have failed to beat the
-            best ``|model_pred(cf) - target|`` seen so far, or
+          * ``patience`` consecutive iterations have failed to improve the
+            active incumbent (priority benefit once inside the band, distance
+            to target before that), or
           * an internal pass raised an exception (e.g. infeasible LP).
 
         Args:
@@ -1893,12 +2559,38 @@ class MINLSearchExplainer:
                 Shapley estimator.
             max_iterations: Maximum number of refinement passes.
             patience: Stop after this many consecutive iterations without
-                improving the best distance to target.
+                improving the active incumbent.
             return_when_fails: If True (default) return the best candidate
                 found even when the target was never reached, with a
                 warning log and full status on
                 ``self.last_search_result``. If False, return ``None``
                 when the target was not reached.
+            peak_lock_in: If True (default) run the Stage 7 peak lock-in
+                sweep (:meth:`_peak_lock_in`) on the feasible incumbent
+                before returning.
+            peak_lock_in_max_sweeps: Maximum number of Stage 7 sweeps.
+            random_seed: Seeds the Stage 1 fallback anchor, the only
+                stochastic step of the search (approximate Shapley subset
+                sampling draws from the same global stream). Pass an int
+                for a reproducible run.
+            trust_region: If True (default) each pass may only move a
+                feature by a fraction of its allowed span, so SLSQP stays
+                where the Shapley-linear surrogate is accurate. The radius
+                grows after an accepted step and shrinks after a rejected
+                one; a pass whose warm-start LP is infeasible inside the
+                region enlarges it and retries without new model calls.
+            trust_region_init/min/max: Radius bounds as a fraction of each
+                feature's allowed span.
+            residual_correction: If True (default) a rejected candidate's
+                measured residual ``f(x) - h(x)`` is subtracted from the
+                target the surrogate aims at, so the next pass asks the
+                linear model for the change the true model actually needs.
+                Costs no extra model calls.
+            restoration: If True (default) a candidate that lands just
+                outside the band is pulled back in with a least-norm
+                Shapley-Newton correction (:meth:`_restore_to_band`)
+                instead of being discarded. Costs up to 3 model calls per
+                pass and keeps most of the candidate's priority.
 
         Returns:
             list | None: The selected counterfactual feature vector, or
@@ -1907,18 +2599,42 @@ class MINLSearchExplainer:
 
         Side effects:
             Sets ``self.last_search_result`` with keys ``reached_target``,
-            ``distance``, ``iterations_run``, ``stop_reason``,
-            ``best_cf`` and ``history``.
+            ``distance``, ``iterations_run``, ``stop_reason``, ``best_cf``,
+            ``history``, ``cf_source`` (``anchor`` when the returned CF is the
+            Stage 1 exemplar, ``optimiser`` when it came out of SLSQP),
+            ``priority_score``, ``anchor_priority_score`` and
+            ``priority_gain_vs_anchor`` (0.0 when the anchor wins).
         """
         logger.info("=" * 78)
         logger.info("MINLP COUNTERFACTUAL SEARCH | target=%.4f | epsilon=%.4f | "
                     "max_iterations=%d | patience=%d | shap_approx=%s | "
-                    "num_samples=%d | return_when_fails=%s",
+                    "num_samples=%d | return_when_fails=%s | trust_region=%s | "
+                    "residual_correction=%s",
                     float(self.target), float(self.epsilon),
                     int(max_iterations), int(patience),
                     bool(shap_approx), int(num_samples),
-                    bool(return_when_fails))
+                    bool(return_when_fails), bool(trust_region),
+                    bool(residual_correction))
         logger.info("=" * 78)
+
+        self.exemplar_source = None
+        self.exemplar_pred_distance = None
+        self._warm_start_info = None
+        self._last_search_exception = None
+        self._priority_peaks_cache = None
+        self._fallback_random_max_iterations = int(fallback_random_max_iterations)
+        self._random_seed = None if random_seed is None else int(random_seed)
+        if self._random_seed is not None:
+            np.random.seed(self._random_seed)
+            random.seed(self._random_seed)
+        self._tr_fraction = float(trust_region_init) if trust_region else None
+        self._tr_min = float(trust_region_min)
+        self._tr_max = float(trust_region_max)
+        self._target_correction = 0.0
+        self._residual_correction_enabled = bool(residual_correction)
+        self._restoration_enabled = bool(restoration)
+        self._last_shapley_sample = None
+        self._pass_targets = {}
 
         # Stage 0: infer bounds directly from priority functions.
         self._derive_bounds_and_intervals_from_priorities()
@@ -1930,11 +2646,37 @@ class MINLSearchExplainer:
         self._log_workflow_initial_and_bounds()
 
         original_sample = list(self.sample_state.sample)
-        best_cf = None
-        best_distance = float("inf")
+        # Keep the selected exemplar as a valid fallback when it already lies
+        # within the final target band. This matters for generated in-range
+        # anchors: if later surrogate optimisation fails or drifts, returning a
+        # valid in-range anchor is better than reporting no CF.
+        anchor_cf = list(np.asarray(self.sample_state.target_exemplar, dtype=float))
+        anchor_pred = float(np.asarray(self.model_pred([anchor_cf])).reshape(-1)[0])
+        anchor_distance = abs(anchor_pred - float(self.target))
+        anchor_priority = self._priority_benefit(anchor_cf)
+
+        best_feasible = None
+        best_feasible_priority = float("-inf")
+        best_feasible_distance = float("inf")
+        best_feasible_source = None
+        best_infeasible = None
+        best_infeasible_distance = float("inf")
+
+        if anchor_distance <= float(self.epsilon):
+            best_feasible = anchor_cf
+            best_feasible_priority = (
+                anchor_priority if anchor_priority is not None else float("-inf"))
+            best_feasible_distance = anchor_distance
+            best_feasible_source = "anchor"
+            logger.info("Initial exemplar is already a valid fallback CF: "
+                        "model_pred=%.4f | distance=%.4f | priority=%s. It is only "
+                        "kept as the incumbent until an SLSQP candidate beats its "
+                        "priority benefit.",
+                        anchor_pred, anchor_distance, anchor_priority)
         no_progress = 0
         history = []
         stop_reason = "max_iterations"
+        restoration_hits = 0
 
         for iteration in range(int(max_iterations)):
             logger.info("############ REFINEMENT ITERATION %d/%d ############",
@@ -1947,28 +2689,92 @@ class MINLSearchExplainer:
                 logger.warning("Iteration %d failed during search pass: %s",
                                iteration + 1, exc)
                 stop_reason = "search_failed"
+                self._last_search_exception = str(exc)
                 break
 
             eval_info = self._evaluate_candidate(cf)
-            improved = eval_info["distance"] < best_distance
-            best_so_far = (
-                f"{best_distance:.4f}" if best_distance != float("inf") else "n/a"
+            if not eval_info["feasible"] and self._restoration_enabled:
+                restored_cf, restored_eval = self._restore_to_band(cf, eval_info)
+                if restored_cf is not None:
+                    cf, eval_info = restored_cf, restored_eval
+                    restoration_hits += 1
+            priority = eval_info["priority"]
+            improved = False
+            # Surrogate agreement over this step: both models share the value
+            # ``basic_prediction`` at the current iterate, so no extra model
+            # call is needed to compare their predicted changes.
+            anchor_value = float(self.basic_prediction)
+            surrogate_change = float(eval_info["h_x"]) - anchor_value
+            model_change = float(eval_info["model_pred"]) - anchor_value
+            rho = (model_change / surrogate_change
+                   if abs(surrogate_change) > 1e-12 else float("nan"))
+            residual = float(eval_info["model_pred"]) - float(eval_info["h_x"])
+            # A step is worth taking when it lands in the band or simply gets
+            # closer to the target than the point it started from.
+            iterate_distance = abs(anchor_value - float(self.target))
+            accepted = bool(eval_info["feasible"]
+                            or eval_info["distance"] < iterate_distance - 1e-12)
+
+            if eval_info["feasible"]:
+                # Inside the band: rank on the priority benefit only.
+                if best_feasible is None or (
+                    priority is not None and priority > best_feasible_priority
+                ):
+                    best_feasible = list(cf)
+                    best_feasible_priority = (
+                        priority if priority is not None else float("-inf"))
+                    best_feasible_distance = eval_info["distance"]
+                    best_feasible_source = "optimiser"
+                    improved = True
+            elif best_feasible is None and eval_info["distance"] < best_infeasible_distance:
+                # No candidate inside the band yet: rank on distance to target.
+                best_infeasible = list(cf)
+                best_infeasible_distance = eval_info["distance"]
+                improved = True
+
+            best_priority_so_far = (
+                f"{best_feasible_priority:.4f}"
+                if best_feasible_priority != float("-inf") else "n/a"
             )
-            logger.info("[Iter %d] model_pred(cf)=%.4f | h(x)=%.4f | "
-                        "distance=%.4f | best_so_far=%s | improved_vs_best=%s",
+            best_distance_so_far = (
+                f"{best_feasible_distance:.4f}" if best_feasible is not None
+                else (f"{best_infeasible_distance:.4f}"
+                      if best_infeasible_distance != float("inf") else "n/a")
+            )
+            logger.info("[Iter %d] model_pred(cf)=%.4f | h(x)=%.4f | distance=%.4f | "
+                        "feasible=%s | priority=%s | best_priority=%s | "
+                        "best_distance=%s | improved_vs_best=%s | rho=%.3f | "
+                        "residual=%.4f | trust=%s",
                         iteration + 1,
                         eval_info["model_pred"], eval_info["h_x"],
-                        eval_info["distance"], best_so_far, improved)
+                        eval_info["distance"], eval_info["feasible"],
+                        f"{priority:.4f}" if priority is not None else "n/a",
+                        best_priority_so_far, best_distance_so_far, improved,
+                        rho, residual,
+                        f"{self._tr_fraction:.3f}" if self._tr_fraction is not None else "off")
 
-            if improved:
-                best_cf = list(cf)
-                best_distance = eval_info["distance"]
+            if accepted:
+                self._target_correction = 0.0
+                if (self._tr_fraction is not None and np.isfinite(rho)
+                        and 0.5 <= rho <= 1.5):
+                    self._grow_trust_region()
+            else:
+                if self._residual_correction_enabled:
+                    self._target_correction = residual
+                    logger.info("[Iter %d] Residual correction: surrogate now aims at "
+                                "%.4f so the model lands on %.4f.",
+                                iteration + 1, self._effective_target(),
+                                float(self.target))
+                self._shrink_trust_region()
+
+            # An accepted step is progress even when it does not yet beat the
+            # incumbent: the trust-region walk needs several passes to cross
+            # the gap, and patience must not cut it short.
+            if improved or accepted:
                 no_progress = 0
-                logger.info("[Iter %d] New best CF (distance=%.4f).",
-                            iteration + 1, best_distance)
             else:
                 no_progress += 1
-                logger.info("[Iter %d] No improvement vs best (%d/%d).",
+                logger.info("[Iter %d] No improvement vs incumbent (%d/%d).",
                             iteration + 1, no_progress, int(patience))
 
             history.append({
@@ -1976,33 +2782,78 @@ class MINLSearchExplainer:
                 "model_pred": eval_info["model_pred"],
                 "h_x": eval_info["h_x"],
                 "distance": eval_info["distance"],
+                "feasible": eval_info["feasible"],
+                "priority": priority,
                 "improved_vs_best": improved,
+                "accepted_step": accepted,
+                "rho": (float(rho) if np.isfinite(rho) else None),
+                "residual": residual,
+                "trust_fraction": self._tr_fraction,
+                "target_correction": self._target_correction,
             })
 
-            if eval_info["distance"] <= self.epsilon:
-                logger.info("[Iter %d] Target reached within epsilon=%.4f.",
-                            iteration + 1, float(self.epsilon))
-                stop_reason = "target_reached"
-                break
-
             if no_progress >= int(patience):
-                logger.info("Stopping: %d consecutive iterations without improvement.",
-                            int(patience))
-                stop_reason = "patience_exhausted"
+                logger.info("Stopping: %d consecutive iterations without improving "
+                            "the %s incumbent.", int(patience),
+                            "priority" if best_feasible is not None else "distance")
+                stop_reason = ("priority_stagnation" if best_feasible is not None
+                               else "patience_exhausted")
                 break
 
-            # Always advance to the latest CF, even when it did not improve;
-            # the next iteration re-linearises against the same exemplar.
-            self.sample_state.sample = list(cf)
-            logger.info("[Iter %d] Advancing: next iteration's sample = current CF.",
-                        iteration + 1)
+            # Advance only on an accepted (in-band) step, so the surrogate is
+            # always re-linearised at a point the true model agrees with. With
+            # both step controls off, keep the historical behaviour of moving
+            # to every candidate.
+            step_control = (self._tr_fraction is not None) or self._residual_correction_enabled
+            if accepted or not step_control:
+                self.sample_state.sample = list(cf)
+                logger.info("[Iter %d] Advancing: next iteration's sample = current CF.",
+                            iteration + 1)
+            else:
+                logger.info("[Iter %d] Step rejected (|f - target|=%.4f > epsilon=%.4f); "
+                            "keeping the current iterate and retrying with a smaller "
+                            "step / corrected target.",
+                            iteration + 1, eval_info["distance"], float(self.epsilon))
 
         # Restore the original sample so explainer state stays consistent
         # for any caller that inspects sample_state after the search.
         self.sample_state.sample = original_sample
         self._workflow_iteration = None
 
-        reached = (stop_reason == "target_reached")
+        peak_info = None
+        if peak_lock_in and best_feasible is not None:
+            improved_cf, peak_info = self._peak_lock_in(
+                best_feasible, max_sweeps=int(peak_lock_in_max_sweeps))
+            if peak_info["accepted_moves"] > 0:
+                best_feasible = improved_cf
+                best_feasible_priority = float(peak_info["priority_after"])
+                best_feasible_distance = abs(
+                    float(peak_info["final_prediction"]) - float(self.target))
+                best_feasible_source = f"{best_feasible_source}+peak_lock_in"
+
+        reached = best_feasible is not None
+        if reached:
+            best_cf = best_feasible
+            best_distance = best_feasible_distance
+            best_priority = (best_feasible_priority
+                             if best_feasible_priority != float("-inf") else None)
+            cf_source = best_feasible_source
+            if stop_reason == "max_iterations":
+                stop_reason = "target_reached"
+        else:
+            best_cf = best_infeasible
+            best_distance = best_infeasible_distance
+            best_priority = (self._priority_benefit(best_cf)
+                             if best_cf is not None else None)
+            cf_source = "optimiser" if best_cf is not None else None
+
+        # The anchor is a priority-agnostic in-range point, so a run that
+        # returns it must not be credited with a priority gain.
+        if cf_source == "anchor" or best_priority is None or anchor_priority is None:
+            priority_gain_vs_anchor = 0.0 if cf_source == "anchor" else None
+        else:
+            priority_gain_vs_anchor = float(best_priority) - float(anchor_priority)
+
         self.last_search_result = {
             "reached_target": reached,
             "distance": best_distance,
@@ -2010,13 +2861,40 @@ class MINLSearchExplainer:
             "stop_reason": stop_reason,
             "best_cf": list(best_cf) if best_cf is not None else None,
             "history": history,
+            "exemplar_source": self.exemplar_source,
+            "exemplar_pred_distance": self.exemplar_pred_distance,
+            "warm_start": self._warm_start_info,
+            "search_exception": self._last_search_exception,
+            "cf_source": cf_source,
+            "priority_score": best_priority,
+            "anchor_priority_score": anchor_priority,
+            "anchor_distance": anchor_distance,
+            "priority_gain_vs_anchor": priority_gain_vs_anchor,
+            "peak_lock_in": peak_info,
+            "step_control": {
+                "trust_region_enabled": bool(trust_region),
+                "trust_fraction_final": self._tr_fraction,
+                "residual_correction_enabled": self._residual_correction_enabled,
+                "accepted_steps": sum(1 for h in history if h.get("accepted_step")),
+                "rejected_steps": sum(
+                    1 for h in history if h.get("accepted_step") is False),
+                "restoration_hits": int(restoration_hits),
+            },
         }
 
         logger.info("=" * 78)
         logger.info("MINLP SEARCH DONE | reached_target=%s | stop_reason=%s | "
-                    "iterations=%d | best_distance=%.4f",
+                    "iterations=%d | best_distance=%.4f | cf_source=%s | "
+                    "priority=%s | anchor_priority=%s | gain_vs_anchor=%s",
                     reached, stop_reason, len(history),
-                    best_distance if best_distance != float("inf") else float("nan"))
+                    best_distance if best_distance != float("inf") else float("nan"),
+                    cf_source, best_priority, anchor_priority,
+                    priority_gain_vs_anchor)
+        if cf_source == "anchor":
+            logger.warning("Returned CF is the Stage 1 anchor exemplar (source=%s): no "
+                           "SLSQP candidate beat its priority benefit (%s). This run "
+                           "carries no optimisation gain.",
+                           self.exemplar_source, anchor_priority)
         logger.info("=" * 78)
 
         if reached:

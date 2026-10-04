@@ -1,0 +1,115 @@
+# Validation of roadmap Step 2 (trust region + additive residual correction).
+#
+# Question this study answers: does bounding the step and re-aiming the
+# surrogate at `target - residual` remove the `cf_source == "anchor"` rows,
+# i.e. does the optimiser itself (rather than the Stage 7 polish) start
+# producing the returned counterfactual?
+#
+# Four arms isolate the two mechanisms; Stage 7 peak lock-in is disabled so the
+# comparison measures the *search*, not the post-hoc polish. `step2_full_with_peak`
+# adds it back to show the combined result. Pair rows on
+# (dataset, priority_set, sample_id, seed, arm).
+
+study: step2_validation
+
+defaults:
+  epsilon: 0.05
+  n_cfs: 1
+  seeds: [0, 1, 2]
+  dataset: [diabetes]
+  priority_set: [set1, set2]
+  selection:
+    strategy: indices
+    sample_indices: [60, 2, 52, 18, 27, 26, 38, 50, 24, 33]
+    target_offset: -0.3
+    skip_if_target_below: 0.0
+
+arms:
+  - name: baseline_no_step_control
+    method: minlp
+    params:
+      shap_approx: true
+      shap_num_samples: 200
+      max_iterations: 10
+      patience: 5
+      target_exemplar_epsilon: 0.10
+      peak_lock_in: false
+      trust_region: false
+      residual_correction: false
+      restoration: false
+
+  - name: trust_region_only
+    method: minlp
+    params:
+      shap_approx: true
+      shap_num_samples: 200
+      max_iterations: 10
+      patience: 5
+      target_exemplar_epsilon: 0.10
+      peak_lock_in: false
+      trust_region: true
+      trust_region_init: 0.25
+      residual_correction: false
+      restoration: false
+
+  - name: residual_correction_only
+    method: minlp
+    params:
+      shap_approx: true
+      shap_num_samples: 200
+      max_iterations: 10
+      patience: 5
+      target_exemplar_epsilon: 0.10
+      peak_lock_in: false
+      trust_region: false
+      residual_correction: true
+      restoration: false
+
+  - name: restoration_only
+    method: minlp
+    params:
+      shap_approx: true
+      shap_num_samples: 200
+      max_iterations: 10
+      patience: 5
+      target_exemplar_epsilon: 0.10
+      peak_lock_in: false
+      trust_region: false
+      residual_correction: false
+      restoration: true
+
+  - name: step2_full
+    method: minlp
+    params:
+      shap_approx: true
+      shap_num_samples: 200
+      max_iterations: 10
+      patience: 5
+      target_exemplar_epsilon: 0.10
+      peak_lock_in: false
+      trust_region: true
+      trust_region_init: 0.25
+      residual_correction: true
+      restoration: true
+
+  - name: step2_full_with_peak
+    method: minlp
+    params:
+      shap_approx: true
+      shap_num_samples: 200
+      max_iterations: 10
+      patience: 5
+      target_exemplar_epsilon: 0.10
+      peak_lock_in: true
+      peak_lock_in_max_sweeps: 3
+      trust_region: true
+      trust_region_init: 0.25
+      residual_correction: true
+      restoration: true
+
+  - name: random_search_reference
+    method: random_search
+    n_cfs: 1
+    params:
+      max_iterations: 10000
+      use_monte_carlo: true

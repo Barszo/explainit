@@ -1,0 +1,112 @@
+# Badania I - hyperparameter selection and the cost of squeezing the method.
+#
+# E1 (sensitivity): one factor at a time around a base configuration, so every
+#     default we ship is justified by a measured curve rather than by taste.
+# E2 (maximum and its price): budget-monotone sweeps and ablations, read as a
+#     Pareto front of normalised priority against model evaluations, wall time
+#     and proximity (L1). That is what "squeeze the method to its maximum and
+#     show at what cost" means operationally.
+#
+# Where it runs: `auto_mpg` and `carseats` at the `medium` strictness level.
+# diabetes is deliberately excluded from *tuning*: its priority sets leave
+# 0.0000 of the training set inside the allowed region and only 30% of targets
+# reachable (analysis/priority_sets_check.csv), so defaults fitted there would
+# be fitted to a pathological cell. The tuned configuration is then verified on
+# diabetes by the `verify_on_stress_case` arm.
+#
+# Fixed on purpose: epsilon (task definition, not a method knob), n_cfs = 1
+# (MINLP is single-shot, the baseline is matched to it) and the Step-2
+# extensions, which stay off so this study characterises the shipped method.
+#
+# Every arm keeps the base value inside its own sweep list so each curve is
+# self-contained; the resulting duplicate base cells are cheap.
+
+study: study1_hyperparams
+
+defaults:
+  epsilon: 0.05
+  n_cfs: 1
+  seeds: [0, 1, 2]
+  dataset: [auto_mpg, carseats]
+  priority_set: [medium]
+  selection:
+    strategy: random
+    n_samples: 10
+    seed: 7
+    target_offset_pred_std: -1.0
+    skip_if_target_below: 0.0
+
+arms:
+  # ---- base --------------------------------------------------------------
+  - name: base
+    method: minlp
+    params: &base
+      shap_approx: true
+      shap_num_samples: 200
+      max_iterations: 10
+      patience: 5
+      target_exemplar_epsilon: 0.10
+      peak_lock_in: true
+      peak_lock_in_max_sweeps: 3
+      trust_region: false
+      residual_correction: false
+      restoration: false
+
+  # ---- E1: one factor at a time ------------------------------------------
+  - name: shap_budget
+    method: minlp
+    params:
+      <<: *base
+      shap_num_samples: [50, 100, 200, 400, 800]
+
+  - name: refinement_passes
+    method: minlp
+    params:
+      <<: *base
+      max_iterations: [1, 3, 5, 10, 20]
+
+  - name: patience
+    method: minlp
+    params:
+      <<: *base
+      max_iterations: 20
+      patience: [1, 3, 5, 10]
+
+  - name: exemplar_tolerance
+    method: minlp
+    params:
+      <<: *base
+      target_exemplar_epsilon: [0.05, 0.10, 0.20, 0.40]
+
+  - name: exact_vs_approx_shapley
+    method: minlp
+    params:
+      <<: *base
+      shap_approx: [true, false]
+
+  # ---- E2: ablation and budget -------------------------------------------
+  - name: peak_lock_in_ablation
+    method: minlp
+    params:
+      <<: *base
+      peak_lock_in: [false, true]
+
+  - name: peak_lock_in_sweeps
+    method: minlp
+    params:
+      <<: *base
+      peak_lock_in_max_sweeps: [1, 3, 6]
+
+  - name: random_search_budget
+    method: random_search
+    n_cfs: 1
+    params:
+      max_iterations: [1000, 5000, 10000]
+      use_monte_carlo: true
+
+  # ---- verification of the tuned configuration on the stress case --------
+  - name: verify_on_stress_case
+    method: minlp
+    dataset: [diabetes]
+    priority_set: [set1, set2]
+    params: *base

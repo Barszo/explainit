@@ -1,0 +1,35 @@
+# Smoke configuration: verifies the harness end to end in a couple of minutes.
+# Two methods, two samples, one seed, tiny budgets. Not a scientific run.
+
+study: smoke
+
+defaults:
+  epsilon: 0.05
+  n_cfs: 1
+  seeds: [0]
+  dataset: [diabetes]
+  priority_set: [set1]
+  selection:
+    strategy: indices
+    sample_indices: [38, 33]
+    target_offset: -0.3
+    skip_if_target_below: 0.0
+
+arms:
+  - name: minlp_smoke
+    method: minlp
+    params:
+      shap_approx: true
+      shap_num_samples: 30
+      max_iterations: 2
+      patience: 2
+      target_exemplar_epsilon: 0.10
+      peak_lock_in: [false, true]
+      peak_lock_in_max_sweeps: 1
+
+  - name: random_smoke
+    method: random_search
+    n_cfs: 1
+    params:
+      max_iterations: 500
+      use_monte_carlo: true
