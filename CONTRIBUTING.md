@@ -49,12 +49,15 @@ versions synchronized.
 
 Commit and push the packaging changes before asking others to install them.
 GitHub installation reads the selected remote branch, tag, or commit, not your
-local working tree. Merge to the default branch for the unqualified URL to
-include your changes, or specify the branch explicitly:
+local working tree. Merge to `main` before sharing this installation command:
 
 ```bash
-python -m pip install "git+https://github.com/Barszo/explainit_project.git@cleaned_version"
+python -m pip install "git+https://github.com/Barszo/explainit_project.git@main"
 ```
+
+Do not direct users to the older `cleaned_version` branch: it lacks the
+packaging fixes. When testing another branch before merging, specify its ref
+explicitly and confirm that it contains all packaging files.
 
 Once a release tag exists, users can select it instead of a moving branch.
 Keep the repository public if installation should work without authentication.
