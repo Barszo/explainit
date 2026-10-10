@@ -81,12 +81,13 @@ Plotting helpers for:
 
 ## Installation
 
-Requires Python **3.13.5 or newer** and Git. Install directly from GitHub:
+Requires Python **3.13.5 or newer** and Git. Install directly from the `main`
+branch on GitHub:
 
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-python -m pip install "git+https://github.com/Barszo/explainit_project.git"
+python -m pip install "git+https://github.com/Barszo/explainit_project.git@main"
 ```
 
 On Windows, activate the environment with `.venv\Scripts\activate` instead.
@@ -94,24 +95,33 @@ NumPy, SciPy, and Matplotlib are installed automatically. You do not need
 `requirements.txt` for normal use; it is a snapshot of the broader development
 environment, including unrelated experiment and notebook dependencies.
 
-The command above installs the repository's default branch. To install another
-branch or a specific commit, append `@<ref>` to the URL. For example:
+Use `@main`, not `@cleaned_version`: the older `cleaned_version` branch lacks
+the packaging fixes and can install without the explainer, priority, and
+utility modules.
+
+For reproducible use, replace `main` after `@` with a full commit hash from
+`main`, or a release tag once one is published. To update to the latest code
+on `main`:
 
 ```bash
-python -m pip install "git+https://github.com/Barszo/explainit_project.git@cleaned_version"
+python -m pip install --upgrade "git+https://github.com/Barszo/explainit_project.git@main"
 ```
 
-For reproducible use, prefer a full commit hash or a release tag once one is
-published. To update to the latest code on the default branch:
+If you previously installed an older revision, or imports fail with
+`ModuleNotFoundError: No module named 'explainit.explainers'`, force a fresh
+installation even if the package version number has not changed:
 
 ```bash
-python -m pip install --upgrade "git+https://github.com/Barszo/explainit_project.git"
+python -m pip install --force-reinstall --no-cache-dir "git+https://github.com/Barszo/explainit_project.git@main"
 ```
 
-Verify the installed package:
+Run these commands using the same Python environment as your application.
+Verify the installed package from outside an ExplainIt repository checkout,
+so local source files cannot hide installation problems:
 
 ```bash
-python -c "from explainit.explainers.random_search import RandomSearchExplainer; from explainit.explainers.minlp_search import MINLSearchExplainer; print('Imports OK')"
+python -c "import explainit; print(explainit.__file__); from explainit.explainers.random_search import RandomSearchExplainer; from explainit.explainers.minlp_search import MINLSearchExplainer; print('Imports OK')"
+python -m pip check
 ```
 
 This is not the unrelated `explainit` distribution on PyPI. Do not use
