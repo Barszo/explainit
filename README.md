@@ -2,6 +2,8 @@
 
 `explainit` is a Python package for building preference-based counterfactual explanations for machine learning models. It lets you describe which feature changes are more desirable, sample or optimize candidate counterfactuals, and visualize both the preference structure and the data around it.
 
+This project is experimental and under active development. APIs may change between releases.
+
 ## Project structure
 
 ```text
@@ -16,14 +18,13 @@ explainit_project/
 │   │   ├── linear.py
 │   │   └── nonlinear.py
 │   └── utils/
-│       ├── dataset_analyzer.py
 │       ├── plot_styles.py
-│       ├── priorities_analyser.py
 │       └── priority_plots.py
 ├── tests/
 ├── CONTRIBUTING.md
 ├── LICENSE
 ├── requirements.txt
+├── pyproject.toml
 └── setup.py
 ```
 
@@ -78,29 +79,43 @@ Plotting helpers for:
 - categorical priority mappings
 - probability-style views of sampling behavior
 
-#### `dataset_analyzer.py`
-
-Dataset diagnostics for:
-- feature and target type inference
-- per-feature descriptive summaries
-- feature distributions
-- correlation plots and target relationships
-
-#### `priorities_analyser.py`
-
-Analysis helpers for:
-- checking how priorities cover a dataset
-- locating dataset rows closest to target predictions
-- generating combined priority and dataset diagnostics
-
 ## Installation
+
+Requires Python **3.13.5 or newer** and Git. Install directly from GitHub:
 
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt
-pip install -e .
+python -m pip install "git+https://github.com/Barszo/explainit_project.git"
 ```
+
+On Windows, activate the environment with `.venv\Scripts\activate` instead.
+NumPy, SciPy, and Matplotlib are installed automatically. You do not need
+`requirements.txt` for normal use; it is a snapshot of the broader development
+environment, including unrelated experiment and notebook dependencies.
+
+The command above installs the repository's default branch. To install another
+branch or a specific commit, append `@<ref>` to the URL. For example:
+
+```bash
+python -m pip install "git+https://github.com/Barszo/explainit_project.git@cleaned_version"
+```
+
+For reproducible use, prefer a full commit hash or a release tag once one is
+published. To update to the latest code on the default branch:
+
+```bash
+python -m pip install --upgrade "git+https://github.com/Barszo/explainit_project.git"
+```
+
+Verify the installed package:
+
+```bash
+python -c "from explainit.explainers.random_search import RandomSearchExplainer; from explainit.explainers.minlp_search import MINLSearchExplainer; print('Imports OK')"
+```
+
+This is not the unrelated `explainit` distribution on PyPI. Do not use
+`pip install explainit`, or install both projects in the same environment.
 
 ## How priorities are structured
 
@@ -261,45 +276,18 @@ from explainit.utils.priority_plots import plot_priorities
 plot_priorities(priorities, sample=sample, show=True)
 ```
 
-### 4. Analyze a dataset
-
-```python
-from pathlib import Path
-
-from explainit.utils.dataset_analyzer import analyze_dataset
-
-report = analyze_dataset(
-    X=dataset,
-    y=model_pred(dataset),
-    feature_names=["feature_0", "feature_1"],
-    dataset_key="demo_dataset",
-    output_dir=Path("analysis_output"),
-)
-```
-
-### 5. Analyze priorities against a dataset
-
-```python
-from pathlib import Path
-
-from explainit.utils.priorities_analyser import analyse_priorities
-
-report = analyse_priorities(
-    model=model_pred,
-    dataset=dataset,
-    target_values=[target],
-    priorities=priorities,
-    feature_names=["feature_0", "feature_1"],
-    output_dir=Path("priority_analysis_output"),
-)
-```
-
 ## Development
 
-Editable installation:
+Clone the repository and install in editable mode inside a virtual environment:
 
 ```bash
-pip install -e .
+git clone https://github.com/Barszo/explainit_project.git
+cd explainit_project
+python -m venv .venv
+source .venv/bin/activate
+python -m pip install -e .
+python -m unittest discover -s tests
 ```
 
-The package version is defined in `explainit/__init__.py`.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for clean-install validation before sharing a release.
+Keep the versions in `setup.py` and `explainit/__init__.py` synchronized.
