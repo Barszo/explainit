@@ -182,7 +182,7 @@ def create_gradient_background(ax, color1=None, color2=None, alpha=0.1):
 
     x = np.linspace(xlim[0], xlim[1], 100)
     y = np.linspace(ylim[0], ylim[1], 100)
-    X, Y = np.meshgrid(x, y)
+    X, _Y = np.meshgrid(x, y)
     Z = np.zeros_like(X)
 
     ax.imshow(

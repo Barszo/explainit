@@ -1,21 +1,21 @@
-from explainit.logging_config import logger
-from explainit.utils.priority_plots import plot_priorities as _plot_priorities
+import copy
+import itertools
+import random
+import warnings
+from collections.abc import Sequence
+from dataclasses import dataclass, field
+from math import factorial
+from typing import Any
+
 # logger.info("This is an info message")
 # logger.debug("This is a debug message with details")
 # logger.warning("This is a warning message")
 # logger.error("This is an error message")
+import numpy as np
+from scipy.optimize import linprog, minimize
 
-import numpy as np
-import random
-from scipy.optimize import minimize
-from math import factorial
-import itertools
-import copy
-from scipy.optimize import linprog
-import warnings
-from dataclasses import dataclass, field
-import numpy as np
-from typing import Dict, Any, Optional, Sequence
+from explainit.logging_config import logger
+from explainit.utils.priority_plots import plot_priorities as _plot_priorities
 
 
 @dataclass
@@ -25,29 +25,29 @@ class SampleState:
     # target exemplar from dataset with prediction closest to target
     target_exemplar: list = None
     # Shapley values dictionary calculated between sample and target_exemplar
-    shapley_values: Dict[Any, float] = None
+    shapley_values: dict[Any, float] = None
     # This dictionary excludes categories that do not change the prediction
     # (shapley value is 0) it is done to limit number of combinations during search
-    limited_priorities: Dict[str, Any] = None
+    limited_priorities: dict[str, Any] = None
     # All combinations of categorical features to consider during search
-    all_combinations: Dict[Any, list] = None
+    all_combinations: dict[Any, list] = None
 
 
 @dataclass
 class PrioritiesState:
     # TODO: at the end, make sure that the attributes are calculated once only when invoked, and then only when priorities are changed
-    priorities: Dict[str, Any] = field(default_factory=dict)
+    priorities: dict[str, Any] = field(default_factory=dict)
 
     @property
-    def numerical_priorities(self) -> Dict[str, Any]:
+    def numerical_priorities(self) -> dict[str, Any]:
         return self.priorities.get("numerical", {})
 
     @property
-    def categorical_priorities(self) -> Dict[str, Any]:
+    def categorical_priorities(self) -> dict[str, Any]:
         return self.priorities.get("categorical", {})
 
     @property
-    def bounds(self) -> Dict[str, Any]:
+    def bounds(self) -> dict[str, Any]:
         bounds = {}
         for idx, val in self.numerical_priorities.items():
             if isinstance(val, dict):
@@ -96,7 +96,7 @@ class MINLSearchExplainer:
         target_exemplar_epsilon=0.01,
         epsilon=0.01,
         workflow_logger=None,
-        feature_names: Optional[Sequence[str]] = None,
+        feature_names: Sequence[str] | None = None,
     ):
         self.sample_state = SampleState(sample=sample)
         self.priorities_state = PrioritiesState(priorities=priorities)
@@ -220,10 +220,7 @@ class MINLSearchExplainer:
     def _in_allowed_intervals(value: float, intervals: list, tol: float = 1e-12) -> bool:
         if not intervals:
             return False
-        for lo, hi in intervals:
-            if (value >= lo - tol) and (value <= hi + tol):
-                return True
-        return False
+        return any(value >= lo - tol and value <= hi + tol for lo, hi in intervals)
 
     @staticmethod
     def _allowed_interval_constraint_value(value: float, intervals: list) -> float:
@@ -510,7 +507,7 @@ class MINLSearchExplainer:
         This implementation treats categorical feature groups as single units for Shapley
         calculation, avoiding redundant calculations for one-hot encoded features.
         """
-        cat_groups = [list(elem) for elem in self.priorities_state.categorical_priorities.keys()]
+        cat_groups = [list(elem) for elem in self.priorities_state.categorical_priorities]
 
         def create_feature_mapping():
             """Create mapping from original features to Shapley calculation units"""
@@ -518,7 +515,7 @@ class MINLSearchExplainer:
             shapley_idx = 0
 
             # Map numerical features (1:1 mapping)
-            for num_idx in self.priorities_state.numerical_priorities.keys():
+            for num_idx in self.priorities_state.numerical_priorities:
                 feature_map[num_idx] = shapley_idx
                 shapley_idx += 1
 
@@ -540,7 +537,7 @@ class MINLSearchExplainer:
             consolidated_x = [0] * total_shapley_features
 
             # Handle numerical features
-            for num_idx in self.priorities_state.numerical_priorities.keys():
+            for num_idx in self.priorities_state.numerical_priorities:
                 shapley_idx = feature_map[num_idx]
                 consolidated_r[shapley_idx] = original_r[num_idx]
                 consolidated_x[shapley_idx] = original_x[num_idx]
@@ -562,7 +559,7 @@ class MINLSearchExplainer:
             expanded = [0] * original_length
 
             # Handle numerical features
-            for num_idx in self.priorities_state.numerical_priorities.keys():
+            for num_idx in self.priorities_state.numerical_priorities:
                 shapley_idx = feature_map[num_idx]
                 expanded[num_idx] = consolidated_vector[shapley_idx]
 
@@ -712,7 +709,7 @@ class MINLSearchExplainer:
         original_length = len(original_r)
 
         # Create feature mapping and consolidated vectors
-        feature_map, cat_to_shapley, total_shapley_features = create_feature_mapping()
+        feature_map, _cat_to_shapley, total_shapley_features = create_feature_mapping()
         consolidated_r, consolidated_x = create_consolidated_vectors(
             original_r, original_x, feature_map, total_shapley_features
         )
@@ -763,7 +760,7 @@ class MINLSearchExplainer:
         shapley_idx = 0
 
         # Map numerical features (single indices as keys)
-        for num_idx in self.priorities_state.numerical_priorities.keys():
+        for num_idx in self.priorities_state.numerical_priorities:
             shapley_dict["numerical"][num_idx] = phi[shapley_idx]
             shapley_idx += 1
 
@@ -801,7 +798,7 @@ class MINLSearchExplainer:
         """
         # Create adjusted bounds
         adjusted_bounds = []
-        for i, feature_idx in enumerate(indices_to_modify):
+        for feature_idx in indices_to_modify:
             if feature_idx in required_shifts:
                 new_bounds = required_shifts[feature_idx]["suggested_bounds"]
                 logger.info(f"Adjusting bounds for feature {feature_idx}: {new_bounds}")
@@ -928,7 +925,7 @@ class MINLSearchExplainer:
             try:
                 solution = np.linalg.lstsq(A, b, rcond=None)[0]
                 return solution
-            except:
+            except Exception:
                 return None
 
     # Helper function to find_required_bounds_adjustments
@@ -1285,7 +1282,7 @@ class MINLSearchExplainer:
                             "error": error,
                         }
 
-            except Exception as e:
+            except Exception:
                 continue
 
         # If no method worked, try corner analysis
@@ -1377,7 +1374,6 @@ class MINLSearchExplainer:
 
         num_shap = self.sample_state.shapley_values["numerical"]
         cat_shap = self.sample_state.shapley_values["categorical"]
-        priorities_for_search = self.sample_state.limited_priorities
         cat_combinations = self.sample_state.all_combinations
         basic_prediction = self.basic_prediction
 
@@ -1385,15 +1381,12 @@ class MINLSearchExplainer:
         coef_times_original = 0.0
         shap_coeffs = {}
 
-        # calcualting coefficients for numerical features
-        for key, value in self.priorities_state.numerical_priorities.items():
+        # calculating coefficients for numerical features
+        for key, _value in self.priorities_state.numerical_priorities.items():
             denom = self.sample_state.target_exemplar[key] - self.sample_state.sample[key]
             # If the feature value does not change between sample and target_exemplar,
             # the unit coefficient is undefined; treat it as 0 to avoid NaNs.
-            if abs(float(denom)) < 1e-12:
-                temp_unit_phi = 0.0
-            else:
-                temp_unit_phi = num_shap[key] / denom
+            temp_unit_phi = 0.0 if abs(float(denom)) < 1e-12 else num_shap[key] / denom
             shap_coeffs[key] = temp_unit_phi  # save coefficient, even for non-actionable features
 
             # Only include actionable features in coef_times_original
@@ -1409,7 +1402,7 @@ class MINLSearchExplainer:
             for combo_idx, combo in cat_combinations.items():
                 result = 0.0
                 if not combo:
-                    print("Empty combination, skipping")
+                    logger.debug("Empty categorical combination %s, skipping", combo_idx)
                     continue
 
                 # ensure array is large enough for the highest index (max index is inclusive)
@@ -1419,7 +1412,7 @@ class MINLSearchExplainer:
                 for idx, val in combo.items():
                     dummy_x[idx] = val
 
-                for key in self.sample_state.limited_priorities["categorical"].keys():
+                for key in self.sample_state.limited_priorities["categorical"]:
                     feature_indices = key
                     shap_value = cat_shap[feature_indices]
 
@@ -1438,9 +1431,7 @@ class MINLSearchExplainer:
                         result += shap_value
                     else:
                         raise ValueError(
-                            "Invalid categorical combination encountered for indices {}: {}".format(
-                                feature_indices, current_values
-                            )
+                            f"Invalid categorical combination encountered for indices {feature_indices}: {current_values}"
                         )
 
                 new_targets[combo_idx] = (
@@ -1583,24 +1574,22 @@ class MINLSearchExplainer:
 
         # Generate all possible combinations across all categorical groups
         all_combinations = {}
-        combination_id = 0
 
         # Use itertools.product to get all combinations across groups
-        for combination_tuple in itertools.product(*allowed_combinations_by_group):
+        for combination_id, combination_tuple in enumerate(
+            itertools.product(*allowed_combinations_by_group)
+        ):
             # Create dictionary mapping each categorical index to its value
             combination_dict = {}
 
-            # Track position in the flattened combination
-            group_index = 0
-
-            for feature_indices in self.priorities_state.categorical_priorities.keys():
+            for group_index, feature_indices in enumerate(
+                self.priorities_state.categorical_priorities
+            ):
                 group_values = combination_tuple[group_index]
                 for i, idx in enumerate(feature_indices):
                     combination_dict[idx] = group_values[i]
-                group_index += 1
 
             all_combinations[combination_id] = combination_dict
-            combination_id += 1
 
         # Store results in SampleState
         self.sample_state.limited_priorities = modified_priorities
@@ -1657,7 +1646,7 @@ class MINLSearchExplainer:
         )
         indices_to_modify = [
             i
-            for i in self.sample_state.shap_coeffs.keys()
+            for i in self.sample_state.shap_coeffs
             if i not in self.priorities_state.non_actionable_indices
         ]
         coeff_to_linear_search = [self.sample_state.shap_coeffs[key] for key in indices_to_modify]
@@ -1685,8 +1674,6 @@ class MINLSearchExplainer:
         shap_dict = self.sample_state.shapley_values
         cat_combinations = self.sample_state.all_combinations
         priorities_for_search = self.sample_state.limited_priorities
-        shap_coefficients = self.sample_state.shap_coeffs
-        basic_prediction = self.basic_prediction
         # (true model gap, linearised gap) at each feasible warm-start x0, used
         # to diagnose warm-start health / surrogate mismatch.
         warm_gaps = []
@@ -1723,7 +1710,7 @@ class MINLSearchExplainer:
             solution = linear_solution["solution"]
             logger.debug("[Stage 4.5] Combo %d LP solution=%s", combination_id, solution)
             if solution is not None:
-                solutions_indices = {key: value for key, value in zip(indices_to_modify, solution)}
+                solutions_indices = dict(zip(indices_to_modify, solution, strict=False))
                 combo_and_initial_solutions[combination_id] = {
                     "initial_solution": solutions_indices,
                     "categorical_combo": temp_combo,
@@ -1776,8 +1763,8 @@ class MINLSearchExplainer:
         if self._warm_start_info is None:
             best = min(warm_gaps, key=lambda t: t[0]) if warm_gaps else (None, None)
             self._warm_start_info = {
-                "total_combos": int(len(target_for_combo)),
-                "feasible_combos": int(len(combo_and_initial_solutions)),
+                "total_combos": len(target_for_combo),
+                "feasible_combos": len(combo_and_initial_solutions),
                 "best_warmstart_model_gap": (float(best[0]) if best[0] is not None else None),
                 "best_warmstart_linear_gap": (float(best[1]) if best[1] is not None else None),
             }
@@ -1791,7 +1778,7 @@ class MINLSearchExplainer:
             )
 
         # 6. If no feasible solutions were found, analyze why and suggest bounds adjustments
-        # TODO: It worked fine when there were no categorical fatures - I need to rethink this part
+        # TODO: It worked fine when there were no categorical features - I need to rethink this part
         # if len(combo_and_initial_solutions) == 0:
         #     # Try to find intelligent bounds adjustments
         #     bounds_adjustment = self.find_required_bounds_adjustments(
@@ -1847,12 +1834,12 @@ class MINLSearchExplainer:
         Returns:
             float: Estimated prediction value based on Shapley value approximation
         """
-        num_shap = shap_dict["numerical"]
+        shap_dict["numerical"]
         cat_shap = shap_dict["categorical"]
 
         result = basic_prediction
 
-        for key in priorities_for_search["numerical"].keys():
+        for key in priorities_for_search["numerical"]:
             # Use pre-calculated coefficient from shap_coeffs instead of recalculating.
             # ``x`` is always the full-length feature vector, so index by the
             # feature's actual column index (numerical indices may be
@@ -1861,7 +1848,7 @@ class MINLSearchExplainer:
 
             result += temp_unit_phi * (x[key] - sample[key])
 
-        for key in priorities_for_search["categorical"].keys():
+        for key in priorities_for_search["categorical"]:
             feature_indices = key
             shap_value = cat_shap[feature_indices]
 
@@ -1879,9 +1866,7 @@ class MINLSearchExplainer:
                 result += shap_value
             else:
                 raise ValueError(
-                    "Invalid categorical combination encountered for indices {}: {}".format(
-                        feature_indices, current_values
-                    )
+                    f"Invalid categorical combination encountered for indices {feature_indices}: {current_values}"
                 )
 
         return result
@@ -2271,7 +2256,7 @@ class MINLSearchExplainer:
         """
         return float(self.target) - float(self._target_correction)
 
-    def _search_bounds(self) -> Dict[int, tuple]:
+    def _search_bounds(self) -> dict[int, tuple]:
         """Per-feature ``(lo, hi)`` for the LP and SLSQP, trust region included.
 
         The trust region caps how far one pass may move each feature from the
@@ -2430,30 +2415,31 @@ class MINLSearchExplainer:
                 except ValueError:
                     return -1e12
 
-            constraint_fun = lambda x: constraint_wrapper(
-                x,
-                self.sample_state.shapley_values,
-                self.sample_state.sample,
-                self.sample_state.target_exemplar,
-                self.sample_state.limited_priorities,
-                basic_prediction=self.basic_prediction,
-                ready_input=prepared_input.copy(),
-            )
-            objective_fun = lambda x: (
-                -objective_wrapper(x, self.sample_state.limited_priorities, prepared_input.copy())
-            )
+            def constraint_fun(x, _prepared=prepared_input):
+                return constraint_wrapper(
+                    x,
+                    self.sample_state.shapley_values,
+                    self.sample_state.sample,
+                    self.sample_state.target_exemplar,
+                    self.sample_state.limited_priorities,
+                    basic_prediction=self.basic_prediction,
+                    ready_input=_prepared.copy(),
+                )
+
+            def objective_fun(x, _prepared=prepared_input):
+                return -objective_wrapper(x, self.sample_state.limited_priorities, _prepared.copy())
 
             # Target of this pass: the real target unless the trust region can
             # only reach part of the way (then the closest reachable value).
             pass_target = self._pass_targets.get(i, self._effective_target())
 
             # Lower bound constraint: h(x) >= pass_target - epsilon
-            def lower_constraint(x, _t=pass_target):
-                return constraint_fun(x) - (_t - self.epsilon)
+            def lower_constraint(x, _t=pass_target, _h=constraint_fun):
+                return _h(x) - (_t - self.epsilon)
 
             # Upper bound constraint: h(x) <= pass_target + epsilon
-            def upper_constraint(x, _t=pass_target):
-                return (_t + self.epsilon) - constraint_fun(x)
+            def upper_constraint(x, _t=pass_target, _h=constraint_fun):
+                return (_t + self.epsilon) - _h(x)
 
             constraints = [
                 {"type": "ineq", "fun": lower_constraint},
@@ -2589,7 +2575,7 @@ class MINLSearchExplainer:
             return 0.0
         return w if np.isfinite(w) else 0.0
 
-    def _priority_peaks(self, grid_size: int = 1000) -> Dict[int, tuple]:
+    def _priority_peaks(self, grid_size: int = 1000) -> dict[int, tuple]:
         """``{feature_index: (peak_value, peak_weight)}`` for actionable features.
 
         The peak is the argmax of the feature's priority function over its
@@ -2599,7 +2585,7 @@ class MINLSearchExplainer:
         """
         if getattr(self, "_priority_peaks_cache", None) is not None:
             return self._priority_peaks_cache
-        peaks: Dict[int, tuple] = {}
+        peaks: dict[int, tuple] = {}
         for idx, cfg in self.priorities_state.numerical_priorities.items():
             if not isinstance(cfg, dict) or cfg.get("function") is None:
                 continue
@@ -3412,7 +3398,7 @@ class MINLSearchExplainer:
         Raises:
             ValueError: If no samples found satisfy the classification constraint
         """
-        logger.info(f"Starting MINLP-based binary classification counterfactual search...")
+        logger.info("Starting MINLP-based binary classification counterfactual search...")
         logger.info(f"Target class: {target_class}, Threshold: {threshold}")
 
         # Set target prediction value based on desired class
@@ -3472,7 +3458,7 @@ class MINLSearchExplainer:
             )
             init_vals_per_combo = {0: {"initial_solution": {}, "categorical_combo": {}}}
 
-        priorities_for_search = (
+        (
             self.sample_state.limited_priorities
             if hasattr(self.sample_state, "limited_priorities")
             else self.priorities_state.priorities
@@ -3491,7 +3477,7 @@ class MINLSearchExplainer:
             logger.info(f"Processing categorical combination {combo_id}...")
             prepared_input = self.sample_state.sample.copy()
 
-            if "initial_solution" in values and values["initial_solution"]:
+            if values.get("initial_solution"):
                 initial_numerical = values["initial_solution"]
                 cat_combo = values.get("categorical_combo", {})
             else:
@@ -3507,7 +3493,9 @@ class MINLSearchExplainer:
             # Define constraint and objective functions
             numerical_indices = list(self.priorities_state.numerical_priorities.keys())
 
-            def objective_wrapper(x):
+            def objective_wrapper(
+                x, prepared_input=prepared_input, numerical_indices=numerical_indices
+            ):
                 temp_input = prepared_input.copy()
                 for i, idx in enumerate(numerical_indices):
                     if i < len(x):
@@ -3518,7 +3506,9 @@ class MINLSearchExplainer:
                     return -1e12
 
             # For binary classification, use direct model prediction instead of Shapley approximation
-            def classification_constraint(x):
+            def classification_constraint(
+                x, prepared_input=prepared_input, numerical_indices=numerical_indices
+            ):
                 temp_input = prepared_input.copy()
                 for i, idx in enumerate(numerical_indices):
                     if i < len(x):

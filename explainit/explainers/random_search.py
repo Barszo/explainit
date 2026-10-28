@@ -1,12 +1,17 @@
+import random
+
+import numpy as np
+
 from explainit.logging_config import logger
 from explainit.utils.priority_plots import (
     plot_priorities as _plot_priorities,
+)
+from explainit.utils.priority_plots import (
     plot_probability_distributions as _plot_probability_distributions,
+)
+from explainit.utils.priority_plots import (
     sample_numeric_value as _sample_numeric_value,
 )
-
-import numpy as np
-import random
 
 
 class RandomSearchExplainer:
@@ -340,11 +345,6 @@ class RandomSearchExplainer:
             np.random.seed(random_seed)
             random.seed(random_seed)
 
-        samples = []
-        predictions = []
-        preference_scores = []
-        iteration_found = []  # Track iteration number when each CF was found
-
         n_features = len(self.sample)
         best_samples = []
         best_predictions = []
@@ -392,10 +392,7 @@ class RandomSearchExplainer:
                         sample[idx] = sel[j]
                 try:
                     pred = self.model_pred(sample.reshape(1, -1))[0]
-                    if target_class == 1:
-                        is_valid = pred > threshold
-                    else:
-                        is_valid = pred < threshold
+                    is_valid = pred > threshold if target_class == 1 else pred < threshold
                     if is_valid:
                         candidates.append(sample.copy())
                         candidate_preds.append(pred)

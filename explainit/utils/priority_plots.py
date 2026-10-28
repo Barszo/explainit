@@ -37,10 +37,11 @@ callers can persist plots to disk without touching matplotlib state.
 
 from __future__ import annotations
 
-import os
 import math
+import os
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
+from typing import Any
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -54,11 +55,10 @@ from explainit.utils.plot_styles import (
     style_numerical_plot,
 )
 
+PathLike = str | os.PathLike
 
-PathLike = Union[str, os.PathLike]
 
-
-PAIR_COLORS: Tuple[str, ...] = (
+PAIR_COLORS: tuple[str, ...] = (
     "#FF6B35",
     "#FFD166",
     "#06D6A0",
@@ -74,7 +74,7 @@ def _pair_color(i: int) -> str:
     return PAIR_COLORS[i % len(PAIR_COLORS)]
 
 
-def _normalize_vectors(vectors: Optional[Any]) -> Optional[List[np.ndarray]]:
+def _normalize_vectors(vectors: Any | None) -> list[np.ndarray] | None:
     """Normalise ``sample``/``exemplar`` to a list of 1D vectors.
 
     Accepts None, a single 1D vector, or a 2D array / list-of-vectors.
@@ -93,9 +93,7 @@ def _normalize_vectors(vectors: Optional[Any]) -> Optional[List[np.ndarray]]:
     raise ValueError(f"Expected 1D or 2D array for sample/exemplar, got ndim={arr.ndim}")
 
 
-def _normalize_target_values(
-    values: Optional[Any], n_pairs: int
-) -> Optional[List[Optional[float]]]:
+def _normalize_target_values(values: Any | None, n_pairs: int) -> list[float | None] | None:
     """Normalise scalar or list-of-scalars target values to length ``n_pairs``.
 
     Returns ``None`` for inputs that are ``None``. A scalar input is
@@ -108,7 +106,7 @@ def _normalize_target_values(
     if isinstance(values, (int, float, np.integer, np.floating)):
         return [float(values)] * n_pairs
     arr = list(values)
-    out: List[Optional[float]] = []
+    out: list[float | None] = []
     for i in range(n_pairs):
         if i >= len(arr) or arr[i] is None:
             out.append(None)
@@ -126,7 +124,7 @@ def _pair_label(prefix: str, idx: int, total: int) -> str:
     return f"{prefix} #{idx + 1}"
 
 
-def _ensure_dir(directory: Optional[PathLike]) -> Optional[Path]:
+def _ensure_dir(directory: PathLike | None) -> Path | None:
     if directory is None:
         return None
     path = Path(directory)
@@ -144,9 +142,7 @@ def _is_actionable_numeric(constraint: Any) -> bool:
         return False
     if min_val is None or max_val is None:
         return False
-    if min_val == max_val:
-        return False
-    return True
+    return min_val != max_val
 
 
 def _bar_width_for(num_categories: int) -> float:
@@ -190,7 +186,7 @@ def sample_numeric_value(constraint: Mapping[str, Any], max_tries: int = 100) ->
     return float(np.clip(xs[idx] + jitter, min_val, max_val))
 
 
-def _finalize(fig: plt.Figure, save_path: Optional[PathLike], show: bool) -> None:
+def _finalize(fig: plt.Figure, save_path: PathLike | None, show: bool) -> None:
     if save_path is not None:
         save_path = Path(save_path)
         save_path.parent.mkdir(parents=True, exist_ok=True)
@@ -214,10 +210,10 @@ def _infer_target_type(target_values: np.ndarray) -> str:
 
 def _find_level_x_positions(
     x_vals: np.ndarray, y_vals: np.ndarray, level: float, tol: float = 1e-4
-) -> List[float]:
+) -> list[float]:
     if x_vals.size < 2 or y_vals.size < 2:
         return []
-    out: List[float] = []
+    out: list[float] = []
     d = y_vals - float(level)
     # For flat runs where priority == level, draw one meaningful boundary:
     # - run touching left edge  -> use RIGHT boundary (border to >/< level)
@@ -226,7 +222,7 @@ def _find_level_x_positions(
     if np.any(close):
         starts = np.where(close & np.concatenate(([True], ~close[:-1])))[0]
         ends = np.where(close & np.concatenate((~close[1:], [True])))[0]
-        for s, e in zip(starts, ends):
+        for s, e in zip(starts, ends, strict=False):
             if s == 0 and e + 1 < len(x_vals):
                 out.append(float(x_vals[e]))  # left-edge run -> right boundary
             else:
@@ -245,7 +241,7 @@ def _find_level_x_positions(
         t = (level - y0) / (y1 - y0)
         out.append(x0 + t * (x1 - x0))
     out.sort()
-    dedup: List[float] = []
+    dedup: list[float] = []
     for x in out:
         if not dedup or abs(x - dedup[-1]) > 2e-3:
             dedup.append(x)
@@ -256,19 +252,19 @@ def plot_numerical_priority(
     idx: int,
     constraint: Mapping[str, Any],
     *,
-    sample: Optional[Any] = None,
-    exemplar: Optional[Any] = None,
-    sample_target_value: Optional[Any] = None,
-    exemplar_target_value: Optional[Any] = None,
-    feature_values: Optional[Sequence[float]] = None,
-    target_values: Optional[Sequence[float]] = None,
+    sample: Any | None = None,
+    exemplar: Any | None = None,
+    sample_target_value: Any | None = None,
+    exemplar_target_value: Any | None = None,
+    feature_values: Sequence[float] | None = None,
+    target_values: Sequence[float] | None = None,
     target_name: str = "target",
-    target_threshold: Optional[float] = None,
-    feature_name: Optional[str] = None,
-    save_path: Optional[PathLike] = None,
-    save_dir: Optional[PathLike] = None,
+    target_threshold: float | None = None,
+    feature_name: str | None = None,
+    save_path: PathLike | None = None,
+    save_dir: PathLike | None = None,
     show: bool = False,
-) -> Optional[plt.Figure]:
+) -> plt.Figure | None:
     """Plot the priority weight curve for a single numerical feature.
 
     ``sample`` and ``exemplar`` can be either a single 1D feature vector or a
@@ -303,7 +299,7 @@ def plot_numerical_priority(
     sample_target_list = _normalize_target_values(sample_target_value, n_pairs)
     exemplar_target_list = _normalize_target_values(exemplar_target_value, n_pairs)
 
-    def _val_at(vec_list: Optional[List[np.ndarray]], i: int) -> Optional[float]:
+    def _val_at(vec_list: list[np.ndarray] | None, i: int) -> float | None:
         if vec_list is None or i >= len(vec_list):
             return None
         vec = vec_list[i]
@@ -312,11 +308,11 @@ def plot_numerical_priority(
         v = float(vec[idx])
         return v if np.isfinite(v) else None
 
-    sample_values: List[Optional[float]] = [_val_at(samples_list, i) for i in range(n_pairs)]
-    exemplar_values: List[Optional[float]] = [_val_at(exemplars_list, i) for i in range(n_pairs)]
+    sample_values: list[float | None] = [_val_at(samples_list, i) for i in range(n_pairs)]
+    exemplar_values: list[float | None] = [_val_at(exemplars_list, i) for i in range(n_pairs)]
     # Back-compat shortcuts for legacy single-pair code paths.
-    sample_value = sample_values[0] if sample_values else None
-    exemplar_value = exemplar_values[0] if exemplar_values else None
+    sample_values[0] if sample_values else None
+    exemplar_values[0] if exemplar_values else None
 
     has_target_distribution = feature_values is not None and target_values is not None
     if has_target_distribution:
@@ -449,7 +445,7 @@ def plot_numerical_priority(
                     if hist.size:
                         y_max = max(y_max, float(np.max(hist)))
 
-                for i, (v, vals) in enumerate(zip(ordered_vals, grouped)):
+                for i, (v, vals) in enumerate(zip(ordered_vals, grouped, strict=False)):
                     ax_i = hist_axes[i]
                     if vals.size == 0:
                         ax_i.text(
@@ -491,7 +487,7 @@ def plot_numerical_priority(
                     ax_i.tick_params(axis="both", labelsize=24)
 
                 # single legend on the first histogram axis
-                handles, labels_leg = hist_axes[0].get_legend_handles_labels()
+                handles, _labels_leg = hist_axes[0].get_legend_handles_labels()
                 if handles:
                     legend = hist_axes[0].legend(
                         frameon=True,
@@ -916,19 +912,19 @@ def plot_numerical_priority(
 
 
 def plot_categorical_priority(
-    group_indices: Tuple[int, ...],
-    mapping: Mapping[Tuple[Any, ...], float],
+    group_indices: tuple[int, ...],
+    mapping: Mapping[tuple[Any, ...], float],
     *,
-    sample: Optional[Any] = None,
-    exemplar: Optional[Any] = None,
-    feature_matrix: Optional[Sequence[Sequence[float]]] = None,
-    target_values: Optional[Sequence[float]] = None,
+    sample: Any | None = None,
+    exemplar: Any | None = None,
+    feature_matrix: Sequence[Sequence[float]] | None = None,
+    target_values: Sequence[float] | None = None,
     target_name: str = "target",
-    feature_names: Optional[Sequence[str]] = None,
-    save_path: Optional[PathLike] = None,
-    save_dir: Optional[PathLike] = None,
+    feature_names: Sequence[str] | None = None,
+    save_path: PathLike | None = None,
+    save_dir: PathLike | None = None,
     show: bool = False,
-) -> Optional[plt.Figure]:
+) -> plt.Figure | None:
     """Plot a bar chart with the priority weights of a categorical group.
 
     ``sample`` and ``exemplar`` may be a single 1D feature vector or a
@@ -941,7 +937,7 @@ def plot_categorical_priority(
 
     apply_style()
 
-    categories: List[Tuple[Any, ...]] = list(mapping.keys())
+    categories: list[tuple[Any, ...]] = list(mapping.keys())
     weights = np.array([0.0 if v is None else float(v) for v in mapping.values()], dtype=float)
     category_labels = [str(cat) for cat in categories]
     num_categories = len(category_labels)
@@ -955,18 +951,21 @@ def plot_categorical_priority(
         0,
     )
 
-    def _combo_for(vec: np.ndarray) -> Optional[Tuple[Any, ...]]:
+    def _combo_for(vec: np.ndarray) -> tuple[Any, ...] | None:
         try:
             return tuple(float(vec[gi]) for gi in group_indices)
         except (IndexError, TypeError, ValueError):
             return None
 
-    def _combo_idx(combo: Optional[Tuple[Any, ...]]) -> Optional[int]:
+    def _combo_idx(combo: tuple[Any, ...] | None) -> int | None:
         if combo is None:
             return None
         for i, cat in enumerate(categories):
             try:
-                if all(math.isclose(float(a), float(b), abs_tol=1e-9) for a, b in zip(combo, cat)):
+                if all(
+                    math.isclose(float(a), float(b), abs_tol=1e-9)
+                    for a, b in zip(combo, cat, strict=False)
+                ):
                     return i
             except (TypeError, ValueError):
                 if combo == cat:
@@ -983,7 +982,7 @@ def plot_categorical_priority(
         target_type = _infer_target_type(tv)
         mask = np.isfinite(tv)
         tv = tv[mask]
-        combos = [c for c, keep in zip(combos, mask) if keep]
+        combos = [c for c, keep in zip(combos, mask, strict=False) if keep]
 
         fig, ax = plt.subplots(figsize=(12, 8))
         if target_type == "categorical":
@@ -1095,8 +1094,8 @@ def plot_categorical_priority(
             )
 
     weights_max = float(max(weights)) if num_categories else 0.0
-    sample_indices_by_pair: List[Optional[int]] = []
-    exemplar_indices_by_pair: List[Optional[int]] = []
+    sample_indices_by_pair: list[int | None] = []
+    exemplar_indices_by_pair: list[int | None] = []
     for pi in range(n_pairs_cat):
         color = _pair_color(pi)
         s_vec = (
@@ -1154,7 +1153,7 @@ def plot_categorical_priority(
         ax.set_xlim(-1, 1)
 
     current_indices = {i for i in sample_indices_by_pair if i is not None}
-    for i, (bar, weight) in enumerate(zip(bars, weights)):
+    for i, (bar, weight) in enumerate(zip(bars, weights, strict=False)):
         label_text = f"{weight:.3f}"
         if i in current_indices:
             label_text += " (Current)"
@@ -1167,13 +1166,13 @@ def plot_categorical_priority(
             fontsize=16,
             fontweight="bold",
             color=COLORS["dirty_white"],
-            bbox=dict(
-                boxstyle="round,pad=0.4",
-                facecolor=COLORS["dark_background"],
-                alpha=0.8,
-                edgecolor=COLORS["dirty_white"],
-                linewidth=1.5,
-            ),
+            bbox={
+                "boxstyle": "round,pad=0.4",
+                "facecolor": COLORS["dark_background"],
+                "alpha": 0.8,
+                "edgecolor": COLORS["dirty_white"],
+                "linewidth": 1.5,
+            },
         )
 
     if feature_names is not None:
@@ -1224,18 +1223,18 @@ def plot_categorical_priority(
 def plot_priorities(
     priorities: Mapping[str, Any],
     *,
-    sample: Optional[Any] = None,
-    exemplar: Optional[Any] = None,
-    sample_target_value: Optional[Any] = None,
-    exemplar_target_value: Optional[Any] = None,
-    feature_matrix: Optional[Sequence[Sequence[float]]] = None,
-    target_values: Optional[Sequence[float]] = None,
+    sample: Any | None = None,
+    exemplar: Any | None = None,
+    sample_target_value: Any | None = None,
+    exemplar_target_value: Any | None = None,
+    feature_matrix: Sequence[Sequence[float]] | None = None,
+    target_values: Sequence[float] | None = None,
     target_name: str = "target",
-    target_threshold: Optional[float] = None,
-    feature_names: Optional[Sequence[str]] = None,
-    save_dir: Optional[PathLike] = None,
+    target_threshold: float | None = None,
+    feature_names: Sequence[str] | None = None,
+    save_dir: PathLike | None = None,
     show: bool = False,
-) -> List[Path]:
+) -> list[Path]:
     """Plot every actionable priority in a priorities dict.
 
     ``sample`` and ``exemplar`` accept either a single 1D vector or a list /
@@ -1245,11 +1244,11 @@ def plot_priorities(
     Returns the list of paths written when ``save_dir`` is provided.
     """
 
-    written: List[Path] = []
+    written: list[Path] = []
     directory = _ensure_dir(save_dir)
 
     numerical: Mapping[int, Any] = priorities.get("numerical", {}) or {}
-    categorical: Mapping[Tuple[int, ...], Any] = priorities.get("categorical", {}) or {}
+    categorical: Mapping[tuple[int, ...], Any] = priorities.get("categorical", {}) or {}
 
     for idx, constraint in numerical.items():
         if not _is_actionable_numeric(constraint):
@@ -1315,12 +1314,12 @@ def plot_numerical_probability_distribution(
     constraint: Mapping[str, Any],
     *,
     n_samples: int = 10000,
-    sampler: Optional[Callable[[Mapping[str, Any]], float]] = None,
-    feature_name: Optional[str] = None,
-    save_path: Optional[PathLike] = None,
-    save_dir: Optional[PathLike] = None,
+    sampler: Callable[[Mapping[str, Any]], float] | None = None,
+    feature_name: str | None = None,
+    save_path: PathLike | None = None,
+    save_dir: PathLike | None = None,
     show: bool = False,
-) -> Optional[plt.Figure]:
+) -> plt.Figure | None:
     """Plot the theoretical density vs the empirical Monte-Carlo histogram for a
     numerical feature's priority.
 
@@ -1342,10 +1341,7 @@ def plot_numerical_probability_distribution(
     x_vals = np.linspace(min_val, max_val, 1000)
     weights = np.array([float(f(x)) for x in x_vals])
     area = float(np.trapezoid(weights, x_vals))
-    if area <= 0 or not np.isfinite(area):
-        prob_density = np.zeros_like(weights)
-    else:
-        prob_density = weights / area
+    prob_density = np.zeros_like(weights) if area <= 0 or not np.isfinite(area) else weights / area
 
     samples = np.array([draw(constraint) for _ in range(int(n_samples))])
     hist, bin_edges = np.histogram(samples, bins=50, density=True)
@@ -1410,14 +1406,14 @@ def plot_numerical_probability_distribution(
 
 
 def plot_categorical_probability_distribution(
-    group_indices: Tuple[int, ...],
-    mapping: Mapping[Tuple[Any, ...], float],
+    group_indices: tuple[int, ...],
+    mapping: Mapping[tuple[Any, ...], float],
     *,
-    feature_names: Optional[Sequence[str]] = None,
-    save_path: Optional[PathLike] = None,
-    save_dir: Optional[PathLike] = None,
+    feature_names: Sequence[str] | None = None,
+    save_path: PathLike | None = None,
+    save_dir: PathLike | None = None,
     show: bool = False,
-) -> Optional[plt.Figure]:
+) -> plt.Figure | None:
     """Plot normalised sampling probabilities for a categorical group.
 
     Forbidden combinations (weight == 0 or None) are filtered out before
@@ -1474,7 +1470,7 @@ def plot_categorical_probability_distribution(
     if num_categories == 1:
         ax.set_xlim(-1, 1)
 
-    for bar, prob in zip(bars, probabilities):
+    for bar, prob in zip(bars, probabilities, strict=False):
         ax.text(
             bar.get_x() + bar.get_width() / 2,
             bar.get_height() + 0.003,
@@ -1484,13 +1480,13 @@ def plot_categorical_probability_distribution(
             fontsize=16,
             fontweight="bold",
             color=COLORS["dirty_white"],
-            bbox=dict(
-                boxstyle="round,pad=0.4",
-                facecolor=COLORS["dark_background"],
-                alpha=0.8,
-                edgecolor=COLORS["dirty_white"],
-                linewidth=1.5,
-            ),
+            bbox={
+                "boxstyle": "round,pad=0.4",
+                "facecolor": COLORS["dark_background"],
+                "alpha": 0.8,
+                "edgecolor": COLORS["dirty_white"],
+                "linewidth": 1.5,
+            },
         )
 
     if feature_names is not None:
@@ -1521,21 +1517,21 @@ def plot_probability_distributions(
     priorities: Mapping[str, Any],
     *,
     n_samples: int = 10000,
-    sampler: Optional[Callable[[Mapping[str, Any]], float]] = None,
-    feature_names: Optional[Sequence[str]] = None,
-    save_dir: Optional[PathLike] = None,
+    sampler: Callable[[Mapping[str, Any]], float] | None = None,
+    feature_names: Sequence[str] | None = None,
+    save_dir: PathLike | None = None,
     show: bool = False,
-) -> List[Path]:
+) -> list[Path]:
     """Render probability-distribution plots for every actionable entry in
     ``priorities``. Mirrors ``plot_priorities`` but uses the sampling-oriented
     views.
     """
 
-    written: List[Path] = []
+    written: list[Path] = []
     directory = _ensure_dir(save_dir)
 
     numerical: Mapping[int, Any] = priorities.get("numerical", {}) or {}
-    categorical: Mapping[Tuple[int, ...], Any] = priorities.get("categorical", {}) or {}
+    categorical: Mapping[tuple[int, ...], Any] = priorities.get("categorical", {}) or {}
 
     for idx, constraint in numerical.items():
         if not _is_actionable_numeric(constraint):
@@ -1580,11 +1576,11 @@ def plot_probability_distributions(
 
 
 __all__ = [
-    "sample_numeric_value",
-    "plot_numerical_priority",
     "plot_categorical_priority",
-    "plot_priorities",
-    "plot_numerical_probability_distribution",
     "plot_categorical_probability_distribution",
+    "plot_numerical_priority",
+    "plot_numerical_probability_distribution",
+    "plot_priorities",
     "plot_probability_distributions",
+    "sample_numeric_value",
 ]

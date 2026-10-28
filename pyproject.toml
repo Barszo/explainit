@@ -94,6 +94,8 @@ select = [
 ignore = [
     "E501",    # long lines are handled by the formatter where possible
 ]
+# Mathematical notation used intentionally in docstrings.
+allowed-confusables = ["×"]
 
 [tool.ruff.lint.per-file-ignores]
 # Legacy global NumPy RNG; scheduled for migration to numpy.random.Generator.

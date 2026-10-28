@@ -11,7 +11,6 @@ __all__ = ["logger"]
 def _initialize():
     """Initialize the package."""
     # Add any initialization code here
-    pass
 
 
 # Run initialization
