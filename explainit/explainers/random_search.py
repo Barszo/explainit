@@ -58,14 +58,12 @@ class RandomSearchExplainer:
         """
         return _sample_numeric_value(constraint, max_tries=max_tries, rng=self._np_rng)
 
-    def display_priorities(
-        self, exemplar=None, *, save_dir="images", show=False, feature_names=None
-    ):
+    def display_priorities(self, exemplar=None, *, save_dir=None, show=True, feature_names=None):
         """Plot the configured priorities (numerical + categorical).
 
-        Delegates to ``explainit.utils.priority_plots.plot_priorities``; pass
-        ``save_dir=None`` to skip writing files and ``show=True`` to open the
-        plots interactively.
+        Delegates to ``explainit.utils.priority_plots.plot_priorities``. Pass
+        ``save_dir`` to also write PNG files, and ``show=False`` to skip
+        opening the plots (useful in scripts and tests).
         """
         return _plot_priorities(
             self.priorities,
@@ -77,7 +75,7 @@ class RandomSearchExplainer:
         )
 
     def investigate_probability_distribution(
-        self, n_samples=10000, *, save_dir="images", show=False, feature_names=None
+        self, n_samples=10000, *, save_dir=None, show=True, feature_names=None
     ):
         """Render theoretical vs empirical probability distributions for the
         priorities (numerical) and normalised category probabilities
@@ -86,7 +84,9 @@ class RandomSearchExplainer:
         Delegates to
         :func:`explainit.utils.priority_plots.plot_probability_distributions`,
         passing this explainer's own ``sample_numeric_value`` so the empirical
-        histogram comes from the exact sampler the search loop uses.
+        histogram comes from the exact sampler the search loop uses. Pass
+        ``save_dir`` to also write PNG files, and ``show=False`` to skip
+        opening the plots.
         """
         return _plot_probability_distributions(
             self.priorities,
@@ -124,8 +124,8 @@ class RandomSearchExplainer:
             weight = possible_values.get(current_combo, 0)
             scores.append(float(weight))
 
-        # Overall score is the product of all weights (geometric mean approach)
-        # This ensures that low preference in any feature significantly reduces overall score
+        # Overall score is the sum of the per-feature priorities, so each
+        # actionable feature contributes a value in [0, 1].
         if len(scores) == 0:
             return 1.0
         return float(np.sum(scores))
@@ -194,6 +194,20 @@ class RandomSearchExplainer:
 
         return breakdown
 
+    @staticmethod
+    def _top_n(results, n):
+        """Keep the ``n`` results with the highest preference score."""
+        if n is None:
+            return results
+        samples, predictions, scores, iterations = results
+        order = sorted(range(len(scores)), key=lambda k: scores[k], reverse=True)[: int(n)]
+        return (
+            [samples[k] for k in order],
+            [predictions[k] for k in order],
+            [scores[k] for k in order],
+            [iterations[k] for k in order],
+        )
+
     def generate_random_samples(
         self,
         expected_counterfactuals=5,
@@ -203,6 +217,7 @@ class RandomSearchExplainer:
         use_monte_carlo=True,
         max_tries=100,
         return_top_n=None,
+        n_candidates_per_cf=None,
     ):
         """
         Generate random samples based on filtered priorities.
@@ -215,19 +230,29 @@ class RandomSearchExplainer:
             random_seed: seed for reproducibility
             use_monte_carlo: if True, use Monte Carlo sampling for numerical features; otherwise use uniform sampling
             max_tries: maximum number of tries for rejection sampling in numerical features (only if use_monte_carlo is True)
-            return_top_n: if specified, return only the top N most preferable samples (default: return all)
+            return_top_n: if specified, return only the top N most preferable samples,
+                ordered by decreasing preference score (default: return all)
+            n_candidates_per_cf: number of valid candidates to collect per
+                counterfactual; the most preferable one is kept (default: 1)
 
         Returns:
-            list of samples and their corresponding predictions
+            tuple: ``(counterfactuals, predictions, scores, iterations)`` -- four
+            lists with one entry per counterfactual found: the feature vector,
+            the model prediction, the preference score (see
+            :meth:`calculate_preference_score`) and the iteration at which it
+            was found. Fewer than ``expected_counterfactuals`` entries are
+            returned when the search budget runs out.
         """
         self._np_rng, self._py_rng = make_rngs(random_seed)
+        if n_candidates_per_cf is None:
+            # Backwards compatibility: this used to be read from an instance attribute.
+            n_candidates_per_cf = getattr(self, "n_candidates_per_cf", 1)
 
         n_features = len(self.sample)
         best_samples = []
         best_predictions = []
         best_scores = []
         best_iteration_found = []
-        n_candidates_per_cf = getattr(self, "n_candidates_per_cf", 1)
         for cf_idx in range(expected_counterfactuals):
             candidates = []
             candidate_preds = []
@@ -302,7 +327,9 @@ class RandomSearchExplainer:
                 best_iteration_found.append(candidate_iters[best_idx])
             else:
                 logger.info(f"No valid candidates found for CF {cf_idx + 1}")
-        return best_samples, best_predictions, best_scores, best_iteration_found
+        return self._top_n(
+            (best_samples, best_predictions, best_scores, best_iteration_found), return_top_n
+        )
 
     def generate_for_binary(
         self,
@@ -328,10 +355,18 @@ class RandomSearchExplainer:
             random_seed: seed for reproducibility
             use_monte_carlo: if True, use Monte Carlo sampling for numerical features; otherwise use uniform sampling
             max_tries: maximum number of tries for rejection sampling in numerical features (only if use_monte_carlo is True)
-            return_top_n: if specified, return only the top N most preferable samples (default: return all)
+            return_top_n: if specified, return only the top N most preferable samples,
+                ordered by decreasing preference score (default: return all)
+            n_candidates_per_cf: number of valid candidates to collect per
+                counterfactual; the most preferable one is kept (default: 1)
 
         Returns:
-            list of samples and their corresponding predictions
+            tuple: ``(counterfactuals, predictions, scores, iterations)`` -- four
+            lists with one entry per counterfactual found: the feature vector,
+            the model prediction, the preference score (see
+            :meth:`calculate_preference_score`) and the iteration at which it
+            was found. Fewer than ``expected_counterfactuals`` entries are
+            returned when the search budget runs out.
         """
         self._np_rng, self._py_rng = make_rngs(random_seed)
 
@@ -416,4 +451,6 @@ class RandomSearchExplainer:
                 best_iteration_found.append(candidate_iters[best_idx])
             else:
                 logger.info(f"No valid candidates found for CF {cf_idx + 1}")
-        return best_samples, best_predictions, best_scores, best_iteration_found
+        return self._top_n(
+            (best_samples, best_predictions, best_scores, best_iteration_found), return_top_n
+        )

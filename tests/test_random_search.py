@@ -103,6 +103,19 @@ class TestGenerateRandomSamples:
         np.testing.assert_array_equal(np.random.get_state()[1], np_state)
         assert random.getstate() == py_state
 
+    def test_return_top_n_keeps_most_preferable(self, explainer):
+        _, _, scores, _ = _run(explainer, expected_counterfactuals=5)
+        top = _run(explainer, expected_counterfactuals=5, return_top_n=2)
+        assert top[2] == sorted(scores, reverse=True)[:2]
+        assert all(len(part) == 2 for part in top)
+        for cf, score in zip(top[0], top[2], strict=True):
+            assert explainer.calculate_preference_score(cf) == pytest.approx(score)
+
+    def test_more_candidates_per_counterfactual_improve_scores(self, explainer):
+        _, _, single, _ = _run(explainer, n_candidates_per_cf=1)
+        _, _, best_of_ten, _ = _run(explainer, n_candidates_per_cf=10)
+        assert np.mean(best_of_ten) > np.mean(single)
+
     def test_unreachable_target_returns_empty_results(self, explainer):
         explainer.target = 5.0
         assert _run(explainer, max_iterations=50) == ([], [], [], [])

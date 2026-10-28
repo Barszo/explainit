@@ -1,5 +1,4 @@
 import numpy as np
-import pytest
 from conftest import linear_model, mixed_model
 
 from explainit.explainers.minlp_search import MINLSearchExplainer
@@ -58,16 +57,26 @@ def test_sample_numeric_value_stays_in_bounds(numerical_priorities):
 
 def test_random_search_plot_methods(numerical_priorities, tmp_path):
     explainer = RandomSearchExplainer(linear_model, numerical_priorities, np.array([0.2, 0.4]), 0.9)
-    explainer.display_priorities(save_dir=tmp_path)
-    explainer.investigate_probability_distribution(n_samples=300, save_dir=tmp_path / "dist")
+    explainer.display_priorities(save_dir=tmp_path, show=False)
+    explainer.investigate_probability_distribution(
+        n_samples=300, save_dir=tmp_path / "dist", show=False
+    )
     assert len(_pngs(tmp_path)) == 2
     assert len(_pngs(tmp_path / "dist")) == 2
 
 
-@pytest.mark.parametrize("show", [False])
-def test_minlp_display_priorities(mixed_priorities, mixed_dataset, tmp_path, show):
+def test_random_search_plots_write_no_files_by_default(numerical_priorities, tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("matplotlib.pyplot.show", lambda *args, **kwargs: None)
+    explainer = RandomSearchExplainer(linear_model, numerical_priorities, np.array([0.2, 0.4]), 0.9)
+    explainer.display_priorities()
+    explainer.investigate_probability_distribution(n_samples=100)
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_minlp_display_priorities(mixed_priorities, mixed_dataset, tmp_path):
     explainer = MINLSearchExplainer(
         mixed_model, mixed_priorities, np.array([0.1, 0.2, 0, 1]), 1.0, mixed_dataset
     )
-    explainer.display_priorities(save_dir=tmp_path, show=show)
+    explainer.display_priorities(save_dir=tmp_path, show=False)
     assert len(_pngs(tmp_path)) == 3
