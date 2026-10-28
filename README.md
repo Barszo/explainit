@@ -23,9 +23,7 @@ explainit_project/
 ├── tests/
 ├── CONTRIBUTING.md
 ├── LICENSE
-├── requirements.txt
-├── pyproject.toml
-└── setup.py
+└── pyproject.toml
 ```
 
 ## Main components
@@ -81,7 +79,7 @@ Plotting helpers for:
 
 ## Installation
 
-Requires Python **3.13.5 or newer** and Git. Install directly from the `main`
+Requires Python **3.12 or newer** and Git. Install directly from the `main`
 branch on GitHub:
 
 ```bash
@@ -91,9 +89,7 @@ python -m pip install "git+https://github.com/Barszo/explainit_project.git@main"
 ```
 
 On Windows, activate the environment with `.venv\Scripts\activate` instead.
-NumPy, SciPy, and Matplotlib are installed automatically. You do not need
-`requirements.txt` for normal use; it is a snapshot of the broader development
-environment, including unrelated experiment and notebook dependencies.
+NumPy, SciPy, and Matplotlib are installed automatically.
 
 Use `@main`, not `@cleaned_version`: the older `cleaned_version` branch lacks
 the packaging fixes and can install without the explainer, priority, and
@@ -295,9 +291,9 @@ git clone https://github.com/Barszo/explainit_project.git
 cd explainit_project
 python -m venv .venv
 source .venv/bin/activate
-python -m pip install -e .
-python -m unittest discover -s tests
+python -m pip install -e . --group dev
+python -m pytest
 ```
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for clean-install validation before sharing a release.
-Keep the versions in `setup.py` and `explainit/__init__.py` synchronized.
+The package version is defined once, in `explainit/__init__.py`.

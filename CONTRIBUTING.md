@@ -1,6 +1,6 @@
 # Contributing
 
-The project is experimental. Use Python 3.13.5 or newer.
+The project is experimental. Use Python 3.12 or newer.
 
 ## Local development
 
@@ -9,14 +9,12 @@ git clone https://github.com/Barszo/explainit_project.git
 cd explainit_project
 python -m venv .venv
 source .venv/bin/activate
-python -m pip install -e .
-python -m unittest discover -s tests
+python -m pip install -e . --group dev
+python -m pytest
 ```
 
 On Windows, activate with `.venv\Scripts\activate`.
-The editable installation installs the library's runtime dependencies.
-`requirements.txt` is a broader development-environment snapshot, not the
-library's dependency manifest.
+The `dev` dependency group (pip 25.1+) adds pytest, Ruff, and pre-commit.
 
 ## Validate a distributable installation
 
@@ -42,8 +40,7 @@ python /absolute/path/to/explainit_project/tests/test_installation.py
 ```
 
 Use an appropriate temporary directory on Windows. Update the wheel filename
-when the version changes, and keep `setup.py` and `explainit/__init__.py`
-versions synchronized.
+when the version changes; the version is defined in `explainit/__init__.py`.
 
 ## Share via GitHub
 
