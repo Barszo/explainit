@@ -1,0 +1,43 @@
+name: Bug report
+description: Something does not work as documented.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a bug! A minimal, runnable example helps us fix it quickly.
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: What did you expect, and what happened instead?
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Minimal example
+      description: |
+        Self-contained code that reproduces the problem (a tiny model and priorities are enough).
+        Pass `random_seed` so the result is reproducible.
+      render: python
+    validations:
+      required: true
+  - type: textarea
+    id: traceback
+    attributes:
+      label: Error message or output
+      render: text
+  - type: input
+    id: version
+    attributes:
+      label: explainit version or commit
+      description: Output of `python -c "import explainit; print(explainit.__version__)"`, or the commit hash you installed.
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      description: Python version, operating system, NumPy/SciPy versions.
+      placeholder: Python 3.13, macOS 15, NumPy 2.3, SciPy 1.16

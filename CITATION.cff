@@ -1,0 +1,29 @@
+cff-version: 1.2.0
+message: "If you use explainit in your research, please cite it as below."
+title: "explainit: preference-aware counterfactual explanations"
+type: software
+authors:
+  - family-names: Szostak
+    given-names: Bartosz
+    affiliation: "University of Silesia in Katowice"
+repository-code: "https://github.com/Barszo/explainit_project"
+license: MIT
+keywords:
+  - counterfactual explanations
+  - explainable artificial intelligence
+  - algorithmic recourse
+  - user preferences
+preferred-citation:
+  type: conference-paper
+  title: "Designing Preference-Aware Counterfactual Explanations for Adaptive Information Systems"
+  authors:
+    - family-names: Szostak
+      given-names: Bartosz
+      affiliation: "University of Silesia in Katowice"
+    - family-names: Doroz
+      given-names: Rafał
+      affiliation: "University of Silesia in Katowice"
+  conference:
+    name: "Information Systems Development (ISD 2026)"
+    city: Prague
+  year: 2026

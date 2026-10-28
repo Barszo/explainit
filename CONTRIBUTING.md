@@ -1,60 +1,152 @@
-# Contributing
+# Contributing to explainit
 
-The project is experimental. Use Python 3.12 or newer.
+Thanks for your interest in explainit! Bug reports, documentation fixes,
+examples, and code are all welcome. This guide explains how to get set up and
+what we look for in a pull request.
 
-## Local development
+By participating you agree to follow our [Code of Conduct](CODE_OF_CONDUCT.md).
+
+## Ways to contribute
+
+- **Report a bug** or **suggest a feature** by
+  [opening an issue](https://github.com/Barszo/explainit_project/issues/new/choose).
+  A small, runnable example makes bugs much easier to fix.
+- **Improve the documentation**: unclear wording, missing examples, typos.
+- **Pick up an issue**: issues labelled `good first issue` are a good start.
+  Comment on the issue before starting so work isn't duplicated.
+
+For larger changes (new search methods, API changes), please open an issue to
+discuss the idea first.
+
+## Development setup
+
+You need Python 3.12 or newer and Git. Fork the repository on GitHub, then:
 
 ```bash
-git clone https://github.com/Barszo/explainit_project.git
+git clone https://github.com/<your-username>/explainit_project.git
 cd explainit_project
+```
+
+### With uv (recommended)
+
+[uv](https://docs.astral.sh/uv/) creates the environment and installs the
+package in editable mode with all development tools:
+
+```bash
+uv sync
+uv run pre-commit install
+uv run pytest
+```
+
+> [!WARNING]
+> `uv sync` makes `.venv` match the project exactly and **uninstalls anything
+> else** in it. If you keep extra packages (notebooks, experiments) in the same
+> environment, use `uv sync --inexact`, or keep them in a separate environment.
+
+### With pip
+
+pip 25.1 or newer is needed for `--group`:
+
+```bash
 python -m venv .venv
-source .venv/bin/activate
+source .venv/bin/activate        # Windows: .venv\Scripts\activate
+python -m pip install --upgrade pip
 python -m pip install -e . --group dev
-python -m pytest
+pre-commit install
+pytest
 ```
 
-On Windows, activate with `.venv\Scripts\activate`.
-The `dev` dependency group (pip 25.1+) adds pytest, Ruff, and pre-commit.
+## Everyday commands
 
-## Validate a distributable installation
+Run these from the repository root (prefix with `uv run` when using uv):
 
-An editable installation can hide missing modules in the built package.
-Before a release, build a wheel and source distribution:
+| Task | Command |
+| --- | --- |
+| Run the tests | `pytest` |
+| Run one test file or test | `pytest tests/test_random_search.py -k seed` |
+| Test coverage | `pytest --cov` |
+| Lint and format everything | `pre-commit run --all-files` |
+| Lint / format only | `ruff check --fix .` / `ruff format .` |
+| Build the package | `uv build` (or `python -m build`) |
 
-```bash
-python -m pip install build
-python -m build
-```
+`pre-commit install` runs Ruff, formatting, spelling, and file checks on
+every commit. CI runs the same hooks, so a commit that passes locally will pass
+the lint job.
 
-Create a separate virtual environment without access to the development
-environment's packages. Install the exact wheel you just built, using an
-absolute path, and run from outside this repository:
+## Making a change
 
-```bash
-python -m venv /tmp/explainit-install-check
-source /tmp/explainit-install-check/bin/activate
-cd /tmp
-python -m pip install /absolute/path/to/explainit_project/dist/explainit-0.1.0-py3-none-any.whl
-python -m pip check
-python /absolute/path/to/explainit_project/tests/test_installation.py
-```
+1. Create a branch from an up-to-date `main`, named after the change, e.g.
+   `fix/binary-threshold` or `feat/peaked-priority`.
+2. Make your change, with tests (see below).
+3. Update the documentation (`README.md`, `docs/`) if behaviour or the public
+   API changes, and add a line to the `Unreleased` section of
+   [CHANGELOG.md](CHANGELOG.md).
+4. Run `pytest` and `pre-commit run --all-files`.
+5. Push your branch and open a pull request against `main`. Fill in the
+   pull request template and link the related issue.
 
-Use an appropriate temporary directory on Windows. Update the wheel filename
-when the version changes; the version is defined in `explainit/__init__.py`.
+CI must pass before a pull request can be merged. Pull requests are usually
+squash-merged, so the pull request title becomes the commit message: make it a
+short, imperative summary (e.g. "Add peaked priority function").
 
-## Share via GitHub
+## Coding guidelines
 
-Commit and push the packaging changes before asking others to install them.
-GitHub installation reads the selected remote branch, tag, or commit, not your
-local working tree. Merge to `main` before sharing this installation command:
+- **Style** is enforced by Ruff (lint and format); configuration lives in
+  `pyproject.toml`. Don't reformat unrelated code.
+- **Tests**: every bug fix needs a test that fails without the fix; every new
+  feature needs tests for its main behaviour and edge cases. Tests use plain
+  `pytest` with `assert`. Keep them fast: use small models and datasets, and
+  pass `random_seed` so results are deterministic.
+- **Documentation examples are tests.** Every `python` code block in
+  `README.md` and `docs/*.md` is executed by `tests/test_docs.py`. If a code
+  block is directly followed by a `text` block, that text must match the
+  printed output exactly.
+- **Logging**: use `from explainit.logging_config import logger`; never `print`
+  and never configure logging handlers inside the library.
+- **Randomness**: never call `np.random.seed`, `random.seed`, or the global
+  `np.random.*` functions. Use the explainer's `self._np_rng` / `self._py_rng`,
+  created with `explainit._random.make_rngs(seed)`.
+- **Priority functions** must be vectorised (accept NumPy arrays) and return
+  values in `[0, 1]`.
+- **Plots** must not write files or open windows unless the caller asks
+  (`save_dir=...`, `show=True`).
 
-```bash
-python -m pip install "git+https://github.com/Barszo/explainit_project.git@main"
-```
+### Adding a priority function
 
-Do not direct users to the older `cleaned_version` branch: it lacks the
-packaging fixes. When testing another branch before merging, specify its ref
-explicitly and confirm that it contains all packaging files.
+1. Implement it in `explainit/priorities/` (linear or nonlinear module) with a
+   docstring describing its shape and parameters.
+2. Export it from `explainit/priorities/__init__.py` and `explainit/__init__.py`.
+3. Add it to the parameterised tests in `tests/test_priorities.py`.
+4. Add it to the priority function table in `README.md`.
 
-Once a release tag exists, users can select it instead of a moving branch.
-Keep the repository public if installation should work without authentication.
+## Public API and compatibility
+
+The public API is everything importable from `explainit`, the explainer
+classes and their public methods, the priority functions, and
+`explainit.utils.priority_plots`. `MINLPSearchExplainer.last_search_result`,
+`exemplar_source` and `exemplar_pred_distance` are also relied on by research
+code (see `LAST_SEARCH_RESULT_KEYS` in `tests/test_minlp_search.py`).
+
+explainit is pre-1.0, but we still avoid breaking users silently:
+
+- Prefer adding optional parameters over changing existing ones.
+- To rename or remove something, keep the old name working with a
+  `DeprecationWarning` for at least one release, and note it in the changelog.
+- Changes that alter the results of seeded searches must be called out in the
+  changelog, since they affect reproducibility of published experiments.
+
+## Releasing (maintainers)
+
+1. Update the version in `explainit/__init__.py` following
+   [Semantic Versioning](https://semver.org/) (pre-1.0: breaking changes bump
+   the minor version).
+2. Move the `Unreleased` changelog entries under the new version and date.
+3. Merge to `main` and wait for CI. The `package` job builds the wheel,
+   installs it in a clean environment, and runs `tests/test_installation.py`.
+4. Tag the release (`git tag v0.2.0 && git push origin v0.2.0`) and create a
+   GitHub release from the tag with the changelog entries.
+
+## Questions
+
+If something in this guide is unclear or out of date, please open an issue.
+Improving the contributor experience is a contribution too.
