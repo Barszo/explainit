@@ -197,8 +197,16 @@ target = 0.9
 
 priorities = {
     "numerical": {
-        0: {"min": 0.0, "max": 1.0, "function": lambda x: exponential(x, 0.4, 0.9, increasing=True)},
-        1: {"min": 0.0, "max": 1.0, "function": lambda x: exponential(x, 0.2, 0.8, increasing=True)},
+        0: {
+            "min": 0.0,
+            "max": 1.0,
+            "function": lambda x: exponential(x, 0.4, 0.9, increasing=True),
+        },
+        1: {
+            "min": 0.0,
+            "max": 1.0,
+            "function": lambda x: exponential(x, 0.2, 0.8, increasing=True),
+        },
     },
     "categorical": {},
 }
@@ -240,20 +248,30 @@ def model_pred(X):
     return X[:, 0] + 0.5 * X[:, 1]
 
 
-dataset = np.array([
-    [0.1, 0.2],
-    [0.3, 0.4],
-    [0.6, 0.5],
-    [0.8, 0.9],
-])
+dataset = np.array(
+    [
+        [0.1, 0.2],
+        [0.3, 0.4],
+        [0.6, 0.5],
+        [0.8, 0.9],
+    ]
+)
 
 sample = np.array([0.1, 0.2])
 target = 1.0
 
 priorities = {
     "numerical": {
-        0: {"min": 0.0, "max": 1.0, "function": lambda x: basic_linear(x, 0.2, 0.8, increasing=True)},
-        1: {"min": 0.0, "max": 1.0, "function": lambda x: basic_linear(x, 0.1, 0.7, increasing=True)},
+        0: {
+            "min": 0.0,
+            "max": 1.0,
+            "function": lambda x: basic_linear(x, 0.2, 0.8, increasing=True),
+        },
+        1: {
+            "min": 0.0,
+            "max": 1.0,
+            "function": lambda x: basic_linear(x, 0.1, 0.7, increasing=True),
+        },
     },
     "categorical": {},
 }

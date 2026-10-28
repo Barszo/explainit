@@ -10,7 +10,10 @@ import numpy as np
 # Exponential functions
 #################################
 
-def exponential(x : float, x0 : float, x1 : float, increasing : bool=True, a : float=5) -> np.ndarray:
+
+def exponential(
+    x: float, x0: float, x1: float, increasing: bool = True, a: float = 5
+) -> np.ndarray:
     """
     Exponential function from 0 to 1 (increasing) or 1 to 0 (decreasing).
     If increasing=True: 0 for x <= x0, 1 for x >= x1.
@@ -31,7 +34,8 @@ def exponential(x : float, x0 : float, x1 : float, increasing : bool=True, a : f
         val = np.zeros_like(x) if increasing else np.ones_like(x)
     return val
 
-def basic_linear_step(x : float, x0 : float, x1 : float, increasing : bool=True) -> np.ndarray:
+
+def basic_linear_step(x: float, x0: float, x1: float, increasing: bool = True) -> np.ndarray:
     """
     Linear function from 0 to 1 (increasing) or 1 to 0 (decreasing).
     If increasing=True: 0 for x <= x0, 1 for x >= x1.
