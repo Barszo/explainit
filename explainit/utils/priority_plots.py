@@ -1027,7 +1027,7 @@ def plot_categorical_priority(
                     vals = np.array([np.nan])
                 grouped.append(vals)
                 labels.append(f"{category_labels[i]}\np={weights[i]:.3f}")
-            bp = ax.boxplot(grouped, patch_artist=True, labels=labels)
+            bp = ax.boxplot(grouped, patch_artist=True, tick_labels=labels)
             for i, box in enumerate(bp["boxes"]):
                 box.set_facecolor(get_bar_color(i))
                 box.set_edgecolor(COLORS["dirty_white"])
