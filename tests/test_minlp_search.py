@@ -1,4 +1,5 @@
 import logging
+import random
 
 import numpy as np
 import pytest
@@ -133,6 +134,13 @@ class TestFindCounterfactuals:
             return explainer.find_counterfactuals(random_seed=7)
 
         np.testing.assert_allclose(run(), run())
+
+    def test_seeded_search_leaves_global_random_state_untouched(self, explainer):
+        np_state = np.random.get_state()[1].copy()
+        py_state = random.getstate()
+        explainer.find_counterfactuals(shap_approx=True, num_samples=20, random_seed=3)
+        np.testing.assert_array_equal(np.random.get_state()[1], np_state)
+        assert random.getstate() == py_state
 
     def test_approximate_shapley_values(self, explainer):
         cf = explainer.find_counterfactuals(shap_approx=True, num_samples=50, random_seed=2)

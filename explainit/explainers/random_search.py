@@ -1,15 +1,10 @@
-import random
-
 import numpy as np
 
+from explainit._random import make_rngs
 from explainit.logging_config import logger
 from explainit.utils.priority_plots import (
     plot_priorities as _plot_priorities,
-)
-from explainit.utils.priority_plots import (
     plot_probability_distributions as _plot_probability_distributions,
-)
-from explainit.utils.priority_plots import (
     sample_numeric_value as _sample_numeric_value,
 )
 
@@ -27,6 +22,7 @@ class RandomSearchExplainer:
         self.sample = sample
         self.target = target
         self.filtered_priorities = self.filter_priorities()
+        self._np_rng, self._py_rng = make_rngs(None)
 
     def filter_priorities(self):
         """
@@ -60,7 +56,7 @@ class RandomSearchExplainer:
         :func:`explainit.utils.priority_plots.sample_numeric_value` so the
         sampling logic stays in lock-step with the distribution plots.
         """
-        return _sample_numeric_value(constraint, max_tries=max_tries)
+        return _sample_numeric_value(constraint, max_tries=max_tries, rng=self._np_rng)
 
     def display_priorities(
         self, exemplar=None, *, save_dir="images", show=False, feature_names=None
@@ -224,10 +220,7 @@ class RandomSearchExplainer:
         Returns:
             list of samples and their corresponding predictions
         """
-        # Only set seed if random_seed is provided
-        if random_seed is not None:
-            np.random.seed(random_seed)
-            random.seed(random_seed)
+        self._np_rng, self._py_rng = make_rngs(random_seed)
 
         n_features = len(self.sample)
         best_samples = []
@@ -248,7 +241,7 @@ class RandomSearchExplainer:
                         sample[idx] = (
                             self.sample_numeric_value(constraint, max_tries)
                             if use_monte_carlo
-                            else np.random.uniform(constraint["min"], constraint["max"])
+                            else self._np_rng.uniform(constraint["min"], constraint["max"])
                         )
                     else:
                         sample[idx] = constraint
@@ -267,11 +260,11 @@ class RandomSearchExplainer:
                         allowed_weights = weights[allowed_mask]
                         allowed_weights = allowed_weights / allowed_weights.sum()
                         sel = allowed_combos[
-                            np.random.choice(len(allowed_combos), p=allowed_weights)
+                            self._np_rng.choice(len(allowed_combos), p=allowed_weights)
                         ]
                     else:
                         allowed_combos = [combos[j] for j in range(len(combos)) if allowed_mask[j]]
-                        sel = random.choice(allowed_combos)
+                        sel = self._py_rng.choice(allowed_combos)
                     for j, idx in enumerate(group_indices):
                         sample[idx] = sel[j]
                 try:
@@ -340,10 +333,7 @@ class RandomSearchExplainer:
         Returns:
             list of samples and their corresponding predictions
         """
-        # Only set seed if random_seed is provided
-        if random_seed is not None:
-            np.random.seed(random_seed)
-            random.seed(random_seed)
+        self._np_rng, self._py_rng = make_rngs(random_seed)
 
         n_features = len(self.sample)
         best_samples = []
@@ -364,7 +354,7 @@ class RandomSearchExplainer:
                         sample[idx] = (
                             self.sample_numeric_value(constraint, max_tries)
                             if use_monte_carlo
-                            else np.random.uniform(constraint["min"], constraint["max"])
+                            else self._np_rng.uniform(constraint["min"], constraint["max"])
                         )
                     else:
                         sample[idx] = constraint
@@ -383,11 +373,11 @@ class RandomSearchExplainer:
                         allowed_weights = weights[allowed_mask]
                         allowed_weights = allowed_weights / allowed_weights.sum()
                         sel = allowed_combos[
-                            np.random.choice(len(allowed_combos), p=allowed_weights)
+                            self._np_rng.choice(len(allowed_combos), p=allowed_weights)
                         ]
                     else:
                         allowed_combos = [combos[j] for j in range(len(combos)) if allowed_mask[j]]
-                        sel = random.choice(allowed_combos)
+                        sel = self._py_rng.choice(allowed_combos)
                     for j, idx in enumerate(group_indices):
                         sample[idx] = sel[j]
                 try:

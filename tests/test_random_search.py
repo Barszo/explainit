@@ -1,3 +1,5 @@
+import random
+
 import numpy as np
 import pytest
 from conftest import linear_model, mixed_model
@@ -93,6 +95,13 @@ class TestGenerateRandomSamples:
         second = _run(explainer, random_seed=123)
         np.testing.assert_array_equal(first[0], second[0])
         assert first[3] == second[3]
+
+    def test_seeded_search_leaves_global_random_state_untouched(self, explainer):
+        np_state = np.random.get_state()[1].copy()
+        py_state = random.getstate()
+        _run(explainer, random_seed=123)
+        np.testing.assert_array_equal(np.random.get_state()[1], np_state)
+        assert random.getstate() == py_state
 
     def test_unreachable_target_returns_empty_results(self, explainer):
         explainer.target = 5.0

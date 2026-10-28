@@ -102,12 +102,12 @@ ignore = [
 allowed-confusables = ["×"]
 
 [tool.ruff.lint.per-file-ignores]
-# Legacy global NumPy RNG; scheduled for migration to numpy.random.Generator.
-"explainit/explainers/*.py" = ["NPY002"]
-"explainit/utils/priority_plots.py" = ["NPY002"]
+# Tests inspect the legacy global NumPy random state on purpose.
+"tests/*" = ["NPY002"]
 
 [tool.ruff.lint.isort]
 known-first-party = ["explainit"]
+combine-as-imports = true
 
 [tool.coverage.run]
 source = ["explainit"]

@@ -157,32 +157,39 @@ def _bar_width_for(num_categories: int) -> float:
     return 0.8
 
 
-def sample_numeric_value(constraint: Mapping[str, Any], max_tries: int = 100) -> float:
+def sample_numeric_value(
+    constraint: Mapping[str, Any], max_tries: int = 100, rng: Any = None
+) -> float:
     """Rejection-sample a value from the [min, max] range proportional to
     ``constraint['function']`` (which must take values in [0, 1]).
 
     Falls back to a discretised inverse-transform on a 256-point grid if
     rejection sampling does not succeed within ``max_tries`` iterations.
+
+    ``rng`` is a ``numpy.random.RandomState`` (or the ``numpy.random`` module,
+    the default, which uses the global stream).
     """
+    if rng is None:
+        rng = np.random
 
     min_val = float(constraint["min"])
     max_val = float(constraint["max"])
     f = constraint["function"]
 
     for _ in range(max_tries):
-        rv = np.random.uniform(min_val, max_val)
+        rv = rng.uniform(min_val, max_val)
         w = float(np.asarray(f(rv)).squeeze())
-        if np.random.random() < w:
+        if rng.random() < w:
             return float(rv)
 
     xs = np.linspace(min_val, max_val, 256)
     ws = np.asarray(f(xs)).astype(float).ravel()
     ws = np.clip(ws, 0.0, None)
     if ws.sum() == 0 or not np.isfinite(ws).all():
-        return float(np.random.uniform(min_val, max_val))
+        return float(rng.uniform(min_val, max_val))
     p = ws / ws.sum()
-    idx = np.random.choice(len(xs), p=p)
-    jitter = (max_val - min_val) / 256 * (np.random.random() - 0.5)
+    idx = rng.choice(len(xs), p=p)
+    jitter = (max_val - min_val) / 256 * (rng.random() - 0.5)
     return float(np.clip(xs[idx] + jitter, min_val, max_val))
 
 

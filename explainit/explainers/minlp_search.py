@@ -1,19 +1,15 @@
 import copy
 import itertools
-import random
 import warnings
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from math import factorial
 from typing import Any
 
-# logger.info("This is an info message")
-# logger.debug("This is a debug message with details")
-# logger.warning("This is a warning message")
-# logger.error("This is an error message")
 import numpy as np
 from scipy.optimize import linprog, minimize
 
+from explainit._random import make_rngs
 from explainit.logging_config import logger
 from explainit.utils.priority_plots import plot_priorities as _plot_priorities
 
@@ -126,6 +122,9 @@ class MINLSearchExplainer:
         # Seed for the only stochastic part of the search (the Stage 1
         # fallback anchor); set per run by ``find_counterfactuals``.
         self._random_seed = None
+        # Random streams for the stochastic steps (see ``make_rngs``); replaced
+        # per run by ``find_counterfactuals``.
+        self._np_rng, self._py_rng = make_rngs(None)
         # Step-limiting state (Stage 4/5). ``_tr_fraction`` is the trust-region
         # radius as a fraction of each feature's allowed span; ``None`` when the
         # trust region is disabled.
@@ -667,13 +666,13 @@ class MINLSearchExplainer:
             all_subsets_with_i = []
 
             for _ in range(num_samples):
-                subset_size = random.randint(0, len(others))
+                subset_size = self._py_rng.randint(0, len(others))
                 if subset_size == 0:
                     S = set()
                 elif subset_size == len(others):
                     S = set(others)
                 else:
-                    S = set(random.sample(others, subset_size))
+                    S = set(self._py_rng.sample(others, subset_size))
 
                 all_subsets.append(S)
                 all_subsets_with_i.append(S | {i})
@@ -2050,14 +2049,14 @@ class MINLSearchExplainer:
             hi = cfg.get("max")
             if lo is None or hi is None:
                 raise Exception("Feature has no allowed region to sample from.")
-            return float(np.random.uniform(float(lo), float(hi)))
+            return float(self._np_rng.uniform(float(lo), float(hi)))
         lengths = np.array([max(0.0, float(hi) - float(lo)) for lo, hi in intervals], dtype=float)
         total = float(lengths.sum())
         if total <= 0.0:
-            lo, _hi = intervals[int(np.random.randint(len(intervals)))]
+            lo, _hi = intervals[int(self._np_rng.randint(len(intervals)))]
             return float(lo)
-        pick = intervals[int(np.random.choice(len(intervals), p=lengths / total))]
-        return float(np.random.uniform(float(pick[0]), float(pick[1])))
+        pick = intervals[int(self._np_rng.choice(len(intervals), p=lengths / total))]
+        return float(self._np_rng.uniform(float(pick[0]), float(pick[1])))
 
     def _sample_candidate_in_allowed_region(self) -> np.ndarray:
         """Assemble one random candidate inside the allowed region.
@@ -2084,7 +2083,7 @@ class MINLSearchExplainer:
                 raise Exception(
                     f"Categorical group {group} has no allowed combinations to sample from."
                 )
-            combo = allowed[int(np.random.randint(len(allowed)))]
+            combo = allowed[int(self._np_rng.randint(len(allowed)))]
             for j, idx in enumerate(group):
                 cand[idx] = float(combo[j])
         return cand
@@ -2111,7 +2110,7 @@ class MINLSearchExplainer:
             int(max_iterations),
         )
         if random_seed is not None:
-            np.random.seed(int(random_seed))
+            self._np_rng = make_rngs(random_seed)[0]
 
         for i in range(int(max_iterations)):
             cand = self._sample_candidate_in_allowed_region()
@@ -2150,7 +2149,7 @@ class MINLSearchExplainer:
         """
         self._derive_bounds_and_intervals_from_priorities()
         if random_seed is not None:
-            np.random.seed(int(random_seed))
+            self._np_rng = make_rngs(random_seed)[0]
 
         min_dist = float("inf")
         found_iter = None
@@ -2192,7 +2191,7 @@ class MINLSearchExplainer:
             int(max_iterations),
         )
         if random_seed is not None:
-            np.random.seed(int(random_seed))
+            self._np_rng = make_rngs(random_seed)[0]
 
         sample = np.asarray(self.sample_state.sample, dtype=float)
         num_priorities = self.priorities_state.numerical_priorities
@@ -2215,7 +2214,7 @@ class MINLSearchExplainer:
                     raise Exception(
                         f"Categorical group {group} has no allowed combinations to sample from."
                     )
-                combo = allowed[int(np.random.randint(len(allowed)))]
+                combo = allowed[int(self._np_rng.randint(len(allowed)))]
                 for j, idx in enumerate(group):
                     cand[idx] = float(combo[j])
             pred = float(np.asarray(self.model_pred(cand.reshape(1, -1))).reshape(-1)[0])
@@ -2957,10 +2956,11 @@ class MINLSearchExplainer:
                 sweep (:meth:`_peak_lock_in`) on the feasible incumbent
                 before returning.
             peak_lock_in_max_sweeps: Maximum number of Stage 7 sweeps.
-            random_seed: Seeds the Stage 1 fallback anchor, the only
-                stochastic step of the search (approximate Shapley subset
-                sampling draws from the same global stream). Pass an int
-                for a reproducible run.
+            random_seed: Seeds the stochastic steps of the search (the
+                Stage 1 fallback anchor and approximate Shapley subset
+                sampling). Pass an int for a reproducible run; the global
+                NumPy and ``random`` state is left untouched. With ``None``
+                the global random streams are used.
             trust_region: If True (default) each pass may only move a
                 feature by a fraction of its allowed span, so SLSQP stays
                 where the Shapley-linear surrogate is accurate. The radius
@@ -3018,9 +3018,7 @@ class MINLSearchExplainer:
         self._priority_peaks_cache = None
         self._fallback_random_max_iterations = int(fallback_random_max_iterations)
         self._random_seed = None if random_seed is None else int(random_seed)
-        if self._random_seed is not None:
-            np.random.seed(self._random_seed)
-            random.seed(self._random_seed)
+        self._np_rng, self._py_rng = make_rngs(self._random_seed)
         self._tr_fraction = float(trust_region_init) if trust_region else None
         self._tr_min = float(trust_region_min)
         self._tr_max = float(trust_region_max)

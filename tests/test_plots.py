@@ -49,9 +49,9 @@ def test_plot_probability_distributions(mixed_priorities, tmp_path):
 
 
 def test_sample_numeric_value_stays_in_bounds(numerical_priorities):
-    np.random.seed(0)  # noqa: NPY002 - sampler still uses the global RNG
+    rng = np.random.RandomState(0)
     constraint = numerical_priorities["numerical"][0]
-    values = [priority_plots.sample_numeric_value(constraint) for _ in range(200)]
+    values = [priority_plots.sample_numeric_value(constraint, rng=rng) for _ in range(200)]
     assert all(0.0 <= v <= 1.0 for v in values)
     assert np.mean(values) > 0.5  # increasing priority favours high values
 
