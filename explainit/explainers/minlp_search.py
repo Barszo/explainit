@@ -81,7 +81,7 @@ class PrioritiesState:
         return non_actionable
 
 
-class MINLSearchExplainer:
+class MINLPSearchExplainer:
     def __init__(
         self,
         model_pred,
@@ -231,7 +231,7 @@ class MINLSearchExplainer:
     def _project_to_allowed_intervals(value: float, intervals: list) -> float:
         if not intervals:
             return value
-        if MINLSearchExplainer._in_allowed_intervals(value, intervals):
+        if MINLPSearchExplainer._in_allowed_intervals(value, intervals):
             return value
         candidates = []
         for lo, hi in intervals:
@@ -380,7 +380,7 @@ class MINLSearchExplainer:
                       no samples satisfy the specified priority constraints.
 
         Example:
-            >>> explainer = MINLSearchExplainer(...)
+            >>> explainer = MINLPSearchExplainer(...)
             >>> filtered_data = explainer.get_rows_in_priorities()
             >>> print(f"Dataset reduced from {explainer.dataset.shape[0]} to {filtered_data.shape[0]} samples")
 
@@ -822,7 +822,7 @@ class MINLSearchExplainer:
             logger.info(f"Validating combination {combination_id} with target {target}")
 
             # Try to solve with adjusted bounds
-            linear_solution = MINLSearchExplainer.solve_linear_constraint_lp(
+            linear_solution = MINLPSearchExplainer.solve_linear_constraint_lp(
                 coeff_to_linear_search,
                 target,
                 adjusted_bounds,
@@ -1285,7 +1285,7 @@ class MINLSearchExplainer:
                 continue
 
         # If no method worked, try corner analysis
-        return MINLSearchExplainer._fallback_corner_analysis(
+        return MINLPSearchExplainer._fallback_corner_analysis(
             coefficients, target, bounds, tolerance
         )
 
@@ -1693,7 +1693,7 @@ class MINLSearchExplainer:
             for idx, val in temp_combo.items():
                 dummy_x[idx] = val
 
-            linear_solution = MINLSearchExplainer.solve_linear_constraint_lp(
+            linear_solution = MINLPSearchExplainer.solve_linear_constraint_lp(
                 coeff_to_linear_search,
                 temp_target,
                 bounds_for_linear_search,
@@ -3626,3 +3626,15 @@ class MINLSearchExplainer:
             save_dir=save_dir,
             show=show,
         )
+
+
+def __getattr__(name):
+    if name == "MINLSearchExplainer":
+        warnings.warn(
+            "MINLSearchExplainer was renamed to MINLPSearchExplainer and will be "
+            "removed in a future release.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return MINLPSearchExplainer
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

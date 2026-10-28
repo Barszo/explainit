@@ -3,7 +3,7 @@
 Centralises the matplotlib code that used to live in
 ``RandomSearchExplainer.display_priorities`` /
 ``RandomSearchExplainer.investigate_probability_distribution`` and
-``MINLSearchExplainer.display_priorities``.
+``MINLPSearchExplainer.display_priorities``.
 
 Public entry points
 -------------------

@@ -1,7 +1,7 @@
 import numpy as np
 from conftest import linear_model, mixed_model
 
-from explainit.explainers.minlp_search import MINLSearchExplainer
+from explainit.explainers.minlp_search import MINLPSearchExplainer
 from explainit.explainers.random_search import RandomSearchExplainer
 from explainit.utils import priority_plots
 
@@ -75,7 +75,7 @@ def test_random_search_plots_write_no_files_by_default(numerical_priorities, tmp
 
 
 def test_minlp_display_priorities(mixed_priorities, mixed_dataset, tmp_path):
-    explainer = MINLSearchExplainer(
+    explainer = MINLPSearchExplainer(
         mixed_model, mixed_priorities, np.array([0.1, 0.2, 0, 1]), 1.0, mixed_dataset
     )
     explainer.display_priorities(save_dir=tmp_path, show=False)

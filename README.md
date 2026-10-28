@@ -44,7 +44,7 @@ Current capabilities:
 - provides per-feature preference breakdowns
 - can visualize priorities and sampling distributions
 
-#### `MINLSearchExplainer`
+#### `MINLPSearchExplainer`
 
 Defined in `explainit/explainers/minlp_search.py`.
 
@@ -116,7 +116,7 @@ Verify the installed package from outside an ExplainIt repository checkout,
 so local source files cannot hide installation problems:
 
 ```bash
-python -c "import explainit; print(explainit.__file__); from explainit.explainers.random_search import RandomSearchExplainer; from explainit.explainers.minlp_search import MINLSearchExplainer; print('Imports OK')"
+python -c "import explainit; print(explainit.__file__); from explainit.explainers.random_search import RandomSearchExplainer; from explainit.explainers.minlp_search import MINLPSearchExplainer; print('Imports OK')"
 python -m pip check
 ```
 
@@ -239,7 +239,7 @@ Useful methods:
 ```python
 import numpy as np
 
-from explainit.explainers.minlp_search import MINLSearchExplainer
+from explainit.explainers.minlp_search import MINLPSearchExplainer
 from explainit.priorities.linear import basic_linear
 
 
@@ -276,7 +276,7 @@ priorities = {
     "categorical": {},
 }
 
-explainer = MINLSearchExplainer(
+explainer = MINLPSearchExplainer(
     model_pred=model_pred,
     priorities=priorities,
     sample=sample,

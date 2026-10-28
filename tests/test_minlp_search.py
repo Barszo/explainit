@@ -5,7 +5,7 @@ import numpy as np
 import pytest
 from conftest import mixed_model
 
-from explainit.explainers.minlp_search import MINLSearchExplainer, PrioritiesState
+from explainit.explainers.minlp_search import MINLPSearchExplainer, PrioritiesState
 
 SAMPLE = np.array([0.1, 0.2, 0.0, 1.0])
 TARGET = 1.0
@@ -32,7 +32,7 @@ EXEMPLAR_SOURCES = {"dataset_priority_filtered", "dataset_actionable", "random_i
 
 @pytest.fixture
 def explainer(mixed_priorities, mixed_dataset):
-    return MINLSearchExplainer(mixed_model, mixed_priorities, SAMPLE, TARGET, mixed_dataset)
+    return MINLPSearchExplainer(mixed_model, mixed_priorities, SAMPLE, TARGET, mixed_dataset)
 
 
 class TestPrioritiesState:
@@ -60,28 +60,28 @@ class TestIntervalHelpers:
         ("value", "expected"), [(0.1, True), (0.5, True), (0.3, False), (0.9, False)]
     )
     def test_in_allowed_intervals(self, value, expected):
-        assert MINLSearchExplainer._in_allowed_intervals(value, self.INTERVALS) is expected
+        assert MINLPSearchExplainer._in_allowed_intervals(value, self.INTERVALS) is expected
 
     def test_empty_intervals_allow_nothing(self):
-        assert MINLSearchExplainer._in_allowed_intervals(0.1, []) is False
+        assert MINLPSearchExplainer._in_allowed_intervals(0.1, []) is False
 
     @pytest.mark.parametrize(
         ("value", "expected"), [(0.1, 0.1), (0.3, 0.2), (0.4, 0.5), (1.0, 0.8)]
     )
     def test_project_to_nearest_allowed_value(self, value, expected):
-        projected = MINLSearchExplainer._project_to_allowed_intervals(value, self.INTERVALS)
+        projected = MINLPSearchExplainer._project_to_allowed_intervals(value, self.INTERVALS)
         assert projected == pytest.approx(expected)
 
     def test_extract_positive_intervals(self):
         x = np.linspace(0.0, 1.0, 11)
         y = np.where((x < 0.25) | ((x > 0.55) & (x < 0.85)), 1.0, 0.0)
-        intervals = MINLSearchExplainer._extract_positive_intervals(x, y)
+        intervals = MINLPSearchExplainer._extract_positive_intervals(x, y)
         np.testing.assert_allclose(intervals, [(0.0, 0.2), (0.6, 0.8)])
 
 
 class TestLinearProgram:
     def test_finds_point_on_hyperplane_within_bounds(self):
-        result = MINLSearchExplainer.solve_linear_constraint_lp(
+        result = MINLPSearchExplainer.solve_linear_constraint_lp(
             [1.0, 2.0], 1.5, [(0.0, 1.0), (0.0, 1.0)]
         )
         assert result["success"]
@@ -90,22 +90,22 @@ class TestLinearProgram:
         assert np.all((x >= 0.0) & (x <= 1.0))
 
     def test_infeasible_target_fails(self):
-        result = MINLSearchExplainer.solve_linear_constraint_lp(
+        result = MINLPSearchExplainer.solve_linear_constraint_lp(
             [1.0, 1.0], 5.0, [(0.0, 1.0), (0.0, 1.0)]
         )
         assert not result["success"]
         assert result["solution"] is None
 
     def test_mismatched_bounds_are_rejected(self):
-        result = MINLSearchExplainer.solve_linear_constraint_lp([1.0, 1.0], 1.0, [(0.0, 1.0)])
+        result = MINLPSearchExplainer.solve_linear_constraint_lp([1.0, 1.0], 1.0, [(0.0, 1.0)])
         assert not result["success"]
 
     def test_all_zero_coefficients(self):
         bounds = [(0.0, 1.0), (2.0, 4.0)]
-        ok = MINLSearchExplainer.solve_linear_constraint_lp([0.0, 0.0], 0.0, bounds)
+        ok = MINLPSearchExplainer.solve_linear_constraint_lp([0.0, 0.0], 0.0, bounds)
         assert ok["success"]
         np.testing.assert_allclose(ok["solution"], [0.5, 3.0])
-        assert not MINLSearchExplainer.solve_linear_constraint_lp([0.0, 0.0], 1.0, bounds)[
+        assert not MINLPSearchExplainer.solve_linear_constraint_lp([0.0, 0.0], 1.0, bounds)[
             "success"
         ]
 
@@ -128,7 +128,7 @@ class TestFindCounterfactuals:
 
     def test_seed_makes_search_reproducible(self, mixed_priorities, mixed_dataset):
         def run():
-            explainer = MINLSearchExplainer(
+            explainer = MINLPSearchExplainer(
                 mixed_model, mixed_priorities, SAMPLE, TARGET, mixed_dataset
             )
             return explainer.find_counterfactuals(random_seed=7)
@@ -160,7 +160,7 @@ class TestFindCounterfactuals:
 
     def test_workflow_logger_receives_progress(self, mixed_priorities, mixed_dataset, caplog):
         workflow_logger = logging.getLogger("tests.workflow")
-        explainer = MINLSearchExplainer(
+        explainer = MINLPSearchExplainer(
             mixed_model,
             mixed_priorities,
             SAMPLE,
@@ -174,7 +174,7 @@ class TestFindCounterfactuals:
         assert any(r.name == "tests.workflow" for r in caplog.records)
 
     def test_unreachable_target_raises(self, mixed_priorities, mixed_dataset):
-        explainer = MINLSearchExplainer(mixed_model, mixed_priorities, SAMPLE, 5.0, mixed_dataset)
+        explainer = MINLPSearchExplainer(mixed_model, mixed_priorities, SAMPLE, 5.0, mixed_dataset)
         explainer._fallback_random_max_iterations = 200
         with pytest.raises(Exception, match="Could not randomly generate"):
             explainer.find_counterfactuals(random_seed=1, return_when_fails=False)
@@ -186,7 +186,7 @@ class TestFindCounterfactuals:
     )
     def test_non_actionable_feature_is_unchanged(self, mixed_priorities, mixed_dataset):
         mixed_priorities["numerical"][1] = {"min": 0.2, "max": 0.2, "function": None}
-        explainer = MINLSearchExplainer(mixed_model, mixed_priorities, SAMPLE, 0.8, mixed_dataset)
+        explainer = MINLPSearchExplainer(mixed_model, mixed_priorities, SAMPLE, 0.8, mixed_dataset)
         cf = explainer.find_counterfactuals(random_seed=1)
         assert cf[1] == pytest.approx(SAMPLE[1])
 
@@ -197,7 +197,9 @@ class TestFindCounterfactualsForBinary:
         return 1.0 / (1.0 + np.exp(-4.0 * (mixed_model(X) - 0.9)))
 
     def test_counterfactuals_cross_threshold(self, mixed_priorities, mixed_dataset):
-        explainer = MINLSearchExplainer(self.classifier, mixed_priorities, SAMPLE, 1, mixed_dataset)
+        explainer = MINLPSearchExplainer(
+            self.classifier, mixed_priorities, SAMPLE, 1, mixed_dataset
+        )
         cfs, preds, scores, counts = explainer.find_counterfactuals_for_binary(
             target_class=1, threshold=0.5
         )

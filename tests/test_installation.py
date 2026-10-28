@@ -83,3 +83,30 @@ def test_import_does_not_configure_logging():
         "assert root.level == logging.WARNING, root.level"
     )
     subprocess.run([sys.executable, "-c", code], check=True)
+
+
+def test_top_level_exports():
+    from explainit.explainers.minlp_search import MINLPSearchExplainer
+    from explainit.priorities.linear import basic_linear
+
+    assert explainit.MINLPSearchExplainer is MINLPSearchExplainer
+    assert explainit.RandomSearchExplainer is RandomSearchExplainer
+    assert explainit.basic_linear is basic_linear
+    assert explainit.exponential is exponential
+    for name in explainit.__all__:
+        assert hasattr(explainit, name)
+
+
+@pytest.mark.parametrize("module", ["explainit.explainers.minlp_search", "explainit.explainers"])
+def test_old_minlp_name_is_deprecated_alias(module):
+    mod = importlib.import_module(module)
+    with pytest.warns(DeprecationWarning, match="MINLPSearchExplainer"):
+        old = mod.MINLSearchExplainer
+    assert old is explainit.MINLPSearchExplainer
+
+
+def test_unknown_attribute_raises():
+    from explainit.explainers import minlp_search
+
+    with pytest.raises(AttributeError):
+        minlp_search.does_not_exist  # noqa: B018
