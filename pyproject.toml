@@ -32,8 +32,8 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 dependencies = [
-    "numpy>=1.26",
-    "scipy>=1.11",
+    "numpy>=2.0",
+    "scipy>=1.13",
     "matplotlib>=3.9",
 ]
 
@@ -68,7 +68,11 @@ minversion = "8"
 testpaths = ["tests"]
 addopts = ["-ra", "--strict-markers", "--strict-config"]
 xfail_strict = true
-filterwarnings = ["error"]
+filterwarnings = [
+    "error",
+    # Old Matplotlib releases call pyparsing APIs that newer pyparsing deprecates.
+    "ignore:'\\w+' deprecated - use '\\w+':DeprecationWarning",
+]
 log_level = "INFO"
 
 [tool.ruff]
