@@ -1,11 +1,14 @@
+"""Package logger.
+
+explainit never configures logging output itself. Applications decide what to
+show, for example::
+
+    import logging
+
+    logging.basicConfig(level=logging.INFO)  # show the search progress
+"""
+
 import logging
 
-logging.basicConfig(
-    level=logging.DEBUG,  # Use DEBUG for development
-    format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
-)
-
-# Suppress verbose matplotlib font manager logs
-logging.getLogger("matplotlib.font_manager").setLevel(logging.WARNING)
-
 logger = logging.getLogger("explainit")
+logger.addHandler(logging.NullHandler())

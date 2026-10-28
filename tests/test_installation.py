@@ -1,6 +1,8 @@
 """Smoke tests that also run against an installed wheel outside the checkout."""
 
 import importlib
+import subprocess
+import sys
 from importlib.metadata import version
 
 import numpy as np
@@ -71,3 +73,13 @@ def test_readme_random_search_example():
     assert np.all((np.asarray(scores) >= 0) & (np.asarray(scores) <= 2))
     assert len(iterations) == 3
     assert np.all((np.asarray(iterations) > 0) & (np.asarray(iterations) <= 5000))
+
+
+def test_import_does_not_configure_logging():
+    code = (
+        "import logging, explainit; "
+        "root = logging.getLogger(); "
+        "assert not root.handlers, root.handlers; "
+        "assert root.level == logging.WARNING, root.level"
+    )
+    subprocess.run([sys.executable, "-c", code], check=True)
