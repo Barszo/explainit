@@ -131,7 +131,7 @@ Both explainers expect a priorities dictionary with `numerical` and `categorical
 
 Each actionable numerical feature is typically defined as:
 
-```python
+```text
 {
     feature_index: {
         "min": lower_bound,
