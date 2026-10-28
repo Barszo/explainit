@@ -88,16 +88,17 @@ explainer = MINLPSearchExplainer(model, priorities, np.array([0.1, 0.2]), 1.0, d
 explainer.find_counterfactuals(random_seed=0)
 
 result = explainer.last_search_result
-print(result["reached_target"], result["stop_reason"], explainer.exemplar_source)
+print(result["reached_target"], result["distance"] <= explainer.epsilon)
 ```
 
 ```text
-True target_reached dataset_priority_filtered
+True True
 ```
 
-Useful keys include `distance` (to the target), `iterations_run`,
+Useful keys include `stop_reason`, `distance` (to the target), `iterations_run`,
 `cf_source` (`anchor` or `optimiser`), `priority_score`, `history` (one entry
-per pass) and `step_control` (trust-region statistics).
+per pass) and `step_control` (trust-region statistics). The anchor's origin
+is in `explainer.exemplar_source`.
 
 ## Reproducibility
 
