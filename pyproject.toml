@@ -71,6 +71,38 @@ xfail_strict = true
 filterwarnings = ["error"]
 log_level = "INFO"
 
+[tool.ruff]
+line-length = 100
+extend-exclude = ["trash", "dev"]
+
+[tool.ruff.lint]
+select = [
+    "E", "W",  # pycodestyle
+    "F",       # Pyflakes
+    "I",       # isort
+    "B",       # flake8-bugbear
+    "UP",      # pyupgrade
+    "NPY",     # NumPy-specific rules
+    "RUF",     # Ruff-specific rules
+    "SIM",     # flake8-simplify
+    "C4",      # flake8-comprehensions
+    "PIE",     # flake8-pie
+    "PGH",     # pygrep-hooks
+    "PT",      # flake8-pytest-style
+    "T20",     # flake8-print
+]
+ignore = [
+    "E501",    # long lines are handled by the formatter where possible
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Legacy global NumPy RNG; scheduled for migration to numpy.random.Generator.
+"explainit/explainers/*.py" = ["NPY002"]
+"explainit/utils/priority_plots.py" = ["NPY002"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["explainit"]
+
 [tool.coverage.run]
 source = ["explainit"]
 branch = true
