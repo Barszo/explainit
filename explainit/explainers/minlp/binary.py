@@ -3,7 +3,7 @@
 An older, simpler pipeline than the regression search: for each categorical
 combination, SLSQP maximises the priority benefit subject to the real
 model's probability being on the requested side of the threshold. See known
-issues MINLP-4 to MINLP-6.
+issue MINLP-5.
 """
 
 import traceback

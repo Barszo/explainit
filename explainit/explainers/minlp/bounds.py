@@ -21,7 +21,8 @@ def derive_bounds_and_intervals(
 
     The allowed region is where the priority function is positive within the
     dataset's range. Immutable features are fixed at their configured value.
-    The configs are modified in place (see known issues MINLP-1 and MINLP-2).
+    The configs are modified in place; :class:`MINLPSearchExplainer` passes a
+    copy for every search (see known issue MINLP-1).
 
     Raises:
         ValueError: If a feature has no positive-priority region.
