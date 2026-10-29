@@ -12,6 +12,7 @@ from explainit.explainers.minlp.anchor import (
 from explainit.explainers.minlp.binary import rank, search_combinations
 from explainit.explainers.minlp.bounds import TrustRegion, derive_bounds_and_intervals
 from explainit.explainers.minlp.combinations import limit_combinations
+from explainit.explainers.minlp.incumbent import Incumbents
 from explainit.explainers.minlp.intervals import (
     clip_to_allowed,
 )
@@ -796,67 +797,39 @@ class MINLPSearchExplainer:
         )
         logger.info("=" * 78)
 
-        self.exemplar_source = None
-        self.exemplar_pred_distance = None
-        self._warm_start_info = None
-        self._last_search_exception = None
-        self._priority_peaks_cache = None
-        self._fallback_random_max_iterations = int(fallback_random_max_iterations)
-        self._random_seed = None if random_seed is None else int(random_seed)
-        self._np_rng, self._py_rng = make_rngs(self._random_seed)
-        self._trust_region = TrustRegion(
-            fraction=float(trust_region_init) if trust_region else None,
-            minimum=float(trust_region_min),
-            maximum=float(trust_region_max),
+        self._start_run(
+            fallback_random_max_iterations=fallback_random_max_iterations,
+            random_seed=random_seed,
+            trust_region=trust_region,
+            trust_region_init=trust_region_init,
+            trust_region_min=trust_region_min,
+            trust_region_max=trust_region_max,
+            residual_correction=residual_correction,
+            restoration=restoration,
         )
-        self._target_correction = 0.0
-        self._residual_correction_enabled = bool(residual_correction)
-        self._restoration_enabled = bool(restoration)
-        self._last_shapley_sample = None
-        self._pass_targets = {}
 
-        # Stage 0: infer bounds directly from priority functions.
+        # Stage 0, then the anchor stages 1-2, which run once per search.
         self._derive_bounds_and_intervals_from_priorities()
-
-        # Stages 1 and 2 are anchor stages: they only depend on the
-        # original sample/exemplar/priorities, so we run them exactly once.
         self._stage1_find_exemplar()
         log_bounds(self.priorities_state)
         self._log_workflow_initial_and_bounds()
 
         original_sample = list(self.sample_state.sample)
-        # Keep the selected exemplar as a valid fallback when it already lies
-        # within the final target band. This matters for generated in-range
-        # anchors: if later surrogate optimisation fails or drifts, returning a
-        # valid in-range anchor is better than reporting no CF.
-        anchor_cf = list(np.asarray(self.sample_state.target_exemplar, dtype=float))
-        anchor_pred = float(np.asarray(self.model_pred([anchor_cf])).reshape(-1)[0])
-        anchor_distance = abs(anchor_pred - float(self.target))
-        anchor_priority = self._priority_benefit(anchor_cf)
-
-        best_feasible = None
-        best_feasible_priority = float("-inf")
-        best_feasible_distance = float("inf")
-        best_feasible_source = None
-        best_infeasible = None
-        best_infeasible_distance = float("inf")
-
-        if anchor_distance <= float(self.epsilon):
-            best_feasible = anchor_cf
-            best_feasible_priority = (
-                anchor_priority if anchor_priority is not None else float("-inf")
-            )
-            best_feasible_distance = anchor_distance
-            best_feasible_source = "anchor"
+        anchor = self._evaluate_anchor()
+        incumbents = Incumbents()
+        if anchor["distance"] <= float(self.epsilon):
+            # A valid anchor is a fallback answer until the optimiser beats it.
+            incumbents.set_anchor(anchor["cf"], anchor["priority"], anchor["distance"])
             logger.info(
                 "Initial exemplar is already a valid fallback CF: "
                 "model_pred=%.4f | distance=%.4f | priority=%s. It is only "
                 "kept as the incumbent until an SLSQP candidate beats its "
                 "priority benefit.",
-                anchor_pred,
-                anchor_distance,
-                anchor_priority,
+                anchor["prediction"],
+                anchor["distance"],
+                anchor["priority"],
             )
+
         no_progress = 0
         history = []
         stop_reason = "max_iterations"
@@ -878,101 +851,12 @@ class MINLPSearchExplainer:
                 self._last_search_exception = str(exc)
                 break
 
-            eval_info = evaluate_candidate(self._refinement_context(), cf)
-            if not eval_info["feasible"] and self._restoration_enabled:
-                restored_cf, restored_eval = restore_to_band(
-                    self._refinement_context(), cf, eval_info
-                )
-                if restored_cf is not None:
-                    cf, eval_info = restored_cf, restored_eval
-                    restoration_hits += 1
-            priority = eval_info["priority"]
-            improved = False
-            # Surrogate agreement over this step: both models share the value
-            # ``basic_prediction`` at the current iterate, so no extra model
-            # call is needed to compare their predicted changes.
-            anchor_value = float(self.basic_prediction)
-            surrogate_change = float(eval_info["h_x"]) - anchor_value
-            model_change = float(eval_info["model_pred"]) - anchor_value
-            rho = model_change / surrogate_change if abs(surrogate_change) > 1e-12 else float("nan")
-            residual = float(eval_info["model_pred"]) - float(eval_info["h_x"])
-            # A step is worth taking when it lands in the band or simply gets
-            # closer to the target than the point it started from.
-            iterate_distance = abs(anchor_value - float(self.target))
-            accepted = bool(
-                eval_info["feasible"] or eval_info["distance"] < iterate_distance - 1e-12
-            )
-
-            if eval_info["feasible"]:
-                # Inside the band: rank on the priority benefit only.
-                if best_feasible is None or (
-                    priority is not None and priority > best_feasible_priority
-                ):
-                    best_feasible = list(cf)
-                    best_feasible_priority = priority if priority is not None else float("-inf")
-                    best_feasible_distance = eval_info["distance"]
-                    best_feasible_source = "optimiser"
-                    improved = True
-            elif best_feasible is None and eval_info["distance"] < best_infeasible_distance:
-                # No candidate inside the band yet: rank on distance to target.
-                best_infeasible = list(cf)
-                best_infeasible_distance = eval_info["distance"]
-                improved = True
-
-            best_priority_so_far = (
-                f"{best_feasible_priority:.4f}"
-                if best_feasible_priority != float("-inf")
-                else "n/a"
-            )
-            best_distance_so_far = (
-                f"{best_feasible_distance:.4f}"
-                if best_feasible is not None
-                else (
-                    f"{best_infeasible_distance:.4f}"
-                    if best_infeasible_distance != float("inf")
-                    else "n/a"
-                )
-            )
-            logger.info(
-                "[Iter %d] model_pred(cf)=%.4f | h(x)=%.4f | distance=%.4f | "
-                "feasible=%s | priority=%s | best_priority=%s | "
-                "best_distance=%s | improved_vs_best=%s | rho=%.3f | "
-                "residual=%.4f | trust=%s",
-                iteration + 1,
-                eval_info["model_pred"],
-                eval_info["h_x"],
-                eval_info["distance"],
-                eval_info["feasible"],
-                f"{priority:.4f}" if priority is not None else "n/a",
-                best_priority_so_far,
-                best_distance_so_far,
-                improved,
-                rho,
-                residual,
-                f"{self._trust_region.fraction:.3f}"
-                if self._trust_region.fraction is not None
-                else "off",
-            )
-
-            if accepted:
-                self._target_correction = 0.0
-                if (
-                    self._trust_region.fraction is not None
-                    and np.isfinite(rho)
-                    and 0.5 <= rho <= 1.5
-                ):
-                    self._trust_region.grow()
-            else:
-                if self._residual_correction_enabled:
-                    self._target_correction = residual
-                    logger.info(
-                        "[Iter %d] Residual correction: surrogate now aims at "
-                        "%.4f so the model lands on %.4f.",
-                        iteration + 1,
-                        self._effective_target(),
-                        float(self.target),
-                    )
-                self._trust_region.shrink()
+            cf, evaluation, restored = self._evaluate_with_restoration(cf)
+            restoration_hits += restored
+            accepted, rho, residual = self._step_quality(evaluation)
+            improved = incumbents.offer(cf, evaluation)
+            self._log_iteration(iteration, evaluation, incumbents, improved, rho, residual)
+            self._update_step_control(iteration, accepted, rho, residual)
 
             # An accepted step is progress even when it does not yet beat the
             # incumbent: the trust-region walk needs several passes to cross
@@ -991,11 +875,11 @@ class MINLPSearchExplainer:
             history.append(
                 {
                     "iteration": iteration + 1,
-                    "model_pred": eval_info["model_pred"],
-                    "h_x": eval_info["h_x"],
-                    "distance": eval_info["distance"],
-                    "feasible": eval_info["feasible"],
-                    "priority": priority,
+                    "model_pred": evaluation["model_pred"],
+                    "h_x": evaluation["h_x"],
+                    "distance": evaluation["distance"],
+                    "feasible": evaluation["feasible"],
+                    "priority": evaluation["priority"],
                     "improved_vs_best": improved,
                     "accepted_step": accepted,
                     "rho": (float(rho) if np.isfinite(rho) else None),
@@ -1009,34 +893,14 @@ class MINLPSearchExplainer:
                 logger.info(
                     "Stopping: %d consecutive iterations without improving the %s incumbent.",
                     int(patience),
-                    "priority" if best_feasible is not None else "distance",
+                    "priority" if incumbents.reached_target else "distance",
                 )
                 stop_reason = (
-                    "priority_stagnation" if best_feasible is not None else "patience_exhausted"
+                    "priority_stagnation" if incumbents.reached_target else "patience_exhausted"
                 )
                 break
 
-            # Advance only on an accepted (in-band) step, so the surrogate is
-            # always re-linearised at a point the true model agrees with. With
-            # both step controls off, keep the historical behaviour of moving
-            # to every candidate.
-            step_control = (
-                self._trust_region.fraction is not None
-            ) or self._residual_correction_enabled
-            if accepted or not step_control:
-                self.sample_state.sample = list(cf)
-                logger.info(
-                    "[Iter %d] Advancing: next iteration's sample = current CF.", iteration + 1
-                )
-            else:
-                logger.info(
-                    "[Iter %d] Step rejected (|f - target|=%.4f > epsilon=%.4f); "
-                    "keeping the current iterate and retrying with a smaller "
-                    "step / corrected target.",
-                    iteration + 1,
-                    eval_info["distance"],
-                    float(self.epsilon),
-                )
+            self._advance(iteration, cf, evaluation, accepted)
 
         # Restore the original sample so explainer state stays consistent
         # for any caller that inspects sample_state after the search.
@@ -1044,43 +908,35 @@ class MINLPSearchExplainer:
         self._workflow_iteration = None
 
         peak_info = None
-        if peak_lock_in and best_feasible is not None:
-            improved_cf, peak_info = lock_in_priority_peaks(
-                self._refinement_context(), best_feasible, max_sweeps=int(peak_lock_in_max_sweeps)
-            )
-            if peak_info["accepted_moves"] > 0:
-                best_feasible = improved_cf
-                best_feasible_priority = float(peak_info["priority_after"])
-                best_feasible_distance = abs(
-                    float(peak_info["final_prediction"]) - float(self.target)
-                )
-                best_feasible_source = f"{best_feasible_source}+peak_lock_in"
+        if peak_lock_in and incumbents.reached_target:
+            peak_info = self._apply_peak_lock_in(incumbents, peak_lock_in_max_sweeps)
 
-        reached = best_feasible is not None
-        if reached:
-            best_cf = best_feasible
-            best_distance = best_feasible_distance
+        if incumbents.reached_target:
+            best_cf = incumbents.feasible
+            best_distance = incumbents.feasible_distance
             best_priority = (
-                best_feasible_priority if best_feasible_priority != float("-inf") else None
+                incumbents.feasible_priority
+                if incumbents.feasible_priority != float("-inf")
+                else None
             )
-            cf_source = best_feasible_source
+            cf_source = incumbents.feasible_source
             if stop_reason == "max_iterations":
                 stop_reason = "target_reached"
         else:
-            best_cf = best_infeasible
-            best_distance = best_infeasible_distance
+            best_cf = incumbents.infeasible
+            best_distance = incumbents.infeasible_distance
             best_priority = self._priority_benefit(best_cf) if best_cf is not None else None
             cf_source = "optimiser" if best_cf is not None else None
 
         # The anchor is a priority-agnostic in-range point, so a run that
         # returns it must not be credited with a priority gain.
-        if cf_source == "anchor" or best_priority is None or anchor_priority is None:
+        if cf_source == "anchor" or best_priority is None or anchor["priority"] is None:
             priority_gain_vs_anchor = 0.0 if cf_source == "anchor" else None
         else:
-            priority_gain_vs_anchor = float(best_priority) - float(anchor_priority)
+            priority_gain_vs_anchor = float(best_priority) - float(anchor["priority"])
 
         self.last_search_result = {
-            "reached_target": reached,
+            "reached_target": incumbents.reached_target,
             "distance": best_distance,
             "iterations_run": len(history),
             "stop_reason": stop_reason,
@@ -1092,8 +948,8 @@ class MINLPSearchExplainer:
             "search_exception": self._last_search_exception,
             "cf_source": cf_source,
             "priority_score": best_priority,
-            "anchor_priority_score": anchor_priority,
-            "anchor_distance": anchor_distance,
+            "anchor_priority_score": anchor["priority"],
+            "anchor_distance": anchor["distance"],
             "priority_gain_vs_anchor": priority_gain_vs_anchor,
             "peak_lock_in": peak_info,
             "step_control": {
@@ -1105,32 +961,188 @@ class MINLPSearchExplainer:
                 "restoration_hits": int(restoration_hits),
             },
         }
+        self._log_search_done()
+        return self._final_answer(return_when_fails)
 
+    def _start_run(
+        self,
+        *,
+        fallback_random_max_iterations,
+        random_seed,
+        trust_region,
+        trust_region_init,
+        trust_region_min,
+        trust_region_max,
+        residual_correction,
+        restoration,
+    ):
+        """Reset the per-search state."""
+        self.exemplar_source = None
+        self.exemplar_pred_distance = None
+        self._warm_start_info = None
+        self._last_search_exception = None
+        self._priority_peaks_cache = None
+        self._fallback_random_max_iterations = int(fallback_random_max_iterations)
+        self._random_seed = None if random_seed is None else int(random_seed)
+        self._np_rng, self._py_rng = make_rngs(self._random_seed)
+        self._trust_region = TrustRegion(
+            fraction=float(trust_region_init) if trust_region else None,
+            minimum=float(trust_region_min),
+            maximum=float(trust_region_max),
+        )
+        self._target_correction = 0.0
+        self._residual_correction_enabled = bool(residual_correction)
+        self._restoration_enabled = bool(restoration)
+        self._last_shapley_sample = None
+        self._pass_targets = {}
+
+    def _evaluate_anchor(self) -> dict:
+        """The anchor as a candidate answer: ``cf``, ``prediction``, ``distance``, ``priority``."""
+        cf = list(np.asarray(self.sample_state.target_exemplar, dtype=float))
+        prediction = float(np.asarray(self.model_pred([cf])).reshape(-1)[0])
+        return {
+            "cf": cf,
+            "prediction": prediction,
+            "distance": abs(prediction - float(self.target)),
+            "priority": self._priority_benefit(cf),
+        }
+
+    def _evaluate_with_restoration(self, cf):
+        """Evaluate ``cf``; restore it into the band if it just missed (Stage 6)."""
+        evaluation = evaluate_candidate(self._refinement_context(), cf)
+        if not evaluation["feasible"] and self._restoration_enabled:
+            restored_cf, restored_evaluation = restore_to_band(
+                self._refinement_context(), cf, evaluation
+            )
+            if restored_cf is not None:
+                return restored_cf, restored_evaluation, 1
+        return cf, evaluation, 0
+
+    def _step_quality(self, evaluation):
+        """``(accepted, rho, residual)`` of the step to ``evaluation``'s candidate.
+
+        ``rho`` compares the real and the surrogate change of the prediction
+        (1 means perfect agreement); both share the value ``basic_prediction``
+        at the current iterate, so no extra model call is needed. A step is
+        accepted when it lands in the band or gets closer to the target.
+        """
+        anchor_value = float(self.basic_prediction)
+        surrogate_change = float(evaluation["h_x"]) - anchor_value
+        model_change = float(evaluation["model_pred"]) - anchor_value
+        rho = model_change / surrogate_change if abs(surrogate_change) > 1e-12 else float("nan")
+        residual = float(evaluation["model_pred"]) - float(evaluation["h_x"])
+        iterate_distance = abs(anchor_value - float(self.target))
+        accepted = bool(evaluation["feasible"] or evaluation["distance"] < iterate_distance - 1e-12)
+        return accepted, rho, residual
+
+    def _log_iteration(self, iteration, evaluation, incumbents, improved, rho, residual):
+        priority = evaluation["priority"]
+        best_priority, best_distance = incumbents.describe()
+        logger.info(
+            "[Iter %d] model_pred(cf)=%.4f | h(x)=%.4f | distance=%.4f | "
+            "feasible=%s | priority=%s | best_priority=%s | "
+            "best_distance=%s | improved_vs_best=%s | rho=%.3f | "
+            "residual=%.4f | trust=%s",
+            iteration + 1,
+            evaluation["model_pred"],
+            evaluation["h_x"],
+            evaluation["distance"],
+            evaluation["feasible"],
+            f"{priority:.4f}" if priority is not None else "n/a",
+            best_priority,
+            best_distance,
+            improved,
+            rho,
+            residual,
+            f"{self._trust_region.fraction:.3f}"
+            if self._trust_region.fraction is not None
+            else "off",
+        )
+
+    def _update_step_control(self, iteration, accepted, rho, residual):
+        """Grow the trust region after a good step; shrink it and correct the target after a bad one."""
+        if accepted:
+            self._target_correction = 0.0
+            if self._trust_region.fraction is not None and np.isfinite(rho) and 0.5 <= rho <= 1.5:
+                self._trust_region.grow()
+            return
+        if self._residual_correction_enabled:
+            self._target_correction = residual
+            logger.info(
+                "[Iter %d] Residual correction: surrogate now aims at "
+                "%.4f so the model lands on %.4f.",
+                iteration + 1,
+                self._effective_target(),
+                float(self.target),
+            )
+        self._trust_region.shrink()
+
+    def _advance(self, iteration, cf, evaluation, accepted):
+        """Move the iterate to ``cf`` after an accepted step.
+
+        The surrogate is then always re-linearised at a point the real model
+        agrees with. With both step controls off, every candidate is accepted.
+        """
+        step_control = self._trust_region.enabled or self._residual_correction_enabled
+        if accepted or not step_control:
+            self.sample_state.sample = list(cf)
+            logger.info("[Iter %d] Advancing: next iteration's sample = current CF.", iteration + 1)
+        else:
+            logger.info(
+                "[Iter %d] Step rejected (|f - target|=%.4f > epsilon=%.4f); "
+                "keeping the current iterate and retrying with a smaller "
+                "step / corrected target.",
+                iteration + 1,
+                evaluation["distance"],
+                float(self.epsilon),
+            )
+
+    def _apply_peak_lock_in(self, incumbents, max_sweeps):
+        """Stage 7 on the feasible incumbent; returns its report."""
+        improved_cf, peak_info = lock_in_priority_peaks(
+            self._refinement_context(), incumbents.feasible, max_sweeps=int(max_sweeps)
+        )
+        if peak_info["accepted_moves"] > 0:
+            incumbents.feasible = improved_cf
+            incumbents.feasible_priority = float(peak_info["priority_after"])
+            incumbents.feasible_distance = abs(
+                float(peak_info["final_prediction"]) - float(self.target)
+            )
+            incumbents.feasible_source = f"{incumbents.feasible_source}+peak_lock_in"
+        return peak_info
+
+    def _log_search_done(self):
+        result = self.last_search_result
+        best_distance = result["distance"]
         logger.info("=" * 78)
         logger.info(
             "MINLP SEARCH DONE | reached_target=%s | stop_reason=%s | "
             "iterations=%d | best_distance=%.4f | cf_source=%s | "
             "priority=%s | anchor_priority=%s | gain_vs_anchor=%s",
-            reached,
-            stop_reason,
-            len(history),
+            result["reached_target"],
+            result["stop_reason"],
+            result["iterations_run"],
             best_distance if best_distance != float("inf") else float("nan"),
-            cf_source,
-            best_priority,
-            anchor_priority,
-            priority_gain_vs_anchor,
+            result["cf_source"],
+            result["priority_score"],
+            result["anchor_priority_score"],
+            result["priority_gain_vs_anchor"],
         )
-        if cf_source == "anchor":
+        if result["cf_source"] == "anchor":
             logger.warning(
                 "Returned CF is the Stage 1 anchor exemplar (source=%s): no "
                 "SLSQP candidate beat its priority benefit (%s). This run "
                 "carries no optimisation gain.",
                 self.exemplar_source,
-                anchor_priority,
+                result["anchor_priority_score"],
             )
         logger.info("=" * 78)
 
-        if reached:
+    def _final_answer(self, return_when_fails):
+        result = self.last_search_result
+        # A copy, so changing the returned list does not change the result record.
+        best_cf = None if result["best_cf"] is None else list(result["best_cf"])
+        if result["reached_target"]:
             return best_cf
         if return_when_fails:
             if best_cf is None:
@@ -1142,7 +1154,7 @@ class MINLPSearchExplainer:
                 "Returning best CF although it did NOT reach target "
                 "(distance=%.4f > epsilon=%.4f). See "
                 "self.last_search_result for full status.",
-                best_distance,
+                result["distance"],
                 float(self.epsilon),
             )
             return best_cf
