@@ -1,0 +1,388 @@
+{
+ "metadata": {
+  "explainit": "0.1.0",
+  "commit": "44e3dfd",
+  "python": "3.13.7",
+  "numpy": "2.3.3",
+  "scipy": "1.16.2",
+  "scikit-learn": "1.7.2"
+ },
+ "results": {
+  "diabetes/gbr/regression/random_search": {
+   "summary": {
+    "instances": 8,
+    "valid_rate": 1.0,
+    "reached_target_rate": 1.0,
+    "respects_constraints_rate": 1.0,
+    "mean_relative_score_of_valid": 0.9066513097612942,
+    "mean_model_rows": 1422.875,
+    "mean_seconds": 0.2782816616272612,
+    "errors": 0
+   },
+   "runs": [
+    {
+     "found": true,
+     "reached_target": true,
+     "respects_constraints": true,
+     "valid": true,
+     "relative_score": 0.9349956211184555,
+     "model_rows": 2117,
+     "seconds": 0.41830908399424516,
+     "error": null
+    },
+    {
+     "found": true,
+     "reached_target": true,
+     "respects_constraints": true,
+     "valid": true,
+     "relative_score": 0.885711112165777,
+     "model_rows": 1310,
+     "seconds": 0.25539691699668765,
+     "error": null
+    },
+    {
+     "found": true,
+     "reached_target": true,
+     "respects_constraints": true,
+     "valid": true,
+     "relative_score": 0.9046045637369534,
+     "model_rows": 1219,
+     "seconds": 0.238930541992886,
+     "error": null
+    },
+    {
+     "found": true,
+     "reached_target": true,
+     "respects_constraints": true,
+     "valid": true,
+     "relative_score": 0.885711112165777,
+     "model_rows": 1285,
+     "seconds": 0.24877295902115293,
+     "error": null
+    },
+    {
+     "found": true,
+     "reached_target": true,
+     "respects_constraints": true,
+     "valid": true,
+     "relative_score": 0.9046045637369534,
+     "model_rows": 1401,
+     "seconds": 0.2775730410066899,
+     "error": null
+    },
+    {
+     "found": true,
+     "reached_target": true,
+     "respects_constraints": true,
+     "valid": true,
+     "relative_score": 0.9097231111133259,
+     "model_rows": 1336,
+     "seconds": 0.25935500001651235,
+     "error": null
+    },
+    {
+     "found": true,
+     "reached_target": true,
+     "respects_constraints": true,
+     "valid": true,
+     "relative_score": 0.911354602104457,
+     "model_rows": 1706,
+     "seconds": 0.330712750001112,
+     "error": null
+    },
+    {
+     "found": true,
+     "reached_target": true,
+     "respects_constraints": true,
+     "valid": true,
+     "relative_score": 0.9165057919486544,
+     "model_rows": 1009,
+     "seconds": 0.19720299998880364,
+     "error": null
+    }
+   ]
+  },
+  "diabetes/gbr/regression/minlp_search": {
+   "summary": {
+    "instances": 8,
+    "valid_rate": 0.0,
+    "reached_target_rate": 1.0,
+    "respects_constraints_rate": 0.0,
+    "mean_relative_score_of_valid": 0.9502331172423317,
+    "mean_model_rows": 56616.0,
+    "mean_seconds": 0.5011844740001834,
+    "errors": 0
+   },
+   "runs": [
+    {
+     "found": true,
+     "reached_target": true,
+     "respects_constraints": false,
+     "valid": false,
+     "relative_score": 0.8977693498096898,
+     "model_rows": 51518,
+     "seconds": 0.5617903749807738,
+     "error": null
+    },
+    {
+     "found": true,
+     "reached_target": true,
+     "respects_constraints": false,
+     "valid": false,
+     "relative_score": 1.0,
+     "model_rows": 71956,
+     "seconds": 0.5545974579872563,
+     "error": null
+    },
+    {
+     "found": true,
+     "reached_target": true,
+     "respects_constraints": false,
+     "valid": false,
+     "relative_score": 0.9959793031307189,
+     "model_rows": 41265,
+     "seconds": 0.42360670800553635,
+     "error": null
+    },
+    {
+     "found": true,
+     "reached_target": true,
+     "respects_constraints": false,
+     "valid": false,
+     "relative_score": 1.0,
+     "model_rows": 92430,
+     "seconds": 0.6531942500150762,
+     "error": null
+    },
+    {
+     "found": true,
+     "reached_target": true,
+     "respects_constraints": false,
+     "valid": false,
+     "relative_score": 0.9566543407878583,
+     "model_rows": 41269,
+     "seconds": 0.5327547499909997,
+     "error": null
+    },
+    {
+     "found": true,
+     "reached_target": true,
+     "respects_constraints": false,
+     "valid": false,
+     "relative_score": 0.8898311233872928,
+     "model_rows": 61745,
+     "seconds": 0.4783525000093505,
+     "error": null
+    },
+    {
+     "found": true,
+     "reached_target": true,
+     "respects_constraints": false,
+     "valid": false,
+     "relative_score": 1.0,
+     "model_rows": 41236,
+     "seconds": 0.37656516701099463,
+     "error": null
+    },
+    {
+     "found": true,
+     "reached_target": true,
+     "respects_constraints": false,
+     "valid": false,
+     "relative_score": 0.8616308208230943,
+     "model_rows": 51509,
+     "seconds": 0.42861458400147967,
+     "error": null
+    }
+   ]
+  },
+  "breast_cancer/logreg/binary/random_search": {
+   "summary": {
+    "instances": 8,
+    "valid_rate": 1.0,
+    "reached_target_rate": 1.0,
+    "respects_constraints_rate": 1.0,
+    "mean_relative_score_of_valid": 0.8775676597848907,
+    "mean_model_rows": 985.5,
+    "mean_seconds": 0.12636787512383307,
+    "errors": 0
+   },
+   "runs": [
+    {
+     "found": true,
+     "reached_target": true,
+     "respects_constraints": true,
+     "valid": true,
+     "relative_score": 0.8458814014843293,
+     "model_rows": 365,
+     "seconds": 0.04653975000837818,
+     "error": null
+    },
+    {
+     "found": true,
+     "reached_target": true,
+     "respects_constraints": true,
+     "valid": true,
+     "relative_score": 0.9600285009466771,
+     "model_rows": 127,
+     "seconds": 0.01759266699082218,
+     "error": null
+    },
+    {
+     "found": true,
+     "reached_target": true,
+     "respects_constraints": true,
+     "valid": true,
+     "relative_score": 0.8198784442081648,
+     "model_rows": 1154,
+     "seconds": 0.14314500000909902,
+     "error": null
+    },
+    {
+     "found": true,
+     "reached_target": true,
+     "respects_constraints": true,
+     "valid": true,
+     "relative_score": 0.9600285009466771,
+     "model_rows": 147,
+     "seconds": 0.019713290996151045,
+     "error": null
+    },
+    {
+     "found": true,
+     "reached_target": true,
+     "respects_constraints": true,
+     "valid": true,
+     "relative_score": 0.9600285009466771,
+     "model_rows": 96,
+     "seconds": 0.014365167007781565,
+     "error": null
+    },
+    {
+     "found": true,
+     "reached_target": true,
+     "respects_constraints": true,
+     "valid": true,
+     "relative_score": 0.793110185412081,
+     "model_rows": 4287,
+     "seconds": 0.5578129589848686,
+     "error": null
+    },
+    {
+     "found": true,
+     "reached_target": true,
+     "respects_constraints": true,
+     "valid": true,
+     "relative_score": 0.8407928721672592,
+     "model_rows": 711,
+     "seconds": 0.08908949999022298,
+     "error": null
+    },
+    {
+     "found": true,
+     "reached_target": true,
+     "respects_constraints": true,
+     "valid": true,
+     "relative_score": 0.8407928721672592,
+     "model_rows": 997,
+     "seconds": 0.12268466700334102,
+     "error": null
+    }
+   ]
+  },
+  "breast_cancer/logreg/binary/minlp_search": {
+   "summary": {
+    "instances": 8,
+    "valid_rate": 0.0,
+    "reached_target_rate": 0.75,
+    "respects_constraints_rate": 0.0,
+    "mean_relative_score_of_valid": 1.0,
+    "mean_model_rows": 817.25,
+    "mean_seconds": 0.08536020837345859,
+    "errors": 0
+   },
+   "runs": [
+    {
+     "found": true,
+     "reached_target": true,
+     "respects_constraints": false,
+     "valid": false,
+     "relative_score": 1.0,
+     "model_rows": 919,
+     "seconds": 0.10051970797940157,
+     "error": null
+    },
+    {
+     "found": true,
+     "reached_target": true,
+     "respects_constraints": false,
+     "valid": false,
+     "relative_score": 1.0,
+     "model_rows": 757,
+     "seconds": 0.07671683400985785,
+     "error": null
+    },
+    {
+     "found": true,
+     "reached_target": true,
+     "respects_constraints": false,
+     "valid": false,
+     "relative_score": 1.0,
+     "model_rows": 807,
+     "seconds": 0.08363154099788517,
+     "error": null
+    },
+    {
+     "found": true,
+     "reached_target": true,
+     "respects_constraints": false,
+     "valid": false,
+     "relative_score": 1.0,
+     "model_rows": 778,
+     "seconds": 0.07971799999359064,
+     "error": null
+    },
+    {
+     "found": true,
+     "reached_target": true,
+     "respects_constraints": false,
+     "valid": false,
+     "relative_score": 1.0,
+     "model_rows": 786,
+     "seconds": 0.08008433401118964,
+     "error": null
+    },
+    {
+     "found": true,
+     "reached_target": true,
+     "respects_constraints": false,
+     "valid": false,
+     "relative_score": 1.0,
+     "model_rows": 886,
+     "seconds": 0.09603383298963308,
+     "error": null
+    },
+    {
+     "found": false,
+     "reached_target": false,
+     "respects_constraints": false,
+     "valid": false,
+     "relative_score": null,
+     "model_rows": 806,
+     "seconds": 0.0829399999929592,
+     "error": null
+    },
+    {
+     "found": false,
+     "reached_target": false,
+     "respects_constraints": false,
+     "valid": false,
+     "relative_score": null,
+     "model_rows": 799,
+     "seconds": 0.08323741701315157,
+     "error": null
+    }
+   ]
+  }
+ }
+}

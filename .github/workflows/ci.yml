@@ -52,6 +52,55 @@ jobs:
       - name: Run tests against the lowest declared dependency versions
         run: uv run --resolution lowest-direct --no-dev --group test pytest
 
+  snapshots:
+    name: Snapshot tests (recorded dependency versions)
+    runs-on: ubuntu-latest
+    # Hosted runners have different CPUs; pin the CPU-specific code paths of
+    # NumPy and OpenBLAS so floating-point results are identical on all of them.
+    env:
+      NPY_DISABLE_CPU_FEATURES: "AVX512F AVX512_SKX AVX512_ICL AVX512_SPR"
+      OPENBLAS_CORETYPE: Haswell
+      OPENBLAS_NUM_THREADS: "1"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          python-version: "3.13"
+      # Keep these pins equal to the versions in tests/snapshots/linux.json.
+      - name: Show NumPy runtime configuration
+        run: uv run --no-dev --group test --with numpy==2.3.3 --with scipy==1.16.2 python -c "import numpy; numpy.show_runtime()"
+      - name: Record fresh Linux snapshots (for updating tests/snapshots/linux.json)
+        run: >-
+          uv run --no-dev --group test --with numpy==2.3.3 --with scipy==1.16.2
+          pytest -m snapshot --update-snapshots --snapshot-dir "$RUNNER_TEMP/snapshots"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: snapshots-linux
+          path: ${{ runner.temp }}/snapshots/linux.json
+      - name: Compare results with the recorded snapshots
+        run: >-
+          uv run --no-dev --group test --with numpy==2.3.3 --with scipy==1.16.2
+          pytest -m snapshot -rs
+
+  benchmark:
+    name: Quality benchmark (manual)
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          python-version: "3.13"
+      - name: Run the benchmark and compare with the baseline
+        run: >-
+          uv run --no-dev --group benchmark python benchmarks/run_benchmark.py
+          --compare benchmarks/results/baseline.json --output benchmark.json
+          >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: benchmark
+          path: benchmark.json
+
   package:
     name: Build and verify package
     runs-on: ubuntu-latest
@@ -68,7 +117,7 @@ jobs:
         run: |
           uv venv "$RUNNER_TEMP/wheel-env"
           source "$RUNNER_TEMP/wheel-env/bin/activate"
-          uv pip install dist/*.whl pytest
+          uv pip install dist/*.whl pytest hypothesis
           cd "$RUNNER_TEMP"
           python -m pytest -p no:cacheprovider "$GITHUB_WORKSPACE/tests/test_installation.py"
       - uses: actions/upload-artifact@v7

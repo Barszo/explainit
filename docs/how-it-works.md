@@ -105,3 +105,8 @@ is in `explainer.exemplar_source`.
 Both explainers accept `random_seed`. A seeded run uses private random number
 generators, so repeated runs give identical results and the global NumPy and
 `random` state is not modified.
+
+Random search results are identical on every machine. MINLP results are
+identical on the same operating system with the same NumPy/SciPy versions;
+across operating systems the optimiser can take a slightly different path, so
+the counterfactual may differ in the third or fourth decimal place.

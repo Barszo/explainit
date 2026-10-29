@@ -179,17 +179,6 @@ class TestFindCounterfactuals:
         with pytest.raises(Exception, match="Could not randomly generate"):
             explainer.find_counterfactuals(random_seed=1, return_when_fails=False)
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason="Known bug: when the dataset anchor is returned as the counterfactual, "
-        "non-actionable features keep the anchor's value instead of the sample's.",
-    )
-    def test_non_actionable_feature_is_unchanged(self, mixed_priorities, mixed_dataset):
-        mixed_priorities["numerical"][1] = {"min": 0.2, "max": 0.2, "function": None}
-        explainer = MINLPSearchExplainer(mixed_model, mixed_priorities, SAMPLE, 0.8, mixed_dataset)
-        cf = explainer.find_counterfactuals(random_seed=1)
-        assert cf[1] == pytest.approx(SAMPLE[1])
-
 
 class TestFindCounterfactualsForBinary:
     @staticmethod

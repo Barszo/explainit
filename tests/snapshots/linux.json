@@ -1,0 +1,319 @@
+{
+ "versions": {
+  "numpy": "2.3",
+  "scipy": "1.16",
+  "python": "3.13.18"
+ },
+ "results": {
+  "minlp/approximate-shapley": {
+   "counterfactual": [
+    0.977529239445369,
+    0.00022169971029817326,
+    1.0,
+    0.0,
+    0.9965038654273245
+   ],
+   "reached_target": true,
+   "stop_reason": "target_reached",
+   "iterations_run": 10,
+   "exemplar_source": "dataset_priority_filtered",
+   "cf_source": "optimiser",
+   "priority_score": 3.982553675291399,
+   "model_calls": 103,
+   "model_rows": 2686
+  },
+  "minlp/binary": {
+   "counterfactuals": [
+    [
+     0.973788245567258,
+     0.0019420406760971387,
+     1.0,
+     0.0,
+     0.9965038653818048
+    ]
+   ],
+   "predictions": [
+    0.5000007157817395
+   ],
+   "scores": [
+    3.9825536750662276
+   ],
+   "counts": [
+    2
+   ],
+   "model_calls": 71,
+   "model_rows": 358
+  },
+  "minlp/default": {
+   "counterfactual": [
+    0.9775292394453701,
+    0.00022169971029817326,
+    1.0,
+    0.0,
+    0.9965038654273245
+   ],
+   "reached_target": true,
+   "stop_reason": "target_reached",
+   "iterations_run": 10,
+   "exemplar_source": "dataset_priority_filtered",
+   "cf_source": "optimiser",
+   "priority_score": 3.982553675291399,
+   "model_calls": 103,
+   "model_rows": 670
+  },
+  "minlp/fixed-feature": {
+   "counterfactual": [
+    0.6166852415481274,
+    0.00022169971029817326,
+    1.0,
+    0.0,
+    0.3
+   ],
+   "reached_target": true,
+   "stop_reason": "target_reached",
+   "iterations_run": 10,
+   "exemplar_source": "dataset_priority_filtered",
+   "cf_source": "optimiser",
+   "priority_score": 2.6944754025802125,
+   "model_calls": 80,
+   "model_rows": 535
+  },
+  "minlp/no-corrections": {
+   "counterfactual": [
+    0.9593027918680598,
+    0.010911995351812899,
+    1.0,
+    0.0,
+    0.9965038654273245
+   ],
+   "reached_target": true,
+   "stop_reason": "target_reached",
+   "iterations_run": 10,
+   "exemplar_source": "dataset_priority_filtered",
+   "cf_source": "optimiser",
+   "priority_score": 3.982553675291399,
+   "model_calls": 118,
+   "model_rows": 853
+  },
+  "minlp/no-trust-region": {
+   "counterfactual": [
+    0.9596995563490238,
+    0.011539847492750282,
+    1.0,
+    0.0,
+    0.9965038654273245
+   ],
+   "reached_target": true,
+   "stop_reason": "target_reached",
+   "iterations_run": 10,
+   "exemplar_source": "dataset_priority_filtered",
+   "cf_source": "optimiser",
+   "priority_score": 3.982553675291399,
+   "model_calls": 80,
+   "model_rows": 535
+  },
+  "minlp/numerical-only": {
+   "counterfactual": [
+    0.9122630064892583,
+    0.8658683406154581
+   ],
+   "reached_target": true,
+   "stop_reason": "target_reached",
+   "iterations_run": 10,
+   "exemplar_source": "dataset_priority_filtered",
+   "cf_source": "optimiser",
+   "priority_score": 2.0,
+   "model_calls": 86,
+   "model_rows": 311
+  },
+  "minlp/random-anchor": {
+   "counterfactual": [
+    0.9572101796109636,
+    0.007115934686713367,
+    1.0,
+    0.0,
+    0.9811950400663443
+   ],
+   "reached_target": true,
+   "stop_reason": "target_reached",
+   "iterations_run": 10,
+   "exemplar_source": "random_in_range",
+   "cf_source": "optimiser",
+   "priority_score": 3.9096514238928917,
+   "model_calls": 283,
+   "model_rows": 862
+  },
+  "random/binary": {
+   "counterfactuals": [
+    [
+     0.9854914276432976,
+     0.1059061548822322,
+     1.0,
+     0.0,
+     0.8817202123338397
+    ],
+    [
+     0.9021312148042321,
+     0.19645099182095394,
+     1.0,
+     0.0,
+     0.8429732964010842
+    ],
+    [
+     0.8748423619393388,
+     0.10128424696474214,
+     1.0,
+     0.0,
+     0.8443270139828222
+    ]
+   ],
+   "predictions": [
+    0.6468385246368208,
+    0.614241864498084,
+    0.5031958848733571
+   ],
+   "scores": [
+    3.5406802189995785,
+    3.2916172432765967,
+    3.4533468406378716
+   ],
+   "iterations": [
+    20,
+    28,
+    4
+   ],
+   "model_calls": 113,
+   "model_rows": 113
+  },
+  "random/regression-fixed-feature": {
+   "counterfactuals": [
+    [
+     0.6842239682340508,
+     0.24653833096694677,
+     1.0,
+     0.0,
+     0.3
+    ],
+    [
+     0.6150335417852003,
+     0.4466095093503376,
+     1.0,
+     0.0,
+     0.3
+    ]
+   ],
+   "predictions": [
+    1.200697042314247,
+    1.2315422050570919
+   ],
+   "scores": [
+    2.562809395445173,
+    2.1140400540581044
+   ],
+   "iterations": [
+    43,
+    7
+   ],
+   "model_calls": 50,
+   "model_rows": 50
+  },
+  "random/regression-mixed-best-of-20": {
+   "counterfactuals": [
+    [
+     0.8923196514729808,
+     0.08996165617294427,
+     1.0,
+     0.0,
+     0.975744435158754
+    ],
+    [
+     0.9354740935715375,
+     0.0662362154863746,
+     1.0,
+     0.0,
+     0.9687690396417357
+    ]
+   ],
+   "predictions": [
+    1.168308005067272,
+    1.2016460610817135
+   ],
+   "scores": [
+    3.8850130561699148,
+    3.854446023547532
+   ],
+   "iterations": [
+    111,
+    151
+   ],
+   "model_calls": 575,
+   "model_rows": 575
+  },
+  "random/regression-monte-carlo": {
+   "counterfactuals": [
+    [
+     0.9394989415641891,
+     0.8287375091519293
+    ],
+    [
+     0.8631034258755935,
+     0.8872127425763265
+    ],
+    [
+     0.907566473926093,
+     0.9296976523425731
+    ]
+   ],
+   "predictions": [
+    0.9173466550817372,
+    0.8679252892157402,
+    0.911992709609389
+   ],
+   "scores": [
+    2.0,
+    1.6893559953918138,
+    2.0
+   ],
+   "iterations": [
+    3,
+    2,
+    1
+   ],
+   "model_calls": 6,
+   "model_rows": 6
+  },
+  "random/regression-uniform": {
+   "counterfactuals": [
+    [
+     0.8704830870014831,
+     0.9227496139456699
+    ],
+    [
+     0.9814687376060105,
+     0.3989448039028505
+    ],
+    [
+     0.964915292526365,
+     0.6317660527377454
+    ]
+   ],
+   "predictions": [
+    0.8809363923903205,
+    0.8649639508653785,
+    0.8982854445686411
+   ],
+   "scores": [
+    1.7426718118041742,
+    1.0288179028567106,
+    1.2410025922576189
+   ],
+   "iterations": [
+    22,
+    2,
+    5
+   ],
+   "model_calls": 29,
+   "model_rows": 29
+  }
+ }
+}
