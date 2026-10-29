@@ -1,5 +1,3 @@
-import copy
-import itertools
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any
@@ -15,13 +13,13 @@ from explainit.explainers.minlp.anchor import (
     probe_feasibility,
 )
 from explainit.explainers.minlp.bounds import TrustRegion, derive_bounds_and_intervals
+from explainit.explainers.minlp.combinations import limit_combinations
 from explainit.explainers.minlp.intervals import (
     allowed_interval_constraint_value,
     clip_to_allowed,
     in_allowed_intervals,
     project_to_allowed_intervals,
 )
-from explainit.explainers.minlp.linear_program import solve_linear_constraint
 from explainit.explainers.minlp.scoring import (
     feature_priority,
     priority_benefit,
@@ -35,6 +33,7 @@ from explainit.explainers.minlp.surrogate import (
     surrogate_prediction,
     unit_coefficients,
 )
+from explainit.explainers.minlp.warm_start import solve_warm_starts, warm_start_health
 from explainit.logging_config import logger
 from explainit.utils.priority_plots import plot_priorities as _plot_priorities
 
@@ -363,128 +362,30 @@ class MINLPSearchExplainer:
         self._pass_targets[combo_idx] = float(clipped)
         return float(clipped)
 
-    # function to create limited priorities based on SHAP values (4.1)
-    def create_limited_priorities(self):
-        """
-        Create modified priorities dictionary based on SHAP values and sample data.
-
-        This method processes the calculated Shapley values to determine which categorical
-        combinations should be considered during the counterfactual search. The logic is:
-
-        For categorical features:
-        - If SHAP value is 0: Feature doesn't contribute to prediction difference,
-          so keep only the category from the original sample
-        - If SHAP value is not 0: Feature contributes to prediction difference,
-          so allow categories from both sample and target_exemplar
-
-        This reduces the search space by eliminating categorical combinations that
-        don't contribute to achieving the target prediction.
-
-        Results are stored in:
-            - sample_state.limited_priorities: Updated priorities with filtered categorical options
-            - sample_state.all_combinations: All possible categorical combinations to explore
-        """
-
-        # Create a deep copy of the original priorities
-        modified_priorities = copy.deepcopy(self.priorities_state.priorities)
-
-        # Use existing Shapley values from sample_state
-        shap_values_dict = self.sample_state.shapley_values
-
-        # Store allowed combinations for each categorical group
-        allowed_combinations_by_group = []
-        all_categorical_indices = []
-
-        # Process categorical features
-        for (
-            feature_indices,
-            categorical_weights,
-        ) in self.priorities_state.categorical_priorities.items():
-            # Extract values for this categorical group from sample and target_exemplar
-            sample_values = tuple(float(self.sample_state.sample[idx]) for idx in feature_indices)
-            target_exemplar_values = tuple(
-                float(self.sample_state.target_exemplar[idx]) for idx in feature_indices
-            )
-
-            # Get SHAP value for this categorical group
-            shap_val = shap_values_dict["categorical"].get(feature_indices, 0.0)
-
-            # Create new categorical weights dictionary and collect allowed combinations
-            new_categorical_weights = {}
-            group_combinations = []
-
-            if shap_val == 0:
-                # Keep only the category from sample
-                # This is to exclude situations where this feature is the same for both sample and target_exemplar
-                # It would be useless to include both if they are identical
-                if sample_values in categorical_weights:
-                    new_categorical_weights[sample_values] = categorical_weights[sample_values]
-                    group_combinations.append(sample_values)
-            else:
-                # Keep categories from both sample and target_exemplar
-                if sample_values in categorical_weights:
-                    new_categorical_weights[sample_values] = categorical_weights[sample_values]
-                    group_combinations.append(sample_values)
-                if (
-                    target_exemplar_values in categorical_weights
-                    and target_exemplar_values != sample_values
-                ):
-                    new_categorical_weights[target_exemplar_values] = categorical_weights[
-                        target_exemplar_values
-                    ]
-                    group_combinations.append(target_exemplar_values)
-
-            # Update the modified priorities
-            modified_priorities["categorical"][feature_indices] = new_categorical_weights
-
-            # Store for cross-product calculation
-            allowed_combinations_by_group.append(group_combinations)
-            all_categorical_indices.extend(feature_indices)
-
-        # Generate all possible combinations across all categorical groups
-        all_combinations = {}
-
-        # Use itertools.product to get all combinations across groups
-        for combination_id, combination_tuple in enumerate(
-            itertools.product(*allowed_combinations_by_group)
-        ):
-            # Create dictionary mapping each categorical index to its value
-            combination_dict = {}
-
-            for group_index, feature_indices in enumerate(
-                self.priorities_state.categorical_priorities
-            ):
-                group_values = combination_tuple[group_index]
-                for i, idx in enumerate(feature_indices):
-                    combination_dict[idx] = group_values[i]
-
-            all_combinations[combination_id] = combination_dict
-
-        # Store results in SampleState
-        self.sample_state.limited_priorities = modified_priorities
-        self.sample_state.all_combinations = all_combinations
-
-    # function to confirm existence of solution for each categorical combination
     def confirm_existence_of_solution_for_combo(self):
+        """Stage 4: prune combinations, linearise, and find one warm start per combination.
 
-        # 1. Prepare variables for next steps, including categorical combinations
-        # limiting the search space based on SHAP values
-        # exclude categories that do not contribute to reaching the target (according to Shapley values)
-        # creates list of categorical combinations to explore
-        # creates self.sample_state.limited_priorities and self.sample_state.all_combinations
-        # now, there are at most two categories in each categorical group (one from sample, one from target_exemplar)
+        Returns:
+            dict: ``{combination_id: warm start}``; see
+            :func:`warm_start.solve_warm_starts`.
+        """
         logger.info(
             "[Stage 4.1] Pruning categorical combinations using Shapley values "
             "(zero-impact groups collapse to the sample's own category)."
         )
-        self.create_limited_priorities()
+        self.sample_state.limited_priorities, self.sample_state.all_combinations = (
+            limit_combinations(
+                self.priorities_state.priorities,
+                self.sample_state.shapley_values["categorical"],
+                self.sample_state.sample,
+                self.sample_state.target_exemplar,
+            )
+        )
         logger.info(
             "[Stage 4.1] %d categorical combination(s) survive after pruning.",
             len(self.sample_state.all_combinations),
         )
 
-        # self.shap_dict = shap_dict
-        # 2. Extract targets for linear search for each categorical combination
         logger.info(
             "[Stage 4.2] Caching baseline prediction for the original sample "
             "(used as anchor in the linear approximation)."
@@ -496,7 +397,6 @@ class MINLPSearchExplainer:
             float(self.target),
         )
 
-        # 3. Prepare targets and coefficients for linear search
         logger.info(
             "[Stage 4.3] Building per-combo LP targets and per-feature linear "
             "coefficients from Shapley values."
@@ -508,7 +408,6 @@ class MINLPSearchExplainer:
             "[Stage 4.3] Per-feature shap_coeffs (unit phi): %s", self.sample_state.shap_coeffs
         )
 
-        # 4. Verify which are actionable and prepare input for linear search
         logger.info(
             "[Stage 4.4] Selecting actionable numerical features and gathering "
             "their bounds for the LP solver."
@@ -518,125 +417,32 @@ class MINLPSearchExplainer:
             for i in self.sample_state.shap_coeffs
             if i not in self.priorities_state.non_actionable_indices
         ]
-        coeff_to_linear_search = [self.sample_state.shap_coeffs[key] for key in indices_to_modify]
+        coefficients = [self.sample_state.shap_coeffs[key] for key in indices_to_modify]
         search_bounds = self._search_bounds()
-        bounds_for_linear_search = [search_bounds[key] for key in indices_to_modify]
+        bounds = [search_bounds[key] for key in indices_to_modify]
         logger.info(
             "[Stage 4.4] %d actionable numerical features: %s",
             len(indices_to_modify),
             indices_to_modify,
         )
-        logger.debug(
-            "[Stage 4.4] LP coefficients=%s | bounds=%s",
-            coeff_to_linear_search,
-            bounds_for_linear_search,
+        logger.debug("[Stage 4.4] LP coefficients=%s | bounds=%s", coefficients, bounds)
+
+        warm_starts, gaps = solve_warm_starts(
+            target_for_combo,
+            self.sample_state.all_combinations,
+            indices_to_modify,
+            coefficients,
+            bounds,
+            self.sample_state.sample,
+            self._surrogate,
+            lambda combination_id: self._pass_targets.get(combination_id, self._effective_target()),
+            self.model_pred,
+            self.target,
+            self.epsilon,
         )
 
-        # 5. For each categorical combination, solve the linear programming problem to find at least one solution
-        # TODO: Optimize by removing for loop and vectorize if possible
-        logger.info(
-            "[Stage 4.5] Solving an LP per categorical combination "
-            "(coefficients . x = adjusted_target, bounded). The first feasible "
-            "x becomes the warm-start for SLSQP later on."
-        )
-        combo_and_initial_solutions = {}
-        shap_dict = self.sample_state.shapley_values
-        cat_combinations = self.sample_state.all_combinations
-        priorities_for_search = self.sample_state.limited_priorities
-        # (true model gap, linearised gap) at each feasible warm-start x0, used
-        # to diagnose warm-start health / surrogate mismatch.
-        warm_gaps = []
-
-        for combination_id, temp_target in target_for_combo.items():
-            logger.info(
-                "[Stage 4.5] Combo %d/%d -> LP target=%.4f",
-                combination_id + 1,
-                len(target_for_combo),
-                float(temp_target),
-            )
-            temp_combo = cat_combinations[combination_id]
-            logger.debug(
-                "[Stage 4.5] Combo %d categorical assignment: %s", combination_id, temp_combo
-            )
-            dummy_x = self.sample_state.sample.copy()
-
-            for idx, val in temp_combo.items():
-                dummy_x[idx] = val
-
-            linear_solution = solve_linear_constraint(
-                coeff_to_linear_search,
-                temp_target,
-                bounds_for_linear_search,
-                method="auto",
-                tolerance=self.epsilon,
-            )
-            logger.info(
-                "[Stage 4.5] Combo %d LP %s (method=%s).",
-                combination_id,
-                "feasible" if linear_solution["success"] else "infeasible",
-                linear_solution.get("method_used"),
-            )
-            solution = linear_solution["solution"]
-            logger.debug("[Stage 4.5] Combo %d LP solution=%s", combination_id, solution)
-            if solution is not None:
-                solutions_indices = dict(zip(indices_to_modify, solution, strict=False))
-                combo_and_initial_solutions[combination_id] = {
-                    "initial_solution": solutions_indices,
-                    "categorical_combo": temp_combo,
-                }
-                for key, value in solutions_indices.items():
-                    dummy_x[key] = value
-                logger.debug("[Stage 4.5] Combo %d candidate vector: %s", combination_id, dummy_x)
-                check_value = self.constraint_function(
-                    dummy_x,
-                    shap_dict,
-                    self.sample_state.sample,
-                    self.sample_state.target_exemplar,
-                    priorities_for_search,
-                    basic_prediction=self.basic_prediction,
-                )
-                pass_target = self._pass_targets.get(combination_id, self._effective_target())
-                assert abs(check_value - pass_target) <= self.epsilon, (
-                    f"Constraint function value {check_value} exceeds tolerance {self.epsilon} from target {pass_target}"
-                )
-                linear_gap = abs(float(check_value) - float(pass_target))
-                logger.info(
-                    "[Stage 4.5] Combo %d sanity check: linearised h(x)=%.4f "
-                    "(target=%.4f, |gap|=%.4f, epsilon=%.4f).",
-                    combination_id,
-                    float(check_value),
-                    float(pass_target),
-                    linear_gap,
-                    float(self.epsilon),
-                )
-                # Surrogate mismatch: true model prediction at the warm-start x0.
-                ws_model_pred = float(np.asarray(self.model_pred([dummy_x])).reshape(-1)[0])
-                ws_model_gap = abs(ws_model_pred - float(self.target))
-                warm_gaps.append((ws_model_gap, linear_gap))
-                logger.info(
-                    "[Stage 4.5] Combo %d warm-start true model_pred=%.4f "
-                    "(|model gap|=%.4f vs linear gap=%.4f).",
-                    combination_id,
-                    ws_model_pred,
-                    ws_model_gap,
-                    linear_gap,
-                )
-
-        logger.info(
-            "[Stage 4.6] %d/%d categorical combination(s) yielded an initial feasible solution.",
-            len(combo_and_initial_solutions),
-            len(target_for_combo),
-        )
-
-        # Capture warm-start health once per find_counterfactuals run (first pass).
         if self._warm_start_info is None:
-            best = min(warm_gaps, key=lambda t: t[0]) if warm_gaps else (None, None)
-            self._warm_start_info = {
-                "total_combos": len(target_for_combo),
-                "feasible_combos": len(combo_and_initial_solutions),
-                "best_warmstart_model_gap": (float(best[0]) if best[0] is not None else None),
-                "best_warmstart_linear_gap": (float(best[1]) if best[1] is not None else None),
-            }
+            self._warm_start_info = warm_start_health(target_for_combo, warm_starts, gaps)
             logger.info(
                 "[Stage 4.6] Warm-start health: %d/%d combos feasible; best "
                 "warm-start model |gap|=%s | linear |gap|=%s.",
@@ -646,7 +452,7 @@ class MINLPSearchExplainer:
                 self._warm_start_info["best_warmstart_linear_gap"],
             )
 
-        return combo_and_initial_solutions
+        return warm_starts
 
     #################################################################
     # Functions for optimisation
@@ -664,6 +470,17 @@ class MINLPSearchExplainer:
             target_exemplar,
             priorities_for_search,
             basic_prediction,
+        )
+
+    def _surrogate(self, x):
+        """``h(x)`` linearised at the current point."""
+        return self.constraint_function(
+            x,
+            self.sample_state.shapley_values,
+            self.sample_state.sample,
+            self.sample_state.target_exemplar,
+            self.sample_state.limited_priorities,
+            basic_prediction=self.basic_prediction,
         )
 
     def calculate_total_weight(self, values):
