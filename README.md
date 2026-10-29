@@ -82,16 +82,15 @@ priorities = {
     "categorical": {},
 }
 
-explainer = RandomSearchExplainer(approval_probability, priorities, applicant, target=1)
-counterfactuals, probabilities, scores, _ = explainer.generate_for_binary(
-    expected_counterfactuals=3,
-    target_class=1,
-    threshold=0.5,
-    n_candidates_per_cf=50,
-    random_seed=0,
+# Configure the explainer once (model + priorities), then explain any applicant.
+explainer = RandomSearchExplainer(
+    approval_probability, priorities, candidates_per_counterfactual=50
+)
+result = explainer.explain(
+    applicant, target_class=1, threshold=0.5, n_counterfactuals=3, random_seed=0
 )
 
-for cf, probability, score in zip(counterfactuals, probabilities, scores):
+for cf, probability, score in zip(result.counterfactuals, result.predictions, result.scores):
     print(f"income {cf[0]:.2f}k, loan {cf[1]:.1f}k -> p={probability:.2f}, preference {score:.2f}")
 ```
 
@@ -106,10 +105,13 @@ applicant: a small income increase combined with a smaller loan, with age
 untouched. The **preference score** is the sum of the per-feature priorities
 (here at most 2.0), so higher is better.
 
-`get_preference_breakdown` shows where the score comes from:
+`explain` returns an `Explanation`: the counterfactuals (one per row), their
+`predictions`, preference `scores`, `valid` flags, the `changes` relative to
+the applicant, and `to_frame()` for a pandas table (requires pandas).
+`preference_breakdown` shows where a score comes from:
 
 ```python
-breakdown = explainer.get_preference_breakdown(counterfactuals[0])
+breakdown = explainer.preference_breakdown(result.counterfactuals[0])
 print({i: round(f["weight"], 2) for i, f in breakdown["numerical"].items() if f["actionable"]})
 ```
 
@@ -121,9 +123,9 @@ print({i: round(f["weight"], 2) for i, f in breakdown["numerical"].items() if f[
 
 | Term | Meaning |
 | --- | --- |
-| **model** (`model_pred`) | Callable that takes a 2-D array of samples and returns one prediction per row (a value or a class probability). |
-| **sample** | The original input you want to explain (1-D array). |
-| **target** | The desired prediction. For regression-style search a counterfactual is valid when `abs(model(x) - target) <= epsilon`; for binary search when the probability crosses `threshold`. |
+| **model** | Callable that takes a 2-D array of samples and returns one prediction per row (a value or a class probability). |
+| **sample** | The original input you want to explain (1-D array), passed to `explain`. |
+| **target** | What a counterfactual must achieve: `target=value` (valid when `abs(model(x) - value) <= tolerance`) or `target_class=0/1` (valid when the probability is on that side of `threshold`). |
 | **priority** | For each feature: which values are allowed, and how desirable each allowed value is, on a 0-to-1 scale. |
 | **preference score** | Sum of the priorities of a counterfactual's feature values. Used to rank valid counterfactuals. |
 
@@ -178,13 +180,15 @@ categorical = {
 | | `RandomSearchExplainer` | `MINLPSearchExplainer` |
 | --- | --- | --- |
 | Idea | Samples candidates from the priority-weighted space and keeps valid ones with the best score. | Builds a local Shapley-value surrogate around a reference point and optimises the priorities with SLSQP, re-checking with the real model. |
-| Needs | Model, sample, target, priorities. | Same, plus a reference **dataset** (e.g. training data). |
-| Returns | Several diverse counterfactuals. | One optimised counterfactual, plus diagnostics in `last_search_result`. |
+| Needs | Model and priorities. | Same, plus a reference **dataset** (e.g. training data). |
+| Returns | Several counterfactuals. | One optimised counterfactual (one per categorical option for `target_class`), with search details in `diagnostics`. |
 | Good for | Quick exploration, any model, many alternatives. | Higher-quality single answers with fewer model calls. |
 
-Both explainers support regression-style targets and binary classification
-(`generate_for_binary` / `find_counterfactuals_for_binary`), and accept a
-`random_seed` for reproducible results.
+Both explainers have the same `explain(x, ...)` method, support `target` and
+`target_class`, and accept a `random_seed` for reproducible results. Search
+options are set when creating the explainer: keyword arguments for random
+search, and a `MINLPSettings` object for MINLP (e.g.
+`MINLPSettings(trust_region=False)`).
 
 ### MINLP example
 
@@ -201,37 +205,32 @@ past_applicants = np.column_stack(
 minlp = MINLPSearchExplainer(
     approval_probability,
     priorities,  # the priorities from the quick start
-    applicant,
-    target=0.6,
     dataset=past_applicants,
-    epsilon=0.02,
 )
-counterfactual = minlp.find_counterfactuals(random_seed=0)
+result = minlp.explain(applicant, target=0.6, tolerance=0.02, random_seed=0)
 
-print(np.round(counterfactual, 2), approval_probability([counterfactual]).round(2))
-print(minlp.last_search_result["reached_target"])
+print(np.round(result.counterfactuals[0], 2), result.predictions.round(2))
+print(result.valid[0], result.diagnostics["stop_reason"])
 ```
 
 ```text
 [ 3.1  13.49 35.  ] [0.6]
-True
+True target_reached
 ```
 
 ## Visualising priorities
 
 ```python
-from explainit import plot_priorities
-
-plot_priorities(
-    priorities,
-    sample=applicant,
+explainer.plot_priorities(
+    applicant,
     feature_names=["income", "loan", "age"],
     show=True,  # or save_dir="figures" to write PNG files
 )
 ```
 
-`RandomSearchExplainer.investigate_probability_distribution()` additionally
-shows how the random search samples each feature.
+`RandomSearchExplainer.plot_sampling_distributions()` additionally shows how
+the random search samples each feature, and `explainit.plot_priorities` plots
+a priorities dictionary without an explainer.
 
 ## Logging
 

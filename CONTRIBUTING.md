@@ -104,8 +104,11 @@ short, imperative summary (e.g. "Add peaked priority function").
 - **Logging**: use `from explainit.logging_config import logger`; never `print`
   and never configure logging handlers inside the library.
 - **Randomness**: never call `np.random.seed`, `random.seed`, or the global
-  `np.random.*` functions. Use the explainer's `self._np_rng` / `self._py_rng`,
-  created with `explainit._random.make_rngs(seed)`.
+  `np.random.*` functions. Create generators per search with
+  `explainit._random.make_rngs(seed)` and pass them down explicitly.
+- **No state between searches**: an explainer holds only its configuration;
+  everything a search computes lives in that search (local variables, or a
+  `MINLPSearch` object), so one explainer can explain many samples.
 - **Priority functions** must be vectorised (accept NumPy arrays) and return
   values in `[0, 1]`.
 - **Plots** must not write files or open windows unless the caller asks
