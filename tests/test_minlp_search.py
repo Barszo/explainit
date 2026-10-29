@@ -7,6 +7,12 @@ from conftest import mixed_model
 
 from explainit.explainers.minlp import MINLPSearchExplainer
 from explainit.explainers.minlp.explainer import PrioritiesState
+from explainit.explainers.minlp.intervals import (
+    extract_positive_intervals,
+    in_allowed_intervals,
+    project_to_allowed_intervals,
+)
+from explainit.explainers.minlp.linear_program import solve_linear_constraint
 
 SAMPLE = np.array([0.1, 0.2, 0.0, 1.0])
 TARGET = 1.0
@@ -61,54 +67,48 @@ class TestIntervalHelpers:
         ("value", "expected"), [(0.1, True), (0.5, True), (0.3, False), (0.9, False)]
     )
     def test_in_allowed_intervals(self, value, expected):
-        assert MINLPSearchExplainer._in_allowed_intervals(value, self.INTERVALS) is expected
+        assert in_allowed_intervals(value, self.INTERVALS) is expected
 
     def test_empty_intervals_allow_nothing(self):
-        assert MINLPSearchExplainer._in_allowed_intervals(0.1, []) is False
+        assert in_allowed_intervals(0.1, []) is False
 
     @pytest.mark.parametrize(
         ("value", "expected"), [(0.1, 0.1), (0.3, 0.2), (0.4, 0.5), (1.0, 0.8)]
     )
     def test_project_to_nearest_allowed_value(self, value, expected):
-        projected = MINLPSearchExplainer._project_to_allowed_intervals(value, self.INTERVALS)
+        projected = project_to_allowed_intervals(value, self.INTERVALS)
         assert projected == pytest.approx(expected)
 
     def test_extract_positive_intervals(self):
         x = np.linspace(0.0, 1.0, 11)
         y = np.where((x < 0.25) | ((x > 0.55) & (x < 0.85)), 1.0, 0.0)
-        intervals = MINLPSearchExplainer._extract_positive_intervals(x, y)
+        intervals = extract_positive_intervals(x, y)
         np.testing.assert_allclose(intervals, [(0.0, 0.2), (0.6, 0.8)])
 
 
 class TestLinearProgram:
     def test_finds_point_on_hyperplane_within_bounds(self):
-        result = MINLPSearchExplainer.solve_linear_constraint_lp(
-            [1.0, 2.0], 1.5, [(0.0, 1.0), (0.0, 1.0)]
-        )
+        result = solve_linear_constraint([1.0, 2.0], 1.5, [(0.0, 1.0), (0.0, 1.0)])
         assert result["success"]
         x = result["solution"]
         assert np.dot([1.0, 2.0], x) == pytest.approx(1.5)
         assert np.all((x >= 0.0) & (x <= 1.0))
 
     def test_infeasible_target_fails(self):
-        result = MINLPSearchExplainer.solve_linear_constraint_lp(
-            [1.0, 1.0], 5.0, [(0.0, 1.0), (0.0, 1.0)]
-        )
+        result = solve_linear_constraint([1.0, 1.0], 5.0, [(0.0, 1.0), (0.0, 1.0)])
         assert not result["success"]
         assert result["solution"] is None
 
     def test_mismatched_bounds_are_rejected(self):
-        result = MINLPSearchExplainer.solve_linear_constraint_lp([1.0, 1.0], 1.0, [(0.0, 1.0)])
+        result = solve_linear_constraint([1.0, 1.0], 1.0, [(0.0, 1.0)])
         assert not result["success"]
 
     def test_all_zero_coefficients(self):
         bounds = [(0.0, 1.0), (2.0, 4.0)]
-        ok = MINLPSearchExplainer.solve_linear_constraint_lp([0.0, 0.0], 0.0, bounds)
+        ok = solve_linear_constraint([0.0, 0.0], 0.0, bounds)
         assert ok["success"]
         np.testing.assert_allclose(ok["solution"], [0.5, 3.0])
-        assert not MINLPSearchExplainer.solve_linear_constraint_lp([0.0, 0.0], 1.0, bounds)[
-            "success"
-        ]
+        assert not solve_linear_constraint([0.0, 0.0], 1.0, bounds)["success"]
 
 
 class TestFindCounterfactuals:

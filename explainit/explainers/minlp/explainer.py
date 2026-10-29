@@ -1,15 +1,28 @@
 import copy
 import itertools
-import warnings
 from collections.abc import Sequence
 from dataclasses import dataclass, field
-from math import factorial
 from typing import Any
 
 import numpy as np
-from scipy.optimize import linprog, minimize
+from scipy.optimize import minimize
 
 from explainit._random import make_rngs
+from explainit.explainers.minlp.intervals import (
+    allowed_interval_constraint_value,
+    clip_to_allowed,
+    extract_positive_intervals,
+    in_allowed_intervals,
+    project_to_allowed_intervals,
+)
+from explainit.explainers.minlp.linear_program import solve_linear_constraint
+from explainit.explainers.minlp.scoring import (
+    feature_priority,
+    priority_benefit,
+    priority_peaks,
+    total_weight,
+)
+from explainit.explainers.minlp.shapley import shapley_values
 from explainit.logging_config import logger
 from explainit.utils.priority_plots import plot_priorities as _plot_priorities
 
@@ -178,7 +191,7 @@ class MINLPSearchExplainer:
             if allowed_intervals:
                 feature_allowed_mask = np.array(
                     [
-                        self._in_allowed_intervals(float(v), allowed_intervals)
+                        in_allowed_intervals(float(v), allowed_intervals)
                         for v in self.dataset[:, idx]
                     ],
                     dtype=bool,
@@ -214,50 +227,6 @@ class MINLPSearchExplainer:
             int(np.sum(global_allowed_mask)),
             n_rows,
         )
-
-    @staticmethod
-    def _in_allowed_intervals(value: float, intervals: list, tol: float = 1e-12) -> bool:
-        if not intervals:
-            return False
-        return any(value >= lo - tol and value <= hi + tol for lo, hi in intervals)
-
-    @staticmethod
-    def _allowed_interval_constraint_value(value: float, intervals: list) -> float:
-        if not intervals:
-            return -1.0
-        return max(min(value - lo, hi - value) for lo, hi in intervals)
-
-    @staticmethod
-    def _project_to_allowed_intervals(value: float, intervals: list) -> float:
-        if not intervals:
-            return value
-        if MINLPSearchExplainer._in_allowed_intervals(value, intervals):
-            return value
-        candidates = []
-        for lo, hi in intervals:
-            candidates.append(lo)
-            candidates.append(hi)
-        return float(min(candidates, key=lambda c: abs(c - value)))
-
-    @staticmethod
-    def _extract_positive_intervals(
-        x_grid: np.ndarray, y_grid: np.ndarray, positive_eps: float = 1e-12
-    ) -> list:
-        mask = np.asarray(y_grid, dtype=float) > float(positive_eps)
-        intervals = []
-        i = 0
-        n = len(x_grid)
-        while i < n:
-            if not mask[i]:
-                i += 1
-                continue
-            start = i
-            while i + 1 < n and mask[i + 1]:
-                i += 1
-            end = i
-            intervals.append((float(x_grid[start]), float(x_grid[end])))
-            i += 1
-        return intervals
 
     def _derive_bounds_and_intervals_from_priorities(self, grid_size: int = 2000):
         logger.info("--- STAGE 0/6: Derive numerical bounds from priority functions ---")
@@ -301,7 +270,7 @@ class MINLPSearchExplainer:
             y_grid = np.array(y_values, dtype=float)
             y_grid[~np.isfinite(y_grid)] = 0.0
 
-            intervals = self._extract_positive_intervals(x_grid, y_grid, positive_eps=1e-12)
+            intervals = extract_positive_intervals(x_grid, y_grid, positive_eps=1e-12)
             if not intervals:
                 raise ValueError(
                     f"Feature {idx} has no positive-priority region on dataset range "
@@ -443,10 +412,7 @@ class MINLPSearchExplainer:
             allowed_intervals = cfg.get("allowed_intervals") if isinstance(cfg, dict) else None
             if allowed_intervals:
                 in_interval_mask = np.array(
-                    [
-                        self._in_allowed_intervals(float(v), allowed_intervals)
-                        for v in data_np[:, idx]
-                    ],
+                    [in_allowed_intervals(float(v), allowed_intervals) for v in data_np[:, idx]],
                     dtype=bool,
                 )
                 data_np = data_np[in_interval_mask]
@@ -497,419 +463,27 @@ class MINLPSearchExplainer:
     # Calculating Shapley values (3)
     ##################################
 
-    def calc_shapley(
-        self, r: list, use_approximation: bool = False, num_samples: int = 200
-    ) -> list:
+    def calc_shapley(self, r, use_approximation: bool = False, num_samples: int = 200):
+        """Stage 3: Shapley values of ``r`` against the target exemplar.
+
+        Stores them in ``sample_state.shapley_values``; see
+        :func:`shapley.shapley_values`.
         """
-        Calculate Shapley values for feature importance in counterfactual explanations.
-
-        This implementation treats categorical feature groups as single units for Shapley
-        calculation, avoiding redundant calculations for one-hot encoded features.
-        """
-        cat_groups = [list(elem) for elem in self.priorities_state.categorical_priorities]
-
-        def create_feature_mapping():
-            """Create mapping from original features to Shapley calculation units"""
-            feature_map = {}
-            shapley_idx = 0
-
-            # Map numerical features (1:1 mapping)
-            for num_idx in self.priorities_state.numerical_priorities:
-                feature_map[num_idx] = shapley_idx
-                shapley_idx += 1
-
-            # Map categorical groups (many:1 mapping)
-            cat_to_shapley = {}
-            for cat_group in cat_groups:
-                for cat_idx in cat_group:
-                    feature_map[cat_idx] = shapley_idx
-                cat_to_shapley[tuple(cat_group)] = shapley_idx
-                shapley_idx += 1
-
-            return feature_map, cat_to_shapley, shapley_idx
-
-        def create_consolidated_vectors(
-            original_r, original_x, feature_map, total_shapley_features
-        ):
-            """Convert original feature vectors to consolidated representation"""
-            consolidated_r = [0] * total_shapley_features
-            consolidated_x = [0] * total_shapley_features
-
-            # Handle numerical features
-            for num_idx in self.priorities_state.numerical_priorities:
-                shapley_idx = feature_map[num_idx]
-                consolidated_r[shapley_idx] = original_r[num_idx]
-                consolidated_x[shapley_idx] = original_x[num_idx]
-
-            # Handle categorical groups - represent as tuples
-            for cat_group in cat_groups:
-                shapley_idx = feature_map[
-                    cat_group[0]
-                ]  # All indices in group map to same shapley_idx
-                r_values = tuple(original_r[i] for i in cat_group)
-                x_values = tuple(original_x[i] for i in cat_group)
-                consolidated_r[shapley_idx] = r_values
-                consolidated_x[shapley_idx] = x_values
-
-            return consolidated_r, consolidated_x
-
-        def expand_to_original_format(consolidated_vector, feature_map, original_length):
-            """Expand consolidated vector back to original feature space"""
-            expanded = [0] * original_length
-
-            # Handle numerical features
-            for num_idx in self.priorities_state.numerical_priorities:
-                shapley_idx = feature_map[num_idx]
-                expanded[num_idx] = consolidated_vector[shapley_idx]
-
-            # Handle categorical groups
-            for cat_group in cat_groups:
-                shapley_idx = feature_map[cat_group[0]]
-                cat_values = consolidated_vector[shapley_idx]
-                if isinstance(cat_values, tuple):
-                    for i, cat_idx in enumerate(cat_group):
-                        expanded[cat_idx] = cat_values[i]
-                else:
-                    # Fallback: use same value for all in group
-                    for cat_idx in cat_group:
-                        expanded[cat_idx] = cat_values
-
-            return expanded
-
-        def z_of_S_batch_consolidated(
-            S_list, consolidated_r, consolidated_x, feature_map, original_length
-        ):
-            """Create batch of hybrid vectors using consolidated representation"""
-            z_batch = []
-
-            for S in S_list:
-                # Start with reference vector
-                z_consolidated = consolidated_r.copy()
-
-                # Replace features in S with values from x
-                for i in S:
-                    z_consolidated[i] = consolidated_x[i]
-
-                # Expand back to original format for model prediction
-                z_expanded = expand_to_original_format(z_consolidated, feature_map, original_length)
-                z_batch.append(z_expanded)
-
-            return np.array(z_batch)
-
-        def shapley_value_vectorized_consolidated(
-            i, consolidated_x, consolidated_r, f, n, feature_map, original_length
-        ):
-            """Vectorized Shapley calculation for consolidated features"""
-            others = [j for j in range(n) if j != i]
-
-            all_subsets = []
-            all_subsets_with_i = []
-            all_weights = []
-
-            total_subsets = 2 ** len(others)
-            logger.info(
-                "[Stage 3] Exact Shapley for unit %d/%d: enumerating %d subsets (O(2^(n-1)) work).",
-                i + 1,
-                n,
-                total_subsets,
-            )
-
-            for k in range(len(others) + 1):
-                for S in itertools.combinations(others, k):
-                    S = set(S)
-                    weight = factorial(len(S)) * factorial(n - len(S) - 1) / factorial(n)
-
-                    all_subsets.append(S)
-                    all_subsets_with_i.append(S | {i})
-                    all_weights.append(weight)
-
-            # Create batches for prediction
-            z_without_batch = z_of_S_batch_consolidated(
-                all_subsets, consolidated_r, consolidated_x, feature_map, original_length
-            )
-            z_with_batch = z_of_S_batch_consolidated(
-                all_subsets_with_i, consolidated_r, consolidated_x, feature_map, original_length
-            )
-
-            # Batch predictions
-            pred_without_batch = f(z_without_batch)
-            pred_with_batch = f(z_with_batch)
-
-            # Ensure proper shape
-            if pred_without_batch.ndim > 1:
-                pred_without_batch = pred_without_batch.flatten()
-            if pred_with_batch.ndim > 1:
-                pred_with_batch = pred_with_batch.flatten()
-
-            # Calculate weighted differences
-            diff_batch = pred_with_batch - pred_without_batch
-            weighted_contributions = np.array(all_weights) * diff_batch
-
-            total = np.sum(weighted_contributions)
-            return total
-
-        def shapley_value_approximate_consolidated(
-            i, consolidated_x, consolidated_r, f, n, feature_map, original_length, num_samples=200
-        ):
-            """Approximate Shapley calculation for consolidated features"""
-            others = [j for j in range(n) if j != i]
-
-            logger.info(
-                "[Stage 3] Approximate Shapley for unit %d/%d: averaging %d "
-                "random subsets (Monte-Carlo estimator).",
-                i + 1,
-                n,
-                num_samples,
-            )
-
-            all_subsets = []
-            all_subsets_with_i = []
-
-            for _ in range(num_samples):
-                subset_size = self._py_rng.randint(0, len(others))
-                if subset_size == 0:
-                    S = set()
-                elif subset_size == len(others):
-                    S = set(others)
-                else:
-                    S = set(self._py_rng.sample(others, subset_size))
-
-                all_subsets.append(S)
-                all_subsets_with_i.append(S | {i})
-
-            # Create batches for prediction
-            z_without_batch = z_of_S_batch_consolidated(
-                all_subsets, consolidated_r, consolidated_x, feature_map, original_length
-            )
-            z_with_batch = z_of_S_batch_consolidated(
-                all_subsets_with_i, consolidated_r, consolidated_x, feature_map, original_length
-            )
-
-            # Batch predictions
-            pred_without_batch = f(z_without_batch)
-            pred_with_batch = f(z_with_batch)
-
-            # Ensure proper shape
-            if pred_without_batch.ndim > 1:
-                pred_without_batch = pred_without_batch.flatten()
-            if pred_with_batch.ndim > 1:
-                pred_with_batch = pred_with_batch.flatten()
-
-            # Calculate average marginal contribution
-            diff_batch = pred_with_batch - pred_without_batch
-            total = np.mean(diff_batch)
-
-            return total
-
-        # Main calculation logic
-        original_r = r
-        original_x = self.sample_state.target_exemplar
-        f = self.model_pred
-        original_length = len(original_r)
-
-        # Create feature mapping and consolidated vectors
-        feature_map, _cat_to_shapley, total_shapley_features = create_feature_mapping()
-        consolidated_r, consolidated_x = create_consolidated_vectors(
-            original_r, original_x, feature_map, total_shapley_features
+        phi, self.sample_state.shapley_values = shapley_values(
+            self.model_pred,
+            r,
+            self.sample_state.target_exemplar,
+            self.priorities_state.numerical_priorities,
+            self.priorities_state.categorical_priorities,
+            use_approximation=use_approximation,
+            num_samples=num_samples,
+            py_rng=self._py_rng,
         )
-
-        logger.info(
-            "[Stage 3] Consolidating features for Shapley: %d original cols -> "
-            "%d units (numerical kept 1:1, each one-hot group merged).",
-            original_length,
-            total_shapley_features,
-        )
-        logger.info(
-            "[Stage 3] Numerical features tracked: %d | Categorical groups: %d",
-            len(self.priorities_state.numerical_priorities),
-            len(cat_groups),
-        )
-
-        # Calculate Shapley values for consolidated features
-        if use_approximation:
-            phi = [
-                shapley_value_approximate_consolidated(
-                    i,
-                    consolidated_x,
-                    consolidated_r,
-                    f,
-                    total_shapley_features,
-                    feature_map,
-                    original_length,
-                    num_samples,
-                )
-                for i in range(total_shapley_features)
-            ]
-        else:
-            phi = [
-                shapley_value_vectorized_consolidated(
-                    i,
-                    consolidated_x,
-                    consolidated_r,
-                    f,
-                    total_shapley_features,
-                    feature_map,
-                    original_length,
-                )
-                for i in range(total_shapley_features)
-            ]
-
-        # Create dictionary mapping feature indices/groups to their Shapley values
-        shapley_dict = {"numerical": {}, "categorical": {}}
-        shapley_idx = 0
-
-        # Map numerical features (single indices as keys)
-        for num_idx in self.priorities_state.numerical_priorities:
-            shapley_dict["numerical"][num_idx] = phi[shapley_idx]
-            shapley_idx += 1
-
-        # Map categorical groups (tuples of indices as keys)
-        for cat_group in cat_groups:
-            shapley_dict["categorical"][tuple(cat_group)] = phi[shapley_idx]
-            shapley_idx += 1
-
-        # Store in SampleState
-        self.sample_state.shapley_values = shapley_dict
-
-        return np.array(phi, dtype=float)
+        return phi
 
     #################################################################
     # Confirm existence of solution for each categorical combination (4)
     #################################################################
-
-    # Helper function to solve_linear_constraint_lp. Fallback corner analysis method for LP solving
-    @staticmethod
-    def _fallback_corner_analysis(coefficients, target, bounds, tolerance):
-        """Fallback method using corner point analysis"""
-        corners = []
-        for bound in bounds:
-            corners.append([bound[0], bound[1]])
-
-        corner_points = list(itertools.product(*corners))
-
-        best_error = float("inf")
-        best_solution = None
-
-        for corner in corner_points:
-            corner = np.array(corner)
-            value = np.dot(coefficients, corner)
-            error = abs(value - target)
-
-            if error < best_error:
-                best_error = error
-                best_solution = corner
-
-        if best_error < tolerance:
-            return {
-                "success": True,
-                "solution": best_solution,
-                "message": f"Corner solution found with error {best_error:.2e}",
-                "method_used": "corner_analysis",
-                "constraint_value": np.dot(coefficients, best_solution),
-                "error": best_error,
-            }
-        else:
-            return {
-                "success": False,
-                "solution": None,
-                "message": f"No feasible solution found. Best error: {best_error:.2e}",
-                "method_used": "corner_analysis",
-            }
-
-    # function for finding initial solution for counterfactual search (4.5)
-    @staticmethod
-    def solve_linear_constraint_lp(coefficients, target, bounds, method="auto", tolerance=1e-8):
-        """
-        Production-ready linear programming solver for constraint satisfaction
-
-        Args:
-            coefficients: array-like, coefficients [a₁, a₂, ..., aₙ]
-            target: float, target value for a₁x₁ + a₂x₂ + ... + aₙxₙ = target
-            bounds: list of tuples, [(min₁, max₁), (min₂, max₂), ...]
-            method: str, LP algorithm ('highs', 'interior-point', 'revised simplex')
-            tolerance: float, tolerance for constraint satisfaction
-
-        Returns:
-            dict: {'success': bool, 'solution': array, 'message': str, 'method_used': str}
-        """
-        coefficients = np.array(coefficients)
-        n = len(coefficients)
-
-        # Input validation
-        if len(bounds) != n:
-            return {
-                "success": False,
-                "solution": None,
-                "message": "Bounds length must match coefficients length",
-                "method_used": None,
-            }
-
-        # Check if all coefficients are zero
-        if np.allclose(coefficients, 0):
-            if abs(target) < tolerance:
-                # Any point in bounds is a solution
-                solution = np.array([(b[0] + b[1]) / 2 for b in bounds])
-                return {
-                    "success": True,
-                    "solution": solution,
-                    "message": "Trivial solution (all coefficients zero)",
-                    "method_used": "analytical",
-                }
-            else:
-                return {
-                    "success": False,
-                    "solution": None,
-                    "message": "No solution (all coefficients zero, target non-zero)",
-                    "method_used": None,
-                }
-
-        # Try different methods if auto is selected
-        methods_to_try = ["highs", "interior-point"] if method == "auto" else [method]
-
-        for current_method in methods_to_try:
-            try:
-                # Set up LP problem
-                # Convert equality to two inequalities
-                A_ub = np.array([coefficients, -coefficients])
-                b_ub = np.array([target, -target])
-
-                # Dummy objective (just find feasible point)
-                c = np.zeros(n)
-
-                # Suppress warnings for cleaner output
-                with warnings.catch_warnings():
-                    warnings.simplefilter("ignore")
-                    result = linprog(
-                        c=c,
-                        A_ub=A_ub,
-                        b_ub=b_ub,
-                        bounds=bounds,
-                        method=current_method,
-                        options={"presolve": True},
-                    )
-
-                if result.success:
-                    # Verify solution
-                    constraint_value = np.dot(coefficients, result.x)
-                    error = abs(constraint_value - target)
-
-                    if error < tolerance:
-                        return {
-                            "success": True,
-                            "solution": result.x,
-                            "message": f"Solution found with error {error:.2e}",
-                            "method_used": current_method,
-                            "constraint_value": constraint_value,
-                            "error": error,
-                        }
-
-            except Exception:
-                continue
-
-        # If no method worked, try corner analysis
-        return MINLPSearchExplainer._fallback_corner_analysis(
-            coefficients, target, bounds, tolerance
-        )
 
     # Calculating shap cefficients and new targets for linear search (4.3)
     def extract_for_linear_search(self):
@@ -1315,7 +889,7 @@ class MINLPSearchExplainer:
             for idx, val in temp_combo.items():
                 dummy_x[idx] = val
 
-            linear_solution = MINLPSearchExplainer.solve_linear_constraint_lp(
+            linear_solution = solve_linear_constraint(
                 coeff_to_linear_search,
                 temp_target,
                 bounds_for_linear_search,
@@ -1467,100 +1041,13 @@ class MINLPSearchExplainer:
 
         return result
 
-    # objective function
     def calculate_total_weight(self, values):
-        """
-        Calculate total weight (cost) based on priorities dictionary and input values list.
-
-        This function computes the total cost of changing features from the original sample
-        to the proposed counterfactual values. It validates that all values are within
-        allowed ranges for numerical features and acceptable categorical combinations.
-
-        The weight calculation follows the priority functions defined in self.priorities:
-        - For numerical features: applies the weight function to the feature value
-        - For categorical features: uses predefined weights for specific combinations
-        - For non-actionable features (function=None): contributes 0 to total weight
-
-        Args:
-            values: List of values where each element corresponds to its feature index
-
-        Returns:
-            float: Total calculated weight (cost) for the proposed feature changes
-
-        Raises:
-            ValueError: If any value is outside allowed range or invalid categorical combination
-        """
-        total_weight = 0
-
-        # Process numerical features
-        for feature_id, feature_config in self.priorities_state.numerical_priorities.items():
-            if feature_id >= len(values):
-                raise ValueError(
-                    f"Not enough values provided. Missing value for index {feature_id}"
-                )
-
-            current_value = values[feature_id]
-
-            # Check if feature is non-actionable (function=None)
-            if isinstance(feature_config, dict):
-                function = feature_config.get("function")
-                if function is None:
-                    # Non-actionable feature, contributes 0 to total weight
-                    # Should be fixed at min=max=sample value
-                    pass
-                else:
-                    # Actionable feature: validate value is within min/max range
-                    min_val = feature_config["min"]
-                    max_val = feature_config["max"]
-
-                    if current_value < min_val or current_value > max_val:
-                        raise ValueError(
-                            f"Value {current_value} at index {feature_id} is outside allowed range [{min_val}, {max_val}]"
-                        )
-                    allowed_intervals = feature_config.get("allowed_intervals")
-                    if allowed_intervals and not self._in_allowed_intervals(
-                        float(current_value), allowed_intervals
-                    ):
-                        raise ValueError(
-                            f"Value {current_value} at index {feature_id} is in a zero-priority gap; "
-                            f"allowed intervals: {allowed_intervals}"
-                        )
-
-                    # Apply the weight function
-                    weight = function(current_value)
-                    total_weight += weight
-            else:
-                # Old format fallback (feature_config == 0 or None)
-                # Non-actionable, contributes 0 to total weight
-                pass
-
-        # Process categorical features
-        for (
-            feature_indices,
-            categorical_weights,
-        ) in self.priorities_state.categorical_priorities.items():
-            # Extract values for this categorical group using their indices
-            group_values = []
-            for idx in feature_indices:
-                if idx >= len(values):
-                    raise ValueError(f"Not enough values provided. Missing value for index {idx}")
-                group_values.append(float(values[idx]))
-
-            # Convert to tuple for dictionary lookup
-            value_tuple = tuple(group_values)
-
-            # Validate categorical combination exists in allowed combinations
-            if value_tuple not in categorical_weights:
-                allowed_combinations = list(categorical_weights.keys())
-                raise ValueError(
-                    f"Invalid categorical combination: {value_tuple} for features {feature_indices}. "
-                    f"Allowed combinations: {allowed_combinations}"
-                )
-
-            # Add weight for this categorical combination
-            total_weight += categorical_weights[value_tuple]
-
-        return total_weight
+        """Priority benefit of ``values``; see :func:`scoring.total_weight`."""
+        return total_weight(
+            values,
+            self.priorities_state.numerical_priorities,
+            self.priorities_state.categorical_priorities,
+        )
 
     #################################################################
     # Main function to find counterfactuals
@@ -1982,15 +1469,13 @@ class MINLPSearchExplainer:
                 cfg = self.priorities_state.numerical_priorities.get(feature_idx, {})
                 allowed_intervals = cfg.get("allowed_intervals") if isinstance(cfg, dict) else None
                 if allowed_intervals:
-                    x0[j] = self._project_to_allowed_intervals(float(x0[j]), allowed_intervals)
+                    x0[j] = project_to_allowed_intervals(float(x0[j]), allowed_intervals)
                     constraints.append(
                         {
                             "type": "ineq",
                             "fun": (
                                 lambda x, _j=j, _intervals=allowed_intervals: (
-                                    self._allowed_interval_constraint_value(
-                                        float(x[_j]), _intervals
-                                    )
+                                    allowed_interval_constraint_value(float(x[_j]), _intervals)
                                 )
                             ),
                         }
@@ -2078,72 +1563,27 @@ class MINLPSearchExplainer:
         return counterfactuals
 
     def _priority_benefit(self, cf):
-        """``calculate_total_weight(cf)`` or ``None`` when ``cf`` is out of range.
-
-        ``calculate_total_weight`` is the *priority benefit* that the search
-        maximises (higher is better, same quantity as
-        ``priority_methods.methods.compute_priority_score``). It raises for
-        values outside the allowed range / inside a zero-priority gap, which
-        SLSQP can still produce, so callers get ``None`` instead of an
-        exception.
-        """
-        try:
-            return float(self.calculate_total_weight(cf))
-        except ValueError as exc:
-            logger.debug("Priority benefit unavailable for candidate: %s", exc)
-            return None
+        return priority_benefit(
+            cf,
+            self.priorities_state.numerical_priorities,
+            self.priorities_state.categorical_priorities,
+        )
 
     def _feature_priority(self, idx: int, value: float) -> float:
-        """Priority weight of a single numerical feature at ``value`` (0 if invalid)."""
-        cfg = self.priorities_state.numerical_priorities.get(idx, {})
-        fn = cfg.get("function") if isinstance(cfg, dict) else None
-        if fn is None:
-            return 0.0
-        try:
-            w = float(np.asarray(fn(float(value))).squeeze())
-        except Exception:
-            return 0.0
-        return w if np.isfinite(w) else 0.0
+        return feature_priority(self.priorities_state.numerical_priorities.get(idx, {}), value)
 
-    def _priority_peaks(self, grid_size: int = 1000) -> dict[int, tuple]:
-        """``{feature_index: (peak_value, peak_weight)}`` for actionable features.
-
-        The peak is the argmax of the feature's priority function over its
-        allowed intervals. Priority functions are analytic, so this costs no
-        model calls; the result is cached because priorities do not change
-        during a run.
-        """
-        if getattr(self, "_priority_peaks_cache", None) is not None:
-            return self._priority_peaks_cache
-        peaks: dict[int, tuple] = {}
-        for idx, cfg in self.priorities_state.numerical_priorities.items():
-            if not isinstance(cfg, dict) or cfg.get("function") is None:
-                continue
-            intervals = cfg.get("allowed_intervals") or [(cfg["min"], cfg["max"])]
-            best_v, best_w = None, float("-inf")
-            for lo, hi in intervals:
-                xs = np.linspace(float(lo), float(hi), int(grid_size))
-                ws = np.array([self._feature_priority(idx, v) for v in xs])
-                k = int(ws.argmax())
-                if ws[k] > best_w:
-                    best_w, best_v = float(ws[k]), float(xs[k])
-            if best_v is not None:
-                peaks[idx] = (best_v, best_w)
-        self._priority_peaks_cache = peaks
-        return peaks
+    def _priority_peaks(self) -> dict[int, tuple]:
+        """Cached :func:`scoring.priority_peaks`; priorities do not change during a run."""
+        if getattr(self, "_priority_peaks_cache", None) is None:
+            self._priority_peaks_cache = priority_peaks(self.priorities_state.numerical_priorities)
+        return self._priority_peaks_cache
 
     def _clip_to_allowed(self, idx: int, value: float) -> float:
-        cfg = self.priorities_state.numerical_priorities.get(idx, {})
-        intervals = cfg.get("allowed_intervals") if isinstance(cfg, dict) else None
-        v = float(value)
-        if intervals:
-            v = self._project_to_allowed_intervals(v, intervals)
-        lo, hi = self.priorities_state.bounds.get(idx, (None, None))
-        if lo is not None:
-            v = max(v, float(lo))
-        if hi is not None:
-            v = min(v, float(hi))
-        return v
+        return clip_to_allowed(
+            value,
+            self.priorities_state.numerical_priorities.get(idx, {}),
+            self.priorities_state.bounds.get(idx, (None, None)),
+        )
 
     def _peak_lock_in(self, cf, max_sweeps: int = 3, max_compensators: int = 3):
         """Stage 7: greedy peak lock-in with Shapley compensation.
@@ -3051,15 +2491,13 @@ class MINLPSearchExplainer:
                 cfg = self.priorities_state.numerical_priorities.get(feature_idx, {})
                 allowed_intervals = cfg.get("allowed_intervals") if isinstance(cfg, dict) else None
                 if allowed_intervals:
-                    x0[j] = self._project_to_allowed_intervals(float(x0[j]), allowed_intervals)
+                    x0[j] = project_to_allowed_intervals(float(x0[j]), allowed_intervals)
                     constraints.append(
                         {
                             "type": "ineq",
                             "fun": (
                                 lambda x, _j=j, _intervals=allowed_intervals: (
-                                    self._allowed_interval_constraint_value(
-                                        float(x[_j]), _intervals
-                                    )
+                                    allowed_interval_constraint_value(float(x[_j]), _intervals)
                                 )
                             ),
                         }
