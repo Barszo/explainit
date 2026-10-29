@@ -1,0 +1,77 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  FORCE_COLOR: "1"
+
+jobs:
+  lint:
+    name: Lint (pre-commit)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+      - run: uvx pre-commit run --all-files --show-diff-on-failure
+
+  tests:
+    name: Tests (Python ${{ matrix.python-version }}, ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python-version: ["3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Run tests
+        run: uv run --no-dev --group test pytest --cov --cov-report=term --cov-report=xml
+
+  minimum-versions:
+    name: Tests (minimum dependency versions)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          python-version: "3.12"
+      - name: Run tests against the lowest declared dependency versions
+        run: uv run --resolution lowest-direct --no-dev --group test pytest
+
+  package:
+    name: Build and verify package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          python-version: "3.13"
+      - name: Build sdist and wheel
+        run: uv build
+      - name: Check distribution metadata
+        run: uvx twine check --strict dist/*
+      - name: Install the wheel in a clean environment and run smoke tests
+        run: |
+          uv venv "$RUNNER_TEMP/wheel-env"
+          source "$RUNNER_TEMP/wheel-env/bin/activate"
+          uv pip install dist/*.whl pytest
+          cd "$RUNNER_TEMP"
+          python -m pytest -p no:cacheprovider "$GITHUB_WORKSPACE/tests/test_installation.py"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist
+          path: dist/

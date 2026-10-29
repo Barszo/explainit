@@ -1,16 +1,11 @@
-from explainit.logging_config import logger
-# logger.info("This is an info message")
-# logger.debug("This is a debug message with details")
-# logger.warning("This is a warning message")
-# logger.error("This is an error message")
-
 import numpy as np
 
 ################################
 # Linear functions
 #################################
 
-def basic_linear(x : float, x0 : float, x1 : float, increasing : bool=True) -> np.ndarray:
+
+def basic_linear(x: float, x0: float, x1: float, increasing: bool = True) -> np.ndarray:
     """
     Linear function from 0 to 1 (increasing) or 1 to 0 (decreasing).
     If increasing=True: 0 for x <= x0, 1 for x >= x1.

@@ -1,17 +1,19 @@
+"""Preference-aware counterfactual explanations for machine learning models."""
 
-# Define the version of the package
 __version__ = "0.1.0"
 
-# Re-export commonly used objects.
-from .logging_config import logger
+from explainit.explainers import MINLPSearchExplainer, RandomSearchExplainer
+from explainit.logging_config import logger
+from explainit.priorities import basic_linear, basic_linear_step, exponential
+from explainit.utils.priority_plots import plot_priorities
 
-__all__ = ["logger"]
-
-# Initialization code can go here
-def _initialize():
-    """Initialize the package."""
-    # Add any initialization code here
-    pass
-
-# Run initialization
-_initialize()
+__all__ = [
+    "MINLPSearchExplainer",
+    "RandomSearchExplainer",
+    "__version__",
+    "basic_linear",
+    "basic_linear_step",
+    "exponential",
+    "logger",
+    "plot_priorities",
+]
