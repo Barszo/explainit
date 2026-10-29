@@ -8,10 +8,16 @@ import numpy as np
 from scipy.optimize import minimize
 
 from explainit._random import make_rngs
+from explainit.explainers.minlp.anchor import (
+    closest_row,
+    filter_rows,
+    generate_in_range,
+    probe_feasibility,
+)
+from explainit.explainers.minlp.bounds import TrustRegion, derive_bounds_and_intervals
 from explainit.explainers.minlp.intervals import (
     allowed_interval_constraint_value,
     clip_to_allowed,
-    extract_positive_intervals,
     in_allowed_intervals,
     project_to_allowed_intervals,
 )
@@ -23,6 +29,12 @@ from explainit.explainers.minlp.scoring import (
     total_weight,
 )
 from explainit.explainers.minlp.shapley import shapley_values
+from explainit.explainers.minlp.surrogate import (
+    categorical_contribution,
+    reachable_range,
+    surrogate_prediction,
+    unit_coefficients,
+)
 from explainit.logging_config import logger
 from explainit.utils.priority_plots import plot_priorities as _plot_priorities
 
@@ -138,14 +150,8 @@ class MINLPSearchExplainer:
         # Random streams for the stochastic steps (see ``make_rngs``); replaced
         # per run by ``find_counterfactuals``.
         self._np_rng, self._py_rng = make_rngs(None)
-        # Step-limiting state (Stage 4/5). ``_tr_fraction`` is the trust-region
-        # radius as a fraction of each feature's allowed span; ``None`` when the
-        # trust region is disabled.
-        self._tr_fraction = None
-        self._tr_min = 0.02
-        self._tr_max = 1.0
-        self._tr_expand = 2.0
-        self._tr_shrink = 0.5
+        # Step limit for each optimisation pass (Stages 4-5).
+        self._trust_region = TrustRegion()
         # Additive surrogate correction: the linear constraint aims at
         # ``target - _target_correction`` so the surrogate reproduces the last
         # measured model residual.
@@ -229,71 +235,13 @@ class MINLPSearchExplainer:
         )
 
     def _derive_bounds_and_intervals_from_priorities(self, grid_size: int = 2000):
-        logger.info("--- STAGE 0/6: Derive numerical bounds from priority functions ---")
-        logger.info(
-            "For each numerical feature, infer feasible ranges from where "
-            "priority function > 0 over dataset support; this overrides user "
-            "min/max and excludes internal zero-priority gaps."
+        derive_bounds_and_intervals(
+            self.priorities_state.numerical_priorities,
+            self.dataset,
+            self.sample_state.sample,
+            self._feature_label,
+            grid_size=grid_size,
         )
-
-        for idx, cfg in self.priorities_state.numerical_priorities.items():
-            if not isinstance(cfg, dict):
-                continue
-            fn = cfg.get("function")
-            dmin = float(np.min(self.dataset[:, idx]))
-            dmax = float(np.max(self.dataset[:, idx]))
-
-            # Non-actionable features remain fixed at their configured value.
-            if fn is None:
-                fixed_val = float(cfg.get("min", self.sample_state.sample[idx]))
-                cfg["min"] = fixed_val
-                cfg["max"] = fixed_val
-                cfg["allowed_intervals"] = [(fixed_val, fixed_val)]
-                continue
-
-            if abs(dmax - dmin) < 1e-12:
-                cfg["min"] = dmin
-                cfg["max"] = dmax
-                cfg["allowed_intervals"] = [(dmin, dmax)]
-                continue
-
-            x_grid = np.linspace(dmin, dmax, int(grid_size))
-            y_values = []
-            for x in x_grid:
-                try:
-                    y = float(fn(float(x)))
-                except Exception:
-                    y = 0.0
-                if not np.isfinite(y):
-                    y = 0.0
-                y_values.append(y)
-            y_grid = np.array(y_values, dtype=float)
-            y_grid[~np.isfinite(y_grid)] = 0.0
-
-            intervals = extract_positive_intervals(x_grid, y_grid, positive_eps=1e-12)
-            if not intervals:
-                raise ValueError(
-                    f"Feature {idx} has no positive-priority region on dataset range "
-                    f"[{dmin}, {dmax}]. Cannot derive feasible bounds."
-                )
-
-            derived_min = float(intervals[0][0])
-            derived_max = float(intervals[-1][1])
-            cfg["min"] = max(dmin, derived_min)
-            cfg["max"] = min(dmax, derived_max)
-            cfg["allowed_intervals"] = intervals
-
-            logger.info(
-                "[Stage 0] Feature %s (idx=%d): derived bounds=[%.6f, %.6f] "
-                "| dataset=[%.6f, %.6f] | allowed_intervals=%s",
-                self._feature_label(idx),
-                idx,
-                float(cfg["min"]),
-                float(cfg["max"]),
-                dmin,
-                dmax,
-                intervals,
-            )
 
     ################################################################
     # Finds element in dataset which prediction is closest to target
@@ -302,161 +250,17 @@ class MINLPSearchExplainer:
     ########################################################
     # Filter dataset based on bounds and categorical mapping
 
-    def get_rows_in_priorities(self):
-        """
-        Filter the dataset to include only samples that satisfy the priority constraints.
-
-        This method performs a two-stage filtering process to reduce the dataset to samples
-        that are actionable and within the specified bounds according to the priorities:
-
-        1. **Categorical Feature Filtering**: Removes samples with categorical combinations
-           marked as None (non-actionable) in the priorities dictionary
-        2. **Numerical Feature Filtering**: Removes samples where numerical features fall
-           outside the min/max bounds specified in the priorities
-
-        The filtering is essential for the counterfactual search process as it ensures
-        we only consider samples that:
-        - Respect the user's actionability constraints (categorical features)
-        - Fall within the user's acceptable ranges (numerical features)
-        - Can potentially be reached through valid feature modifications
-
-        ## Algorithm Details
-
-        **Categorical Filtering**:
-        - Identifies categorical combinations with None values in priorities
-        - For each unwanted combination, removes all dataset rows matching that exact combination
-        - Uses vectorized operations for efficient row removal
-
-        **Numerical Filtering**:
-        - Applies min/max bounds from the priorities_state.bounds property
-        - Filters rows where feature values fall outside [min_val, max_val] ranges
-        - Handles cases where only min or max bounds are specified
-
-        ## Error Handling
-
-        Raises exceptions if filtering results in an empty dataset, which would indicate:
-        - Overly restrictive constraints
-        - No feasible solutions exist within the specified priorities
-        - Potential issues with the priority configuration
-
-        Returns:
-            numpy.ndarray: Filtered dataset containing only samples that satisfy all
-                         priority constraints. Shape is (n_filtered_samples, n_features)
-                         where n_filtered_samples <= original dataset size.
-
-        Raises:
-            Exception: If filtering results in an empty dataset at any stage, indicating
-                      no samples satisfy the specified priority constraints.
-
-        Example:
-            >>> explainer = MINLPSearchExplainer(...)
-            >>> filtered_data = explainer.get_rows_in_priorities()
-            >>> print(f"Dataset reduced from {explainer.dataset.shape[0]} to {filtered_data.shape[0]} samples")
-
-        Note:
-            This method is automatically called by find_closest_elem() as part of the
-            counterfactual search pipeline. The filtered dataset is used to identify
-            the target exemplar that achieves the target prediction while respecting
-            all priority constraints.
-        """
-
-        def remv_cat(np_arr, idx_tup, vals):
-            mask = ~(np.all(data_np[:, idx_tup] == vals, axis=1))
-            return np_arr[mask]
-
-        logger.info(
-            "[Stage 1.1] Filtering dataset (%d rows) using priority "
-            "constraints (categorical None entries + numerical bounds)...",
-            self.dataset.shape[0],
-        )
-        data_np = self.dataset.copy()
-
-        # Categorical features
-        # checking which categorical features are None in priorities
-        unwanted_cat_groups = [
-            (group, cat_vals)
-            for group, mapping in self.priorities_state.categorical_priorities.items()
-            for cat_vals, v in mapping.items()
-            if v is None
-        ]
-
-        # removing samples (rows) that categorical features are None in priorities
-        if unwanted_cat_groups:
-            logger.info(
-                "[Stage 1.1a] Dropping rows matching disallowed categorical combos: %d combo(s)",
-                len(unwanted_cat_groups),
-            )
-        for group, cat_vals in unwanted_cat_groups:
-            data_np = remv_cat(data_np, group, cat_vals)
-            if data_np.size == 0:
-                raise Exception("There are no elements fulfilling the requirements")
-        logger.info("[Stage 1.1a] After categorical filtering: %d rows remain.", data_np.shape[0])
-
-        # Numerical features
-        # applying min/max bounds from priorities
-        # Skip non-actionable features (they don't participate in filtering)
-        num_bounds = self.priorities_state.bounds
-        non_actionable = self.priorities_state.non_actionable_indices
-        for idx, (min_val, max_val) in num_bounds.items():
-            # Skip non-actionable features
-            if idx in non_actionable:
-                continue
-
-            if min_val is not None:
-                data_np = data_np[data_np[:, idx] >= min_val]
-            if max_val is not None:
-                data_np = data_np[data_np[:, idx] <= max_val]
-            if data_np.size == 0:
-                raise Exception("There are no elements fulfilling the requirements")
-            cfg = self.priorities_state.numerical_priorities.get(idx, {})
-            allowed_intervals = cfg.get("allowed_intervals") if isinstance(cfg, dict) else None
-            if allowed_intervals:
-                in_interval_mask = np.array(
-                    [in_allowed_intervals(float(v), allowed_intervals) for v in data_np[:, idx]],
-                    dtype=bool,
-                )
-                data_np = data_np[in_interval_mask]
-                if data_np.size == 0:
-                    raise Exception("There are no elements fulfilling the requirements")
-        logger.info(
-            "[Stage 1.1b] After numerical bound filtering: %d rows remain.", data_np.shape[0]
-        )
-
-        return data_np
-
     ################################################################
     # Finds element in dataset (1)
     ################################################################
 
-    def find_closest_elem(self) -> list:
-        """
-        Finds the elements in the dataset that are closest to the desired target value +- epsilon.
-        Returns the actual samples of all such elements.
-        """
-        logger.info(
-            "[Stage 1.2] Searching the priority-filtered dataset for the row "
-            "whose model prediction best matches target=%.4f...",
-            float(self.target),
-        )
-        filtered_data = self.get_rows_in_priorities()
-        pred = self.model_pred(filtered_data)
-
-        min_dist = np.abs(pred - self.target).min()
-        logger.info(
-            "[Stage 1.2] Closest filtered-row prediction is %.4f away from target.", float(min_dist)
-        )
-        if min_dist > self.target_exemplar_epsilon:
-            raise ValueError(
-                f"No elements found within the specified epsilon of {self.target_exemplar_epsilon}. Closest distance is {min_dist}."
-            )
-
-        idx_all = np.where(np.abs(pred - self.target) == min_dist)[0]
-        assert len(idx_all) == 1, "Expected exactly one target exemplar index, but found multiple."
-        self.sample_state.target_exemplar = filtered_data[idx_all[0]]
-        logger.info(
-            "[Stage 1.2] Target exemplar locked in (filtered idx=%d, prediction=%.4f).",
-            int(idx_all[0]),
-            float(pred[idx_all[0]]),
+    def find_closest_elem(self) -> None:
+        """Stage 1: the priority-respecting dataset row closest to the target."""
+        self.sample_state.target_exemplar = closest_row(
+            self.model_pred,
+            filter_rows(self.dataset, self.priorities_state),
+            self.target,
+            self.target_exemplar_epsilon,
         )
 
     ##################################
@@ -485,184 +289,54 @@ class MINLPSearchExplainer:
     # Confirm existence of solution for each categorical combination (4)
     #################################################################
 
-    # Calculating shap cefficients and new targets for linear search (4.3)
     def extract_for_linear_search(self):
+        """Stage 4.3: linearise the model and build one LP target per combination.
+
+        Sets ``sample_state.shap_coeffs`` (per-unit coefficients) and returns
+        ``{combination_id: target}`` for ``coefficients . x = target``.
         """
-        Transform the nonlinear counterfactual search problem into linear programming subproblems.
-
-        This function is the core mathematical engine that converts the complex counterfactual
-        optimization problem into manageable linear programming problems. It uses Shapley values
-        to create linear approximations of how feature changes affect model predictions.
-
-        ## Mathematical Foundation
-
-        The function approximates the constraint equation:
-        ```
-        model_prediction(x) ≈ basic_prediction + Σ(unit_phi_i × (x_i - sample_i)) + categorical_contributions
-        ```
-
-        Where:
-        - `unit_phi_i` is the per-unit Shapley contribution for numerical feature i
-        - `categorical_contributions` are discrete Shapley values for categorical combinations
-
-        ## The Transformation Process
-
-        1. **Numerical Features**: Converts Shapley values into linear coefficients
-           - For each numerical feature i: `unit_phi_i = shapley_i / (target_exemplar_i - sample_i)`
-           - This gives the linear rate of change in prediction per unit change in feature
-
-        2. **Categorical Features**: Calculates discrete contributions
-           - Each categorical combination contributes a fixed Shapley value
-           - Only valid combinations from `cat_combinations` are considered
-
-        3. **Target Adjustment**: Creates adjusted targets for linear programming
-           - Original target: `self.target`
-           - Subtract categorical contributions and baseline effects
-           - Result: target value that numerical features must achieve
-
-        ## Why This Decomposition Works
-
-        By fixing categorical features to specific combinations, the problem becomes:
-        ```
-        Find numerical features x such that:
-        Σ(coefficient_i × x_i) = adjusted_target
-        ```
-
-        This is a standard linear programming constraint that can be solved efficiently.
-
-        ## Example Workflow
-
-        Suppose we want model prediction = 0.8, current prediction = 0.3:
-        1. Fix categorical features to combination A
-        2. Calculate categorical contribution: +0.2
-        3. Remaining gap to fill with numerical features: 0.8 - 0.3 - 0.2 = 0.3
-        4. Use Shapley coefficients to find numerical values achieving +0.3 prediction change
-
-        Args:
-            cat_combinations (dict): Dictionary mapping combination IDs to categorical feature
-                                   value dictionaries. Format: {combo_id: {feature_idx: value}}
-            shap_dict (dict): Shapley values organized as {'numerical': {idx: shap_val},
-                             'categorical': {feature_indices: shap_val}}
-            priorities_for_search (dict): Modified priorities containing actionable features with
-                                        bounds. Format: {'numerical': {idx: {'min': val, 'max': val}}}
-            basic_prediction (float): Model's prediction for the original sample
-
-        Returns:
-            tuple: (new_targets, shap_coeffs)
-                - new_targets (dict): Mapping from combination ID to adjusted target value
-                  that numerical features must achieve through linear programming
-                - shap_coeffs (dict): Linear coefficients and bounds for numerical features.
-                  Format: {feature_idx: {'coeff': linear_coefficient, 'min_max': (min, max)}}
-
-        Raises:
-            ValueError: If an invalid categorical combination is encountered that doesn't
-                       match either the sample or target_exemplar values
-
-        Example:
-            >>> cat_combos = {0: {3: 1.0, 4: 0.0}, 1: {3: 0.0, 4: 1.0}}
-            >>> shap_dict = {'numerical': {0: 0.1, 1: -0.2}, 'categorical': {(3,4): 0.15}}
-            >>> targets, coeffs = explainer.extract_for_linear_search(cat_combos, shap_dict,
-            ...                                                      priorities, 0.5)
-            >>> print(targets)  # {0: 0.23, 1: 0.08}  # Different targets per combination
-            >>> print(coeffs)   # {0: {'coeff': 2.5, 'min_max': (0, 1)}, ...}
-        """
-
-        num_shap = self.sample_state.shapley_values["numerical"]
-        cat_shap = self.sample_state.shapley_values["categorical"]
         cat_combinations = self.sample_state.all_combinations
-        basic_prediction = self.basic_prediction
+        coefficients, coef_times_original = unit_coefficients(
+            self.sample_state.shapley_values["numerical"],
+            self.sample_state.sample,
+            self.sample_state.target_exemplar,
+            self.priorities_state.numerical_priorities,
+            self.priorities_state.non_actionable_indices,
+        )
+        self.sample_state.shap_coeffs = coefficients
 
         new_targets = {}
-        coef_times_original = 0.0
-        shap_coeffs = {}
-
-        # calculating coefficients for numerical features
-        for key, _value in self.priorities_state.numerical_priorities.items():
-            denom = self.sample_state.target_exemplar[key] - self.sample_state.sample[key]
-            # If the feature value does not change between sample and target_exemplar,
-            # the unit coefficient is undefined; treat it as 0 to avoid NaNs.
-            temp_unit_phi = 0.0 if abs(float(denom)) < 1e-12 else num_shap[key] / denom
-            shap_coeffs[key] = temp_unit_phi  # save coefficient, even for non-actionable features
-
-            # Only include actionable features in coef_times_original
-            # Non-actionable features don't change, so they contribute 0 to the linear constraint
-            # The constraint function handles non-actionable features separately (x_i = sample_i always)
-            if key not in self.priorities_state.non_actionable_indices:
-                coef_times_original += temp_unit_phi * self.sample_state.sample[key]
-
-        self.sample_state.shap_coeffs = shap_coeffs
-
         if len(cat_combinations[0]) != 0:
-            # if there are categorical features
+            groups = list(self.sample_state.limited_priorities["categorical"])
             for combo_idx, combo in cat_combinations.items():
-                result = 0.0
                 if not combo:
                     logger.debug("Empty categorical combination %s, skipping", combo_idx)
                     continue
-
-                # ensure array is large enough for the highest index (max index is inclusive)
-                max_idx = max(combo.keys())
-                dummy_x = np.zeros(max_idx + 1, dtype=float)
-
-                for idx, val in combo.items():
-                    dummy_x[idx] = val
-
-                for key in self.sample_state.limited_priorities["categorical"]:
-                    feature_indices = key
-                    shap_value = cat_shap[feature_indices]
-
-                    # Extract current values from x
-                    current_values = tuple(float(dummy_x[idx]) for idx in feature_indices)
-                    sample_values = tuple(
-                        float(self.sample_state.sample[idx]) for idx in feature_indices
-                    )
-                    target_exemplar_values = tuple(
-                        float(self.sample_state.target_exemplar[idx]) for idx in feature_indices
-                    )
-
-                    if current_values == sample_values:
-                        result += 0.0
-                    elif current_values == target_exemplar_values:
-                        result += shap_value
-                    else:
-                        raise ValueError(
-                            f"Invalid categorical combination encountered for indices {feature_indices}: {current_values}"
-                        )
-
+                result = categorical_contribution(
+                    combo,
+                    groups,
+                    self.sample_state.shapley_values["categorical"],
+                    self.sample_state.sample,
+                    self.sample_state.target_exemplar,
+                )
                 new_targets[combo_idx] = (
                     self._pass_target(combo_idx, result)
                     - result
-                    - basic_prediction
+                    - self.basic_prediction
                     + coef_times_original
-                )  # - unactionable_sum
+                )
         else:
-            # no categorical features
-            new_targets[0] = self._pass_target(0, 0.0) - basic_prediction + coef_times_original
-
+            new_targets[0] = self._pass_target(0, 0.0) - self.basic_prediction + coef_times_original
         return new_targets
 
     def _reachable_surrogate_range(self) -> tuple:
-        """Interval the Shapley-linear prediction can span inside the search bounds.
-
-        Interval arithmetic over ``basic_prediction + sum_i c_i (x_i - x_i^k)``,
-        which costs nothing and tells the pass whether the target is reachable
-        in one step of the current trust region.
-        """
-        lo_total = hi_total = float(self.basic_prediction)
-        bounds = self._search_bounds()
-        non_actionable = set(self.priorities_state.non_actionable_indices)
-        for idx, coeff in (self.sample_state.shap_coeffs or {}).items():
-            if idx in non_actionable:
-                continue
-            lo, hi = bounds.get(idx, (None, None))
-            if lo is None or hi is None:
-                continue
-            x = float(self.sample_state.sample[idx])
-            d_lo = float(coeff) * (float(lo) - x)
-            d_hi = float(coeff) * (float(hi) - x)
-            lo_total += min(d_lo, d_hi)
-            hi_total += max(d_lo, d_hi)
-        return lo_total, hi_total
+        return reachable_range(
+            self.basic_prediction,
+            self.sample_state.shap_coeffs,
+            self._search_bounds(),
+            self.sample_state.sample,
+            set(self.priorities_state.non_actionable_indices),
+        )
 
     def _pass_target(self, combo_idx: int, categorical_contribution: float) -> float:
         """Target for this pass: the effective target, clipped to what is reachable.
@@ -978,68 +652,19 @@ class MINLPSearchExplainer:
     # Functions for optimisation
     #################################################################
 
-    # constraint function
     def constraint_function(
         self, x, shap_dict, sample, target_exemplar, priorities_for_search, basic_prediction
     ):
-        """
-        Constraint function based on SHAP values and feature changes.
-
-        This function estimates the model prediction for input x using linear approximation
-        based on Shapley values. It's used as a constraint during optimization to ensure
-        the counterfactual achieves the target prediction.
-
-        The approximation works by:
-        1. Starting with the basic prediction for the original sample
-        2. Adding linear contributions from numerical features based on their Shapley values
-        3. Adding discrete contributions from categorical features based on their Shapley values
-
-        Args:
-            x: Current feature values array/list
-            shap_dict: Dictionary containing SHAP values for numerical and categorical features
-            sample: Original sample feature values array/list
-            target_exemplar: Target exemplar feature values array/list
-            priorities_for_search: Modified priorities dictionary
-            basic_prediction: Model prediction for the original sample
-
-        Returns:
-            float: Estimated prediction value based on Shapley value approximation
-        """
-        cat_shap = shap_dict["categorical"]
-
-        result = basic_prediction
-
-        for key in priorities_for_search["numerical"]:
-            # Use pre-calculated coefficient from shap_coeffs instead of recalculating.
-            # ``x`` is always the full-length feature vector, so index by the
-            # feature's actual column index (numerical indices may be
-            # non-contiguous when categorical one-hot columns are present).
-            temp_unit_phi = self.sample_state.shap_coeffs[key]
-
-            result += temp_unit_phi * (x[key] - sample[key])
-
-        for key in priorities_for_search["categorical"]:
-            feature_indices = key
-            shap_value = cat_shap[feature_indices]
-
-            # Extract current values from x
-            current_values = tuple(
-                float(x[idx]) for idx in feature_indices
-            )  # tuple(float(x[len(priorities_for_search['numerical']) + i + j]) for j in range(len(feature_indices)))
-
-            sample_values = tuple(float(sample[idx]) for idx in feature_indices)
-            target_exemplar_values = tuple(float(target_exemplar[idx]) for idx in feature_indices)
-
-            if current_values == sample_values:
-                result += 0.0
-            elif current_values == target_exemplar_values:
-                result += shap_value
-            else:
-                raise ValueError(
-                    f"Invalid categorical combination encountered for indices {feature_indices}: {current_values}"
-                )
-
-        return result
+        """Surrogate prediction ``h(x)``; see :func:`surrogate.surrogate_prediction`."""
+        return surrogate_prediction(
+            x,
+            self.sample_state.shap_coeffs,
+            shap_dict,
+            sample,
+            target_exemplar,
+            priorities_for_search,
+            basic_prediction,
+        )
 
     def calculate_total_weight(self, values):
         """Priority benefit of ``values``; see :func:`scoring.total_weight`."""
@@ -1125,132 +750,48 @@ class MINLPSearchExplainer:
         )
         return abs(pred - float(self.target))
 
-    def _sample_from_allowed_region(self, cfg: dict) -> float:
-        """Draw a uniform value from a numerical feature's allowed region."""
-        intervals = cfg.get("allowed_intervals") if isinstance(cfg, dict) else None
-        if not intervals:
-            lo = cfg.get("min")
-            hi = cfg.get("max")
-            if lo is None or hi is None:
-                raise Exception("Feature has no allowed region to sample from.")
-            return float(self._np_rng.uniform(float(lo), float(hi)))
-        lengths = np.array([max(0.0, float(hi) - float(lo)) for lo, hi in intervals], dtype=float)
-        total = float(lengths.sum())
-        if total <= 0.0:
-            lo, _hi = intervals[int(self._np_rng.randint(len(intervals)))]
-            return float(lo)
-        pick = intervals[int(self._np_rng.choice(len(intervals), p=lengths / total))]
-        return float(self._np_rng.uniform(float(pick[0]), float(pick[1])))
-
-    def _sample_candidate_in_allowed_region(self) -> np.ndarray:
-        """Assemble one random candidate inside the allowed region.
-
-        Actionable numerical features are drawn uniformly from their allowed
-        interval(s); actionable categorical groups pick uniformly among allowed
-        combinations (priority weights are ignored on purpose); non-actionable
-        features stay frozen at the sample value.
-        """
-        sample = np.asarray(self.sample_state.sample, dtype=float)
-        cand = sample.copy()
-        for idx, cfg in self.priorities_state.numerical_priorities.items():
-            if not isinstance(cfg, dict) or cfg.get("function") is None:
-                cand[idx] = float(sample[idx])  # non-actionable: frozen
-                continue
-            cand[idx] = self._sample_from_allowed_region(cfg)
-        for group, mapping in self.priorities_state.categorical_priorities.items():
-            allowed = [
-                combo
-                for combo, weight in mapping.items()
-                if weight is not None and float(weight) > 0.0
-            ]
-            if not allowed:
-                raise Exception(
-                    f"Categorical group {group} has no allowed combinations to sample from."
-                )
-            combo = allowed[int(self._np_rng.randint(len(allowed)))]
-            for j, idx in enumerate(group):
-                cand[idx] = float(combo[j])
-        return cand
-
-    def _generate_exemplar_in_range(
-        self,
-        max_iterations: int = 10000,
-        random_seed=None,
-    ) -> float:
-        """Randomly generate an in-range exemplar near the target.
-
-        Samples the allowed region (see :meth:`_sample_candidate_in_allowed_region`)
-        and accepts the first candidate whose prediction lands within ``epsilon``
-        of the target, without regard to its priority score. This is *not* the
-        random-search comparison method - it only produces a reachable anchor for
-        MINLP; the subsequent optimisation is what maximises the preference score.
-        Returns ``|prediction - target|`` of the accepted point.
-        """
-        logger.info(
-            "[Stage 1 - fallback] Randomly generating an in-range exemplar: "
-            "sampling the allowed region for a point within epsilon=%.4f of "
-            "target (max_iterations=%d).",
-            float(self.epsilon),
-            int(max_iterations),
-        )
+    def _generate_exemplar_in_range(self, max_iterations: int = 10000, random_seed=None) -> float:
+        """Stage 1 fallback: a random in-range anchor; returns its distance to the target."""
         if random_seed is not None:
             self._np_rng = make_rngs(random_seed)[0]
-
-        for i in range(int(max_iterations)):
-            cand = self._sample_candidate_in_allowed_region()
-            pred = float(np.asarray(self.model_pred(cand.reshape(1, -1))).reshape(-1)[0])
-            if abs(pred - float(self.target)) <= float(self.epsilon):
-                self.sample_state.target_exemplar = cand
-                logger.info(
-                    "[Stage 1 - fallback] In-range exemplar found at iteration "
-                    "%d (|pred - target|=%.4f).",
-                    i + 1,
-                    abs(pred - float(self.target)),
-                )
-                return abs(pred - float(self.target))
-
-        raise Exception(
-            f"Could not randomly generate an in-range point within "
-            f"epsilon={self.epsilon} of target after {max_iterations} "
-            f"iterations."
+        self.sample_state.target_exemplar, distance = generate_in_range(
+            self.model_pred,
+            self.sample_state.sample,
+            self.priorities_state,
+            self.target,
+            self.epsilon,
+            max_iterations,
+            self._np_rng,
         )
+        return distance
 
     def probe_allowed_region_feasibility(
-        self,
-        max_iterations: int = 5000,
-        random_seed=None,
+        self, max_iterations: int = 5000, random_seed=None
     ) -> dict:
         """Measure whether the allowed region can reach the target at all.
 
-        Randomly samples the allowed region (ignoring preference, exactly like
-        :meth:`_generate_exemplar_in_range`) and reports whether any point lands
-        within ``epsilon`` of the target and the smallest ``|pred - target|``
-        seen. This separates *feasibility* (region cannot reach target) from
-        *convergence* (region can, but MINLP's optimiser did not) failures.
+        Randomly samples the allowed region (ignoring priorities) and reports
+        whether any point lands within ``epsilon`` of the target, and the
+        smallest ``|pred - target|`` seen. This separates *feasibility*
+        failures (the region cannot reach the target) from *convergence*
+        failures (it can, but the optimiser did not). Runs Stage 0 first.
 
-        Does not touch ``sample_state.target_exemplar``. Runs Stage 0 first so
-        the allowed intervals exist.
+        Returns:
+            dict: ``feasible_within_epsilon``, ``min_pred_distance`` and
+            ``iterations_run``.
         """
         self._derive_bounds_and_intervals_from_priorities()
         if random_seed is not None:
             self._np_rng = make_rngs(random_seed)[0]
-
-        min_dist = float("inf")
-        found_iter = None
-        for i in range(int(max_iterations)):
-            cand = self._sample_candidate_in_allowed_region()
-            pred = float(np.asarray(self.model_pred(cand.reshape(1, -1))).reshape(-1)[0])
-            dist = abs(pred - float(self.target))
-            if dist < min_dist:
-                min_dist = dist
-            if dist <= float(self.epsilon):
-                found_iter = i + 1
-                break
-        return {
-            "feasible_within_epsilon": found_iter is not None,
-            "min_pred_distance": float(min_dist),
-            "iterations_run": int(found_iter if found_iter is not None else max_iterations),
-        }
+        return probe_feasibility(
+            self.model_pred,
+            self.sample_state.sample,
+            self.priorities_state,
+            self.target,
+            self.epsilon,
+            max_iterations,
+            self._np_rng,
+        )
 
     def _stage2_log_bounds(self):
         """Surface the numerical bounds used by both LP and SLSQP."""
@@ -1274,46 +815,8 @@ class MINLPSearchExplainer:
         return float(self.target) - float(self._target_correction)
 
     def _search_bounds(self) -> dict[int, tuple]:
-        """Per-feature ``(lo, hi)`` for the LP and SLSQP, trust region included.
-
-        The trust region caps how far one pass may move each feature from the
-        current iterate, because the Shapley-linear surrogate is only accurate
-        near the point it was linearised at. Disabled -> the priority bounds.
-        """
-        bounds = self.priorities_state.bounds
-        if self._tr_fraction is None:
-            return dict(bounds)
-        center = np.asarray(self.sample_state.sample, dtype=float)
-        limited = {}
-        for idx, (lo, hi) in bounds.items():
-            if lo is None or hi is None:
-                limited[idx] = (lo, hi)
-                continue
-            lo, hi = float(lo), float(hi)
-            # The iterate can sit outside its own allowed range (the priority
-            # support need not contain the sample), so clamp before expanding.
-            c = min(max(float(center[idx]), lo), hi)
-            delta = float(self._tr_fraction) * (hi - lo)
-            limited[idx] = (max(lo, c - delta), min(hi, c + delta))
-        return limited
-
-    def _grow_trust_region(self) -> bool:
-        """Enlarge the trust region; ``False`` when already at full span."""
-        if self._tr_fraction is None or self._tr_fraction >= self._tr_max:
-            return False
-        self._tr_fraction = min(self._tr_max, self._tr_fraction * self._tr_expand)
-        logger.info(
-            "[Trust region] Enlarged to %.3f of each feature's allowed span.", self._tr_fraction
-        )
-        return True
-
-    def _shrink_trust_region(self) -> None:
-        if self._tr_fraction is None:
-            return
-        self._tr_fraction = max(self._tr_min, self._tr_fraction * self._tr_shrink)
-        logger.info(
-            "[Trust region] Shrunk to %.3f of each feature's allowed span.", self._tr_fraction
-        )
+        """Per-feature ``(lo, hi)`` for the LP and SLSQP, trust region included."""
+        return self._trust_region.limit(self.priorities_state.bounds, self.sample_state.sample)
 
     def _run_one_pass(self, shap_approx, num_samples):
         """Execute stages 3, 4 and 5 once for the current ``sample_state.sample``.
@@ -1366,7 +869,7 @@ class MINLPSearchExplainer:
         # retry, reusing the Shapley values just computed (no model calls).
         while True:
             init_vals_per_combo = self.confirm_existence_of_solution_for_combo()
-            if init_vals_per_combo or not self._grow_trust_region():
+            if init_vals_per_combo or not self._trust_region.grow():
                 break
             logger.info(
                 "[Stage 4] No warm start inside the trust region; retrying "
@@ -1990,9 +1493,11 @@ class MINLPSearchExplainer:
         self._fallback_random_max_iterations = int(fallback_random_max_iterations)
         self._random_seed = None if random_seed is None else int(random_seed)
         self._np_rng, self._py_rng = make_rngs(self._random_seed)
-        self._tr_fraction = float(trust_region_init) if trust_region else None
-        self._tr_min = float(trust_region_min)
-        self._tr_max = float(trust_region_max)
+        self._trust_region = TrustRegion(
+            fraction=float(trust_region_init) if trust_region else None,
+            minimum=float(trust_region_min),
+            maximum=float(trust_region_max),
+        )
         self._target_correction = 0.0
         self._residual_correction_enabled = bool(residual_correction)
         self._restoration_enabled = bool(restoration)
@@ -2131,13 +1636,19 @@ class MINLPSearchExplainer:
                 improved,
                 rho,
                 residual,
-                f"{self._tr_fraction:.3f}" if self._tr_fraction is not None else "off",
+                f"{self._trust_region.fraction:.3f}"
+                if self._trust_region.fraction is not None
+                else "off",
             )
 
             if accepted:
                 self._target_correction = 0.0
-                if self._tr_fraction is not None and np.isfinite(rho) and 0.5 <= rho <= 1.5:
-                    self._grow_trust_region()
+                if (
+                    self._trust_region.fraction is not None
+                    and np.isfinite(rho)
+                    and 0.5 <= rho <= 1.5
+                ):
+                    self._trust_region.grow()
             else:
                 if self._residual_correction_enabled:
                     self._target_correction = residual
@@ -2148,7 +1659,7 @@ class MINLPSearchExplainer:
                         self._effective_target(),
                         float(self.target),
                     )
-                self._shrink_trust_region()
+                self._trust_region.shrink()
 
             # An accepted step is progress even when it does not yet beat the
             # incumbent: the trust-region walk needs several passes to cross
@@ -2176,7 +1687,7 @@ class MINLPSearchExplainer:
                     "accepted_step": accepted,
                     "rho": (float(rho) if np.isfinite(rho) else None),
                     "residual": residual,
-                    "trust_fraction": self._tr_fraction,
+                    "trust_fraction": self._trust_region.fraction,
                     "target_correction": self._target_correction,
                 }
             )
@@ -2196,7 +1707,9 @@ class MINLPSearchExplainer:
             # always re-linearised at a point the true model agrees with. With
             # both step controls off, keep the historical behaviour of moving
             # to every candidate.
-            step_control = (self._tr_fraction is not None) or self._residual_correction_enabled
+            step_control = (
+                self._trust_region.fraction is not None
+            ) or self._residual_correction_enabled
             if accepted or not step_control:
                 self.sample_state.sample = list(cf)
                 logger.info(
@@ -2272,7 +1785,7 @@ class MINLPSearchExplainer:
             "peak_lock_in": peak_info,
             "step_control": {
                 "trust_region_enabled": bool(trust_region),
-                "trust_fraction_final": self._tr_fraction,
+                "trust_fraction_final": self._trust_region.fraction,
                 "residual_correction_enabled": self._residual_correction_enabled,
                 "accepted_steps": sum(1 for h in history if h.get("accepted_step")),
                 "rejected_steps": sum(1 for h in history if h.get("accepted_step") is False),
