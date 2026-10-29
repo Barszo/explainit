@@ -20,6 +20,7 @@ from explainit.explainers.minlp.intervals import (
     in_allowed_intervals,
     project_to_allowed_intervals,
 )
+from explainit.explainers.minlp.optimizer import optimise_combination
 from explainit.explainers.minlp.scoring import (
     feature_priority,
     priority_benefit,
@@ -703,154 +704,45 @@ class MINLPSearchExplainer:
             "combination; without categorical features the loop runs once."
         )
         bounds = self._search_bounds()
+        numerical_indices = list(self.priorities_state.numerical_priorities.keys())
         counterfactuals = []
         for i, values in init_vals_per_combo.items():
+            label = f"[combo {i + 1}/{len(init_vals_per_combo)}]"
             logger.info(
-                "[combo %d/%d] Preparing input from initial LP solution and "
-                "categorical assignment...",
-                i + 1,
-                len(init_vals_per_combo),
+                "%s Preparing input from initial LP solution and categorical assignment...", label
             )
             prepared_input = self.sample_state.sample.copy()
-            initial_numerical = values["initial_solution"]
-            cat_combo = values["categorical_combo"]
-            for idx, val in cat_combo.items():
+            for idx, val in values["categorical_combo"].items():
                 prepared_input[idx] = val
-            for idx, val in initial_numerical.items():
+            for idx, val in values["initial_solution"].items():
                 prepared_input[idx] = val
             logger.debug("Prepared input: %s", prepared_input)
 
-            def constraint_wrapper(
-                x,
-                shap_dict,
-                sample,
-                target_exemplar,
-                priorities_for_search,
-                basic_prediction,
-                ready_input,
-            ):
-                # ``x`` is the compact SLSQP vector (one entry per numerical
-                # feature, ordered like ``shap_dict['numerical']``); map each
-                # position back onto its original column in the full vector.
-                for j, idx in enumerate(shap_dict["numerical"].keys()):
-                    ready_input[idx] = x[j]
-
-                return self.constraint_function(
-                    ready_input,
-                    shap_dict,
-                    sample,
-                    target_exemplar,
-                    priorities_for_search,
-                    basic_prediction,
-                )
-
-            def objective_wrapper(x, priorities_for_search, ready_input):
-                for j, idx in enumerate(self.sample_state.shapley_values["numerical"].keys()):
-                    ready_input[idx] = x[j]
-                try:
-                    return self.calculate_total_weight(ready_input)
-                except ValueError:
-                    return -1e12
-
-            def constraint_fun(x, _prepared=prepared_input):
-                return constraint_wrapper(
-                    x,
-                    self.sample_state.shapley_values,
-                    self.sample_state.sample,
-                    self.sample_state.target_exemplar,
-                    self.sample_state.limited_priorities,
-                    basic_prediction=self.basic_prediction,
-                    ready_input=_prepared.copy(),
-                )
-
-            def objective_fun(x, _prepared=prepared_input):
-                return -objective_wrapper(x, self.sample_state.limited_priorities, _prepared.copy())
-
-            # Target of this pass: the real target unless the trust region can
-            # only reach part of the way (then the closest reachable value).
+            # The real target, unless the trust region can only reach part of
+            # the way (then the closest reachable value).
             pass_target = self._pass_targets.get(i, self._effective_target())
-
-            # Lower bound constraint: h(x) >= pass_target - epsilon
-            def lower_constraint(x, _t=pass_target, _h=constraint_fun):
-                return _h(x) - (_t - self.epsilon)
-
-            # Upper bound constraint: h(x) <= pass_target + epsilon
-            def upper_constraint(x, _t=pass_target, _h=constraint_fun):
-                return (_t + self.epsilon) - _h(x)
-
-            constraints = [
-                {"type": "ineq", "fun": lower_constraint},
-                {"type": "ineq", "fun": upper_constraint},
-            ]
-            numerical_indices = list(self.priorities_state.numerical_priorities.keys())
-            x0 = np.array([prepared_input[idx] for idx in numerical_indices])
-            bounds_list = [bounds[idx] for idx in numerical_indices]
-            for j, feature_idx in enumerate(numerical_indices):
-                cfg = self.priorities_state.numerical_priorities.get(feature_idx, {})
-                allowed_intervals = cfg.get("allowed_intervals") if isinstance(cfg, dict) else None
-                if allowed_intervals:
-                    x0[j] = project_to_allowed_intervals(float(x0[j]), allowed_intervals)
-                    constraints.append(
-                        {
-                            "type": "ineq",
-                            "fun": (
-                                lambda x, _j=j, _intervals=allowed_intervals: (
-                                    allowed_interval_constraint_value(float(x[_j]), _intervals)
-                                )
-                            ),
-                        }
-                    )
-            for j, (lo, hi) in enumerate(bounds_list):
-                if lo is not None:
-                    x0[j] = max(float(x0[j]), float(lo))
-                if hi is not None:
-                    x0[j] = min(float(x0[j]), float(hi))
-            logger.info(
-                "[combo %d/%d] Initial numerical x0=%s", i + 1, len(init_vals_per_combo), x0
+            result, complete_solution, h_solution = optimise_combination(
+                prepared_input,
+                numerical_indices,
+                self.priorities_state.numerical_priorities,
+                bounds,
+                self._surrogate,
+                self.calculate_total_weight,
+                pass_target,
+                self.epsilon,
+                label=label,
             )
-            logger.debug(
-                "[combo %d/%d] Constraints (bounded): h(x) in [%.4f, %.4f]",
-                i + 1,
-                len(init_vals_per_combo),
-                pass_target - self.epsilon,
-                pass_target + self.epsilon,
-            )
-            logger.debug(
-                "[combo %d/%d] Bounds list passed to SLSQP: %s",
-                i + 1,
-                len(init_vals_per_combo),
-                bounds_list,
-            )
-            logger.info(
-                "[combo %d/%d] Running SLSQP (maximise priority weight subject "
-                "to Shapley-linear constraint)...",
-                i + 1,
-                len(init_vals_per_combo),
-            )
-            result = minimize(
-                objective_fun,
-                x0,
-                method="SLSQP",
-                bounds=bounds_list,
-                constraints=constraints,
-            )
-
-            complete_solution = prepared_input.copy()
-            for j, idx in enumerate(self.sample_state.shapley_values["numerical"].keys()):
-                complete_solution[idx] = result.x[j]
             counterfactuals.append(complete_solution)
             model_prediction = float(self.model_pred([complete_solution])[0])
             abs_gap = abs(model_prediction - float(self.target))
             logger.info(
-                "[combo %d/%d] SLSQP done: success=%s | iterations=%s | "
-                "model_pred(cf)=%.4f | constraint h(x)=%.4f | "
-                "objective(weight)=%.4f",
-                i + 1,
-                len(init_vals_per_combo),
+                "%s SLSQP done: success=%s | iterations=%s | model_pred(cf)=%.4f | "
+                "constraint h(x)=%.4f | objective(weight)=%.4f",
+                label,
                 getattr(result, "success", None),
                 getattr(result, "nit", "?"),
                 model_prediction,
-                float(constraint_fun(result.x)),
+                float(h_solution),
                 float(-result.fun),
             )
             iter_no = getattr(self, "_workflow_iteration", None)
@@ -872,13 +764,8 @@ class MINLPSearchExplainer:
                     abs_gap,
                 )
             logger.debug(
-                "[combo %d/%d] Optimal x=%s | message=%s",
-                i + 1,
-                len(init_vals_per_combo),
-                result.x,
-                getattr(result, "message", ""),
+                "%s Optimal x=%s | message=%s", label, result.x, getattr(result, "message", "")
             )
-            logger.debug("-----")
 
         return counterfactuals
 
