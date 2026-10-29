@@ -4,12 +4,23 @@ import matplotlib
 
 matplotlib.use("Agg")
 
+import os
+
 import matplotlib.pyplot as plt
 import numpy as np
 import pytest
+from hypothesis import settings
 
 from explainit.priorities.linear import basic_linear
 from explainit.priorities.nonlinear import exponential
+
+# Hypothesis profiles: "default" for local runs, "ci" is reproducible (selected
+# automatically on CI), "thorough" explores many more problems:
+#   pytest tests/test_invariants.py --hypothesis-profile=thorough
+settings.register_profile("default", max_examples=30)
+settings.register_profile("ci", max_examples=30, derandomize=True, print_blob=True)
+settings.register_profile("thorough", max_examples=500)
+settings.load_profile("ci" if os.environ.get("CI") else "default")
 
 
 @pytest.fixture(autouse=True)
@@ -75,3 +86,11 @@ def mixed_dataset():
     category = rng.integers(0, 2, size=40)
     one_hot = np.stack([category, 1 - category], axis=1)
     return np.hstack([numerical, one_hot])
+
+
+def pytest_addoption(parser):
+    parser.addoption(
+        "--update-snapshots",
+        action="store_true",
+        help="re-record tests/snapshots/results.json instead of comparing with it",
+    )

@@ -52,6 +52,39 @@ jobs:
       - name: Run tests against the lowest declared dependency versions
         run: uv run --resolution lowest-direct --no-dev --group test pytest
 
+  snapshots:
+    name: Snapshot tests (recorded dependency versions)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          python-version: "3.13"
+      # Keep these pins equal to the versions in tests/snapshots/results.json.
+      - name: Compare results with the recorded snapshots
+        run: >-
+          uv run --no-dev --group test --with numpy==2.3.3 --with scipy==1.16.2
+          pytest -m snapshot -rs
+
+  benchmark:
+    name: Quality benchmark (manual)
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          python-version: "3.13"
+      - name: Run the benchmark and compare with the baseline
+        run: >-
+          uv run --no-dev --group benchmark python benchmarks/run_benchmark.py
+          --compare benchmarks/results/baseline.json --output benchmark.json
+          >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: benchmark
+          path: benchmark.json
+
   package:
     name: Build and verify package
     runs-on: ubuntu-latest
