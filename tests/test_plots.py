@@ -1,7 +1,7 @@
 import numpy as np
 from conftest import linear_model, mixed_model
 
-from explainit.explainers.minlp_search import MINLPSearchExplainer
+from explainit.explainers.minlp import MINLPSearchExplainer
 from explainit.explainers.random_search import RandomSearchExplainer
 from explainit.utils import priority_plots
 

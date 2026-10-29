@@ -37,7 +37,7 @@ counterfactual.
 
 ## Shapley-guided MINLP search (`MINLPSearchExplainer`)
 
-Source: [`explainit/explainers/minlp_search.py`](../explainit/explainers/minlp_search.py)
+Source: [`explainit/explainers/minlp/`](../explainit/explainers/minlp/)
 
 The search treats counterfactual generation as a mixed-integer nonlinear
 program: maximise $S(\mathbf{x}')$ subject to reaching the target, with
@@ -45,15 +45,20 @@ categorical features as discrete choices. The true model is replaced locally by
 a linear surrogate built from Shapley values, and every candidate is re-checked
 with the real model. The stages match the `[Stage N]` messages in the log:
 
-| Stage | What happens |
-| --- | --- |
-| 0 | Derive each numerical feature's allowed region from where its priority is positive. |
-| 1 | Pick an **anchor**: a dataset row that respects the priorities and whose prediction is close to the target (falls back to random sampling of the allowed region). |
-| 3 | Compute Shapley values between the current point and the anchor (exact, or Monte-Carlo with `shap_approx=True`), giving a linear surrogate $h(\mathbf{x}')$. |
-| 4 | Prune categorical combinations that cannot help, then solve one linear program per combination for a feasible warm start. |
-| 5 | Optimise the preference score with SLSQP subject to $|h(\mathbf{x}') - y^*| \le \varepsilon$, inside a trust region. |
-| 6 | Evaluate the candidate with the real model, apply residual correction or restoration if it misses the band, and re-linearise around the new point. |
-| 7 | **Peak lock-in**: push features towards their highest-priority values while other features compensate, keeping the prediction in the band. |
+| Stage | What happens | Module |
+| --- | --- | --- |
+| 0 | Derive each numerical feature's allowed region from where its priority is positive. | `bounds.py` |
+| 1 | Pick an **anchor**: a dataset row that respects the priorities and whose prediction is close to the target (falls back to random sampling of the allowed region). | `anchor.py` |
+| 3 | Compute Shapley values between the current point and the anchor (exact, or Monte-Carlo with `shap_approx=True`), giving a linear surrogate $h(\mathbf{x}')$. | `shapley.py`, `surrogate.py` |
+| 4 | Prune categorical combinations that cannot help, then solve one linear program per combination for a feasible warm start. | `combinations.py`, `linear_program.py`, `warm_start.py` |
+| 5 | Optimise the preference score with SLSQP subject to $\lvert h(\mathbf{x}') - y^*\rvert \le \varepsilon$, inside a trust region. | `optimizer.py`, `bounds.py` (`TrustRegion`) |
+| 6 | Evaluate the candidate with the real model, apply residual correction or restoration if it misses the band, and re-linearise around the new point. | `refinement.py`, `incumbent.py` |
+| 7 | **Peak lock-in**: push features towards their highest-priority values while other features compensate, keeping the prediction in the band. | `refinement.py` |
+
+`explainer.py` holds `MINLPSearchExplainer`, which runs the stages in this
+order; `scoring.py` computes preference scores, `intervals.py` handles allowed
+intervals, and `binary.py` contains the separate search for binary
+classifiers.
 
 Stages 3 to 6 repeat for up to `max_iterations` passes, stopping early after
 `patience` passes without improvement. The best valid candidate is returned;

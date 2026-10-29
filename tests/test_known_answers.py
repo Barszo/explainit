@@ -5,11 +5,14 @@ achievable counterfactual of a linear problem comes from a linear program, and
 Shapley values of simple models have closed-form values.
 """
 
+import random
+
 import numpy as np
 import pytest
 from problems import CountingModel, random_linear_problem
 
 from explainit import MINLPSearchExplainer, RandomSearchExplainer, basic_linear, exponential
+from explainit.explainers.minlp.shapley import shapley_values
 
 SEEDS = range(8)
 
@@ -79,21 +82,21 @@ def test_minlp_moves_a_feature_the_model_ignores_to_its_best_value():
 
 
 class TestShapleyValues:
-    """``calc_shapley(r)`` attributes ``f(target_exemplar) - f(r)`` to the features."""
+    """``shapley_values`` attributes ``f(anchor) - f(reference)`` to the features."""
 
     @staticmethod
-    def shapley(model, x, r, **kwargs):
-        n = len(x)
-        priorities = {
-            "numerical": {
-                i: {"min": -10.0, "max": 10.0, "function": lambda v: basic_linear(v, -10, 10)}
-                for i in range(n)
-            },
-            "categorical": {},
-        }
-        explainer = MINLPSearchExplainer(model, priorities, np.asarray(r), 0.0, np.zeros((1, n)))
-        explainer.sample_state.target_exemplar = np.asarray(x, dtype=float)
-        return explainer.calc_shapley(np.asarray(r, dtype=float), **kwargs)
+    def shapley(model, x, r, use_approximation=False, num_samples=200):
+        phi, _ = shapley_values(
+            model,
+            np.asarray(r, dtype=float),
+            np.asarray(x, dtype=float),
+            numerical_indices=range(len(x)),
+            categorical_groups=[],
+            use_approximation=use_approximation,
+            num_samples=num_samples,
+            py_rng=random.Random(0),
+        )
+        return phi
 
     def test_additive_model_gives_each_feature_its_own_change(self):
         def model(X):
