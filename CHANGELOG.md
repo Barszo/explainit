@@ -26,8 +26,7 @@ listed explicitly.
 
 ### Changed
 
-- `MINLSearchExplainer` is renamed to `MINLPSearchExplainer`. The old name
-  still works but emits a `DeprecationWarning`.
+- `MINLSearchExplainer` is renamed to `MINLPSearchExplainer`.
 - Importing explainit no longer calls `logging.basicConfig(level=DEBUG)`.
   Configure logging in your application to see search progress.
 - Seeded searches no longer reset the global NumPy and `random` state. Results
@@ -40,6 +39,12 @@ listed explicitly.
   Matplotlib 3.9 (previously Python 3.13.5; the NumPy/SciPy minimums were not
   declared).
 - Packaging metadata moved from `setup.py` to `pyproject.toml`.
+
+### Removed
+
+- Unused MINLP code: the disconnected "bounds adjustment" suggestions
+  (`find_required_bounds_adjustments` and its helpers) and a duplicate
+  random-anchor fallback.
 
 ### Fixed
 
