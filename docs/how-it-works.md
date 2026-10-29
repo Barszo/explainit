@@ -19,7 +19,8 @@ proposed; the MINLP search also excludes zero-priority regions) and they
 
 ## Random search (`RandomSearchExplainer`)
 
-Source: [`explainit/explainers/random_search.py`](../explainit/explainers/random_search.py)
+Source: [`explainit/explainers/random_search.py`](../explainit/explainers/random_search.py);
+sampling in [`explainit/sampling.py`](../explainit/sampling.py)
 
 1. Immutable features are fixed at their sample value; forbidden categories
    are removed.
