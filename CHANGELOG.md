@@ -50,20 +50,9 @@ listed explicitly.
 
 ### Known issues
 
-Tracked as expected failures in `tests/test_known_bugs.py`:
-
-- `MINLPSearchExplainer` ignores the `min`/`max` of a feature wherever its
-  priority function is positive, so answers can leave the allowed range.
-- `MINLPSearchExplainer` writes derived bounds into the caller's priorities
-  dictionary, changing later runs that reuse it.
-- `find_counterfactuals_for_binary` overwrites the explainer's `target` and
-  `epsilon`.
-- `MINLPSearchExplainer` can return the dataset anchor without resetting
-  immutable features to the sample's values.
-- `RandomSearchExplainer` sets features missing from the priorities to 0,
-  crashes when scoring a forbidden (`None`) category, silently skips model
-  errors, and accepts `min > max`.
-- Plotting permanently changes global Matplotlib settings.
+Confirmed bugs and algorithm limitations are documented in
+[docs/known-issues.md](docs/known-issues.md). They will be fixed after the
+refactoring, which keeps behaviour identical.
 
 ## [0.1.0]
 

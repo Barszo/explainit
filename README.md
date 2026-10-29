@@ -259,6 +259,8 @@ logging.basicConfig(level=logging.INFO)
 
 - [How explainit works](docs/how-it-works.md): the two search methods, their
   stages, and how to read the search diagnostics.
+- [Known issues](docs/known-issues.md): confirmed bugs and limitations that
+  are scheduled for fixing.
 
 ## Project layout
 
