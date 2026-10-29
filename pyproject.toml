@@ -79,6 +79,8 @@ filterwarnings = [
     "error",
     # Old Matplotlib releases call pyparsing APIs that newer pyparsing deprecates.
     "ignore:'\\w+' deprecated - use '\\w+':DeprecationWarning",
+    # Snapshot CI job pins NumPy's CPU features; unknown names only warn.
+    "ignore:.*CPU features:ImportWarning",
 ]
 log_level = "INFO"
 
