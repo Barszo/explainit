@@ -1,9 +1,6 @@
 from collections.abc import Sequence
-from dataclasses import dataclass, field
-from typing import Any
 
 import numpy as np
-from scipy.optimize import minimize
 
 from explainit._random import make_rngs
 from explainit.explainers.minlp.anchor import (
@@ -12,13 +9,11 @@ from explainit.explainers.minlp.anchor import (
     generate_in_range,
     probe_feasibility,
 )
+from explainit.explainers.minlp.binary import rank, search_combinations
 from explainit.explainers.minlp.bounds import TrustRegion, derive_bounds_and_intervals
 from explainit.explainers.minlp.combinations import limit_combinations
 from explainit.explainers.minlp.intervals import (
-    allowed_interval_constraint_value,
     clip_to_allowed,
-    in_allowed_intervals,
-    project_to_allowed_intervals,
 )
 from explainit.explainers.minlp.optimizer import optimise_combination
 from explainit.explainers.minlp.refinement import (
@@ -28,6 +23,7 @@ from explainit.explainers.minlp.refinement import (
     restore_to_band,
     select_best_candidate,
 )
+from explainit.explainers.minlp.reporting import log_bounds, log_workflow_summary
 from explainit.explainers.minlp.scoring import (
     feature_priority,
     priority_benefit,
@@ -35,6 +31,7 @@ from explainit.explainers.minlp.scoring import (
     total_weight,
 )
 from explainit.explainers.minlp.shapley import shapley_values
+from explainit.explainers.minlp.state import PrioritiesState, SampleState
 from explainit.explainers.minlp.surrogate import (
     categorical_contribution,
     reachable_range,
@@ -44,73 +41,6 @@ from explainit.explainers.minlp.surrogate import (
 from explainit.explainers.minlp.warm_start import solve_warm_starts, warm_start_health
 from explainit.logging_config import logger
 from explainit.utils.priority_plots import plot_priorities as _plot_priorities
-
-
-@dataclass
-class SampleState:
-    # original sample that you want to modify to achieve target
-    sample: list = None
-    # target exemplar from dataset with prediction closest to target
-    target_exemplar: list = None
-    # Shapley values dictionary calculated between sample and target_exemplar
-    shapley_values: dict[Any, float] = None
-    # This dictionary excludes categories that do not change the prediction
-    # (shapley value is 0) it is done to limit number of combinations during search
-    limited_priorities: dict[str, Any] = None
-    # All combinations of categorical features to consider during search
-    all_combinations: dict[Any, list] = None
-
-
-@dataclass
-class PrioritiesState:
-    # TODO: at the end, make sure that the attributes are calculated once only when invoked, and then only when priorities are changed
-    priorities: dict[str, Any] = field(default_factory=dict)
-
-    @property
-    def numerical_priorities(self) -> dict[str, Any]:
-        return self.priorities.get("numerical", {})
-
-    @property
-    def categorical_priorities(self) -> dict[str, Any]:
-        return self.priorities.get("categorical", {})
-
-    @property
-    def bounds(self) -> dict[str, Any]:
-        bounds = {}
-        for idx, val in self.numerical_priorities.items():
-            if isinstance(val, dict):
-                min_val = val.get("min", None)
-                max_val = val.get("max", None)
-                bounds[idx] = (min_val, max_val)
-            else:
-                # This shouldn't happen with new format, but keep as fallback
-                bounds[idx] = (None, None)
-        return bounds
-
-    @property
-    def non_actionable_indices(self) -> list:
-        non_actionable = []
-
-        # Categorical groups: if only one category has a numeric (non-None) weight
-        # and all other category combinations are None, mark all indices in that group
-        # as non-actionable (append the individual feature indices).
-        for group, mapping in self.categorical_priorities.items():
-            if isinstance(mapping, dict):
-                non_none_count = sum(1 for v in mapping.values() if v is not None)
-                if non_none_count == 1:
-                    non_actionable.append(group)
-
-        # Numerical features: function=None marks non-actionable
-        # Non-actionable features have min == max (fixed at sample value)
-        for idx, val in self.numerical_priorities.items():
-            if isinstance(val, dict):
-                if val.get("function") is None:
-                    non_actionable.append(idx)
-            elif val is None:
-                # Old format fallback
-                non_actionable.append(idx)
-
-        return non_actionable
 
 
 class MINLPSearchExplainer:
@@ -177,68 +107,14 @@ class MINLPSearchExplainer:
         return f"feature_{idx}"
 
     def _log_workflow_initial_and_bounds(self):
-        initial_prediction = float(self.model_pred([self.sample_state.sample])[0])
-        self._workflow_log("")
-        self._workflow_log("==== MINLP WORKFLOW SUMMARY ====")
-        self._workflow_log("1) Initial prediction: %.6f", initial_prediction)
-        self._workflow_log("2) Target: %.6f", float(self.target))
-        self._workflow_log("")
-        self._workflow_log("3) Bounds per feature vs dataset min/max:")
-        n_rows = int(self.dataset.shape[0])
-        global_allowed_mask = np.ones(n_rows, dtype=bool)
-
-        for idx in sorted(self.priorities_state.numerical_priorities.keys()):
-            dataset_min = float(np.min(self.dataset[:, idx]))
-            dataset_max = float(np.max(self.dataset[:, idx]))
-            cfg = self.priorities_state.numerical_priorities.get(idx, {})
-            bounds_min, bounds_max = self.priorities_state.bounds[idx]
-            allowed_intervals = cfg.get("allowed_intervals") if isinstance(cfg, dict) else None
-
-            allowed_min = dataset_min if bounds_min is None else float(bounds_min)
-            allowed_max = dataset_max if bounds_max is None else float(bounds_max)
-            dataset_span = dataset_max - dataset_min
-            allowed_span = allowed_max - allowed_min
-            coverage_pct = (
-                100.0 if abs(dataset_span) < 1e-12 else (allowed_span / dataset_span) * 100.0
-            )
-            if allowed_intervals:
-                feature_allowed_mask = np.array(
-                    [
-                        in_allowed_intervals(float(v), allowed_intervals)
-                        for v in self.dataset[:, idx]
-                    ],
-                    dtype=bool,
-                )
-            else:
-                feature_allowed_mask = np.logical_and(
-                    self.dataset[:, idx] >= allowed_min,
-                    self.dataset[:, idx] <= allowed_max,
-                )
-            feature_allowed_pct = (
-                100.0 * float(np.sum(feature_allowed_mask)) / float(n_rows) if n_rows else 0.0
-            )
-            global_allowed_mask = np.logical_and(global_allowed_mask, feature_allowed_mask)
-
-            self._workflow_log(
-                "   - %s (idx=%d): bounds=[%.6f, %.6f] | dataset=[%.6f, %.6f] | allowed space=%.2f%% | allowed points=%.2f%%",
-                self._feature_label(idx),
-                idx,
-                allowed_min,
-                allowed_max,
-                dataset_min,
-                dataset_max,
-                coverage_pct,
-                feature_allowed_pct,
-            )
-        global_allowed_pct = (
-            100.0 * float(np.sum(global_allowed_mask)) / float(n_rows) if n_rows else 0.0
-        )
-        self._workflow_log("")
-        self._workflow_log(
-            "Global allowed samples (all numerical-feature bounds simultaneously): %.2f%% (%d/%d)",
-            global_allowed_pct,
-            int(np.sum(global_allowed_mask)),
-            n_rows,
+        log_workflow_summary(
+            self._workflow_log,
+            self.model_pred,
+            self.sample_state.sample,
+            self.target,
+            self.dataset,
+            self.priorities_state,
+            self._feature_label,
         )
 
     def _derive_bounds_and_intervals_from_priorities(self, grid_size: int = 2000):
@@ -618,19 +494,6 @@ class MINLPSearchExplainer:
             self._np_rng,
         )
 
-    def _stage2_log_bounds(self):
-        """Surface the numerical bounds used by both LP and SLSQP."""
-        logger.info("--- STAGE 2/6: Collect numerical-feature bounds from priorities ---")
-        logger.info(
-            "These (min, max) pairs constrain how far each numerical feature is "
-            "allowed to move during the LP and SLSQP searches."
-        )
-        logger.info("Bounds for numerical features: %s", self.priorities_state.bounds)
-        logger.info(
-            "Non-actionable feature indices (frozen at sample values): %s",
-            self.priorities_state.non_actionable_indices,
-        )
-
     def _effective_target(self) -> float:
         """Target the *surrogate* must hit so the true model lands on ``target``.
 
@@ -958,7 +821,7 @@ class MINLPSearchExplainer:
         # Stages 1 and 2 are anchor stages: they only depend on the
         # original sample/exemplar/priorities, so we run them exactly once.
         self._stage1_find_exemplar()
-        self._stage2_log_bounds()
+        log_bounds(self.priorities_state)
         self._log_workflow_initial_and_bounds()
 
         original_sample = list(self.sample_state.sample)
@@ -1392,148 +1255,19 @@ class MINLPSearchExplainer:
 
         logger.info(f"Processing {len(init_vals_per_combo)} categorical combinations")
 
-        ############
-        # 5. For each categorical combination, perform MINLP optimization
         logger.info("Starting MINLP search for binary classification counterfactuals...")
-        counterfactuals = []
-        predictions = []
-        scores = []
-        found_counts = []
-
-        for combo_id, values in init_vals_per_combo.items():
-            logger.info(f"Processing categorical combination {combo_id}...")
-            prepared_input = self.sample_state.sample.copy()
-
-            if values.get("initial_solution"):
-                initial_numerical = values["initial_solution"]
-                cat_combo = values.get("categorical_combo", {})
-            else:
-                # Use sample as initial solution if none provided
-                initial_numerical = {}
-                cat_combo = {}
-
-            for idx, val in cat_combo.items():
-                prepared_input[idx] = val
-            for idx, val in initial_numerical.items():
-                prepared_input[idx] = val
-
-            # Define constraint and objective functions
-            numerical_indices = list(self.priorities_state.numerical_priorities.keys())
-
-            def objective_wrapper(
-                x, prepared_input=prepared_input, numerical_indices=numerical_indices
-            ):
-                temp_input = prepared_input.copy()
-                for i, idx in enumerate(numerical_indices):
-                    if i < len(x):
-                        temp_input[idx] = x[i]
-                try:
-                    return self.calculate_total_weight(temp_input)
-                except ValueError:
-                    return -1e12
-
-            # For binary classification, use direct model prediction instead of Shapley approximation
-            def classification_constraint(
-                x, prepared_input=prepared_input, numerical_indices=numerical_indices
-            ):
-                temp_input = prepared_input.copy()
-                for i, idx in enumerate(numerical_indices):
-                    if i < len(x):
-                        temp_input[idx] = x[i]
-                pred = self.model_pred([temp_input])[0]
-                if target_class == 1:
-                    return pred - threshold  # pred > threshold
-                else:
-                    return threshold - pred  # pred < threshold
-
-            constraints = [{"type": "ineq", "fun": classification_constraint}]
-
-            x0 = np.array([prepared_input[idx] for idx in numerical_indices])
-            bounds_list = [bounds[idx] for idx in numerical_indices]
-            for j, feature_idx in enumerate(numerical_indices):
-                cfg = self.priorities_state.numerical_priorities.get(feature_idx, {})
-                allowed_intervals = cfg.get("allowed_intervals") if isinstance(cfg, dict) else None
-                if allowed_intervals:
-                    x0[j] = project_to_allowed_intervals(float(x0[j]), allowed_intervals)
-                    constraints.append(
-                        {
-                            "type": "ineq",
-                            "fun": (
-                                lambda x, _j=j, _intervals=allowed_intervals: (
-                                    allowed_interval_constraint_value(float(x[_j]), _intervals)
-                                )
-                            ),
-                        }
-                    )
-
-            logger.info(f"Starting optimization for combination {combo_id}...")
-            logger.debug(f"Initial values: {x0}")
-            logger.debug(f"Bounds: {bounds_list}")
-
-            try:
-                result = minimize(
-                    lambda x: -objective_wrapper(x),  # Maximize weight (minimize negative weight)
-                    x0,
-                    method="SLSQP",
-                    bounds=bounds_list,
-                    constraints=constraints,
-                    options={"maxiter": max_iterations, "ftol": 1e-6},
-                )
-
-                if (
-                    result.success or not result.success
-                ):  # Accept both success and partial convergence
-                    complete_solution = prepared_input.copy()
-                    for i, idx in enumerate(numerical_indices):
-                        complete_solution[idx] = result.x[i]
-
-                    # Verify the solution meets the classification constraint
-                    pred = self.model_pred([complete_solution])[0]
-                    is_valid = (pred > threshold) if target_class == 1 else (pred < threshold)
-
-                    logger.debug(
-                        f"Solution prediction: {pred:.4f}, valid: {is_valid}, message: {result.message}"
-                    )
-
-                    if is_valid:
-                        counterfactuals.append(complete_solution)
-                        predictions.append(pred)
-                        scores.append(objective_wrapper(result.x))
-                        found_counts.append(combo_id + 1)
-                        logger.info(
-                            f"Found valid counterfactual: pred={pred:.4f}, weight={scores[-1]:.4f}"
-                        )
-                    else:
-                        logger.debug(
-                            f"Solution doesn't meet classification constraint: pred={pred:.4f}, threshold={threshold}"
-                        )
-
-            except Exception as e:
-                logger.warning(f"Error during optimization for combination {combo_id}: {e}")
-                import traceback
-
-                logger.debug(traceback.format_exc())
-
-        # Sort by preference score (ascending = lower cost/weight is better)
-        if counterfactuals:
-            sorted_indices = np.argsort(scores)
-            counterfactuals = [counterfactuals[i] for i in sorted_indices]
-            predictions = [predictions[i] for i in sorted_indices]
-            scores = [scores[i] for i in sorted_indices]
-            found_counts = [found_counts[i] for i in sorted_indices]
-
-            # Limit to top N if requested
-            if return_top_n is not None and len(counterfactuals) > return_top_n:
-                counterfactuals = counterfactuals[:return_top_n]
-                predictions = predictions[:return_top_n]
-                scores = scores[:return_top_n]
-                found_counts = found_counts[:return_top_n]
-
-            logger.info(f"Found {len(counterfactuals)} valid counterfactuals")
-        else:
-            logger.warning("No valid counterfactuals found!")
-
-        return counterfactuals, predictions, scores, found_counts
+        results = search_combinations(
+            init_vals_per_combo,
+            self.sample_state.sample,
+            self.priorities_state.numerical_priorities,
+            bounds,
+            self.model_pred,
+            self.calculate_total_weight,
+            target_class,
+            threshold,
+            max_iterations,
+        )
+        return rank(*results, return_top_n=return_top_n)
 
     #################################################################
     # Utils

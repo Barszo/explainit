@@ -6,13 +6,13 @@ import pytest
 from conftest import mixed_model
 
 from explainit.explainers.minlp import MINLPSearchExplainer
-from explainit.explainers.minlp.explainer import PrioritiesState
 from explainit.explainers.minlp.intervals import (
     extract_positive_intervals,
     in_allowed_intervals,
     project_to_allowed_intervals,
 )
 from explainit.explainers.minlp.linear_program import solve_linear_constraint
+from explainit.explainers.minlp.state import PrioritiesState
 
 SAMPLE = np.array([0.1, 0.2, 0.0, 1.0])
 TARGET = 1.0
