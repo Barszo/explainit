@@ -1,3 +1,9 @@
+"""``MINLPSearchExplainer``: runs the MINLP search stages in order.
+
+The stages themselves live in the sibling modules; see
+``docs/how-it-works.md`` for the stage-to-module map.
+"""
+
 from collections.abc import Sequence
 
 import numpy as np
@@ -45,6 +51,23 @@ from explainit.utils.priority_plots import plot_priorities as _plot_priorities
 
 
 class MINLPSearchExplainer:
+    """Preference-aware counterfactual search guided by Shapley values.
+
+    Args:
+        model_pred: Callable mapping a 2-D array (or a list of rows) to one
+            prediction per row.
+        priorities: ``{"numerical": ..., "categorical": ...}``; see the README.
+        sample: The point to explain.
+        target: The desired prediction.
+        dataset: Reference rows (e.g. training data) used to find the anchor.
+        target_exemplar_epsilon: How close a dataset row's prediction must be
+            to ``target`` to serve as the anchor.
+        epsilon: Half-width of the target band a counterfactual must reach.
+        workflow_logger: Optional logger that receives a short human-readable
+            summary of each search.
+        feature_names: Names used in log messages.
+    """
+
     def __init__(
         self,
         model_pred,
