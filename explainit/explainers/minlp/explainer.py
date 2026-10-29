@@ -21,6 +21,13 @@ from explainit.explainers.minlp.intervals import (
     project_to_allowed_intervals,
 )
 from explainit.explainers.minlp.optimizer import optimise_combination
+from explainit.explainers.minlp.refinement import (
+    RefinementContext,
+    evaluate_candidate,
+    peak_lock_in as lock_in_priority_peaks,
+    restore_to_band,
+    select_best_candidate,
+)
 from explainit.explainers.minlp.scoring import (
     feature_priority,
     priority_benefit,
@@ -792,284 +799,21 @@ class MINLPSearchExplainer:
             self.priorities_state.bounds.get(idx, (None, None)),
         )
 
-    def _peak_lock_in(self, cf, max_sweeps: int = 3, max_compensators: int = 3):
-        """Stage 7: greedy peak lock-in with Shapley compensation.
-
-        Post-optimisation sweep over a *feasible* counterfactual ``cf``. For
-        each actionable numerical feature ``i`` (best potential gain first) it
-        proposes ``x_i = peak_i`` and pays for the resulting change of the
-        Shapley-linearised prediction, ``dh = c_i (peak_i - x_i)``, by moving the
-        feature ``j`` whose priority loses the least per unit of prediction
-        change: ``x_j -= dh / c_j``. One model call verifies the swap; if it
-        leaves the target band, one restoration step on ``j`` using the measured
-        residual is tried, and up to ``max_compensators`` alternative
-        compensating features are attempted before giving up on the feature. A
-        move is kept only when the point is inside the band *and* the total
-        priority benefit increased, so the incoming ``cf`` can never be made
-        worse.
-
-        Returns ``(cf, info)`` where ``info`` reports the priority before/after,
-        the accepted moves and the number of model calls spent.
-        """
-        info = {
-            "applied": False,
-            "sweeps_run": 0,
-            "accepted_moves": 0,
-            "model_calls": 0,
-            "priority_before": None,
-            "priority_after": None,
-            "priority_gain": 0.0,
-            "final_prediction": None,
-        }
-        coeffs_all = getattr(self.sample_state, "shap_coeffs", None)
-        if cf is None or not coeffs_all:
-            return cf, info
-
-        non_actionable = set(self.priorities_state.non_actionable_indices)
-        peaks = self._priority_peaks()
-        actionable = [
-            i
-            for i in peaks
-            if i not in non_actionable and abs(float(coeffs_all.get(i, 0.0))) > 1e-12
-        ]
-        if not actionable:
-            return cf, info
-
-        cur = np.asarray(cf, dtype=float).copy()
-        cur_priority = self._priority_benefit(list(cur))
-        if cur_priority is None:
-            return cf, info
-        info["applied"] = True
-        info["priority_before"] = cur_priority
-
-        logger.info("--- STAGE 7/7: Peak lock-in with Shapley compensation ---")
-        logger.info(
-            "Sweeping %d actionable feature(s); start priority=%.4f. Each move "
-            "locks a feature on its priority peak and pays for the linearised "
-            "prediction change with the cheapest compensating feature.",
-            len(actionable),
-            cur_priority,
+    def _refinement_context(self) -> RefinementContext:
+        """Snapshot of the current search state for the refinement steps."""
+        return RefinementContext(
+            model=self.model_pred,
+            target=self.target,
+            epsilon=self.epsilon,
+            coefficients=getattr(self.sample_state, "shap_coeffs", None),
+            immutable=set(self.priorities_state.non_actionable_indices),
+            surrogate=self._surrogate,
+            priority_benefit=self._priority_benefit,
+            feature_priority=self._feature_priority,
+            clip=self._clip_to_allowed,
+            priority_peaks=self._priority_peaks,
+            feature_label=self._feature_label,
         )
-
-        for sweep in range(int(max_sweeps)):
-            info["sweeps_run"] = sweep + 1
-            accepted_in_sweep = 0
-            order = sorted(
-                actionable,
-                key=lambda i: -(peaks[i][1] - self._feature_priority(i, cur[i])),
-            )
-            for i in order:
-                peak_v, peak_w = peaks[i]
-                gain = peak_w - self._feature_priority(i, cur[i])
-                if gain <= 1e-6:
-                    continue
-                c_i = float(coeffs_all[i])
-                dh = c_i * (peak_v - float(cur[i]))
-
-                compensators = []
-                for j in actionable:
-                    if j == i:
-                        continue
-                    c_j = float(coeffs_all[j])
-                    v_j = self._clip_to_allowed(j, float(cur[j]) - dh / c_j)
-                    cost = self._feature_priority(j, cur[j]) - self._feature_priority(j, v_j)
-                    if cost < gain:
-                        compensators.append((cost, j, v_j))
-                compensators.sort(key=lambda t: t[0])
-
-                accepted = None
-                for _cost, j, v_j in compensators[:max_compensators]:
-                    cand = cur.copy()
-                    cand[i] = peak_v
-                    cand[j] = v_j
-                    pred = float(np.asarray(self.model_pred([list(cand)])).reshape(-1)[0])
-                    info["model_calls"] += 1
-                    residual = pred - float(self.target)
-                    if abs(residual) > float(self.epsilon):
-                        # One restoration step on the compensating feature, using
-                        # the residual measured against the real model.
-                        cand[j] = self._clip_to_allowed(
-                            j, float(cand[j]) - residual / float(coeffs_all[j])
-                        )
-                        pred = float(np.asarray(self.model_pred([list(cand)])).reshape(-1)[0])
-                        info["model_calls"] += 1
-                        residual = pred - float(self.target)
-                        if abs(residual) > float(self.epsilon):
-                            logger.debug(
-                                "[Stage 7] %s -> peak, compensated by %s: "
-                                "rejected, |pred - target|=%.4f > epsilon.",
-                                self._feature_label(i),
-                                self._feature_label(j),
-                                abs(residual),
-                            )
-                            continue
-                    cand_priority = self._priority_benefit(list(cand))
-                    if cand_priority is None or cand_priority <= cur_priority + 1e-9:
-                        continue
-                    accepted = (cand, cand_priority, pred, j)
-                    break
-
-                if accepted is None:
-                    continue
-                cand, cand_priority, pred, j = accepted
-                logger.info(
-                    "[Stage 7] Accepted: %s -> peak %.4f, compensated by %s "
-                    "-> %.4f | priority %.4f -> %.4f | pred=%.4f.",
-                    self._feature_label(i),
-                    peak_v,
-                    self._feature_label(j),
-                    float(cand[j]),
-                    cur_priority,
-                    cand_priority,
-                    pred,
-                )
-                cur, cur_priority = cand, cand_priority
-                accepted_in_sweep += 1
-                info["accepted_moves"] += 1
-                info["final_prediction"] = pred
-
-            if accepted_in_sweep == 0:
-                break
-
-        info["priority_after"] = cur_priority
-        info["priority_gain"] = float(cur_priority - info["priority_before"])
-        logger.info(
-            "[Stage 7] Done: %d move(s) accepted over %d sweep(s) | "
-            "priority %.4f -> %.4f (+%.4f) | model calls=%d.",
-            info["accepted_moves"],
-            info["sweeps_run"],
-            info["priority_before"],
-            cur_priority,
-            info["priority_gain"],
-            info["model_calls"],
-        )
-        return list(cur), info
-
-    def _restore_to_band(self, cf, eval_info, max_steps: int = 3):
-        """Pull a near-miss candidate back into the target band.
-
-        Least-norm Shapley-Newton correction: distributing the measured
-        residual over the actionable features as ``dx = -r c / ||c||^2`` moves
-        the linearised prediction by exactly ``-r`` while changing the features
-        as little as possible, so most of the candidate's priority survives.
-        Costs at most ``max_steps`` model calls and is only attempted for
-        candidates SLSQP already produced.
-
-        Returns ``(cf, eval_info)`` when the point ends up inside the band,
-        otherwise ``(None, None)``.
-        """
-        coeffs = getattr(self.sample_state, "shap_coeffs", None)
-        if not coeffs:
-            return None, None
-        non_actionable = set(self.priorities_state.non_actionable_indices)
-        indices = [i for i in coeffs if i not in non_actionable and abs(float(coeffs[i])) > 1e-12]
-        if not indices:
-            return None, None
-        denom = sum(float(coeffs[i]) ** 2 for i in indices)
-        if denom < 1e-18:
-            return None, None
-
-        cur = np.asarray(cf, dtype=float).copy()
-        residual = float(eval_info["model_pred"]) - float(self.target)
-        for step in range(int(max_steps)):
-            for i in indices:
-                cur[i] = self._clip_to_allowed(
-                    i, float(cur[i]) - residual * float(coeffs[i]) / denom
-                )
-            pred = float(np.asarray(self.model_pred([list(cur)])).reshape(-1)[0])
-            residual = pred - float(self.target)
-            if abs(residual) <= float(self.epsilon):
-                restored = self._evaluate_candidate(list(cur))
-                logger.info(
-                    "[Restoration] Candidate pulled into the band in %d "
-                    "step(s): |f - target| %.4f -> %.4f | priority %s -> %s.",
-                    step + 1,
-                    eval_info["distance"],
-                    restored["distance"],
-                    eval_info["priority"],
-                    restored["priority"],
-                )
-                return list(cur), restored
-        logger.debug(
-            "[Restoration] Failed after %d step(s); |f - target|=%.4f.",
-            int(max_steps),
-            abs(residual),
-        )
-        return None, None
-
-    def _select_best_candidate(self, counterfactuals):
-        """Stage 6: pick the candidate with the highest priority benefit.
-
-        ``calculate_total_weight`` is maximised by the SLSQP objective (which
-        minimises its negation), so selection across categorical combinations
-        must pick the *largest* value. With no categorical features there is
-        exactly one candidate so this just returns it. Raises
-        :class:`RuntimeError` if no candidates are available so the iterative
-        loop can mark the iteration as failed.
-        """
-        logger.info("--- STAGE 6/6: Pick best counterfactual ---")
-        logger.info(
-            "Among %d candidate(s), pick the one with the highest priority "
-            "benefit (calculate_total_weight). With no categorical features "
-            "there is exactly one candidate.",
-            len(counterfactuals),
-        )
-        if not counterfactuals:
-            raise RuntimeError("No counterfactual candidates produced for selection.")
-        if len(counterfactuals) > 1:
-            best_counterfactual = None
-            best_benefit = float("-inf")
-            for cf in counterfactuals:
-                benefit = self._priority_benefit(cf)
-                logger.debug("Candidate priority benefit=%s", benefit)
-                if benefit is not None and benefit > best_benefit:
-                    best_benefit = benefit
-                    best_counterfactual = cf
-            if best_counterfactual is None:
-                logger.warning(
-                    "No candidate had an evaluable priority benefit; "
-                    "falling back to the first candidate."
-                )
-                return counterfactuals[0]
-            logger.info("Selected candidate priority benefit=%.4f", best_benefit)
-            return best_counterfactual
-        return counterfactuals[0]
-
-    def _evaluate_candidate(self, cf):
-        """Score ``cf`` against the real model and the Shapley surrogate.
-
-        Returns a dict with:
-          * ``model_pred``: real model output on ``cf``.
-          * ``h_x``: surrogate prediction (Shapley-linear approximation).
-            Falls back to NaN if the surrogate cannot be evaluated yet.
-          * ``distance``: ``|model_pred - target|``, used to rank candidates
-            only while no candidate satisfies the target band.
-          * ``priority``: priority benefit (``None`` if not evaluable), used
-            to rank candidates that do satisfy the band.
-          * ``feasible``: ``distance <= epsilon`` against the real model.
-        """
-        model_pred = float(self.model_pred([cf])[0])
-        try:
-            h_x = float(
-                self.constraint_function(
-                    cf,
-                    self.sample_state.shapley_values,
-                    self.sample_state.sample,
-                    self.sample_state.target_exemplar,
-                    self.sample_state.limited_priorities,
-                    basic_prediction=self.basic_prediction,
-                )
-            )
-        except Exception:
-            h_x = float("nan")
-        distance = abs(model_pred - float(self.target))
-        return {
-            "model_pred": model_pred,
-            "h_x": h_x,
-            "distance": distance,
-            "priority": self._priority_benefit(cf),
-            "feasible": distance <= float(self.epsilon),
-        }
 
     def find_counterfactuals(
         self,
@@ -1264,16 +1008,18 @@ class MINLPSearchExplainer:
             self._workflow_iteration = iteration + 1
             try:
                 candidates = self._run_one_pass(shap_approx, num_samples)
-                cf = self._select_best_candidate(candidates)
+                cf = select_best_candidate(self._refinement_context(), candidates)
             except Exception as exc:
                 logger.warning("Iteration %d failed during search pass: %s", iteration + 1, exc)
                 stop_reason = "search_failed"
                 self._last_search_exception = str(exc)
                 break
 
-            eval_info = self._evaluate_candidate(cf)
+            eval_info = evaluate_candidate(self._refinement_context(), cf)
             if not eval_info["feasible"] and self._restoration_enabled:
-                restored_cf, restored_eval = self._restore_to_band(cf, eval_info)
+                restored_cf, restored_eval = restore_to_band(
+                    self._refinement_context(), cf, eval_info
+                )
                 if restored_cf is not None:
                     cf, eval_info = restored_cf, restored_eval
                     restoration_hits += 1
@@ -1436,8 +1182,8 @@ class MINLPSearchExplainer:
 
         peak_info = None
         if peak_lock_in and best_feasible is not None:
-            improved_cf, peak_info = self._peak_lock_in(
-                best_feasible, max_sweeps=int(peak_lock_in_max_sweeps)
+            improved_cf, peak_info = lock_in_priority_peaks(
+                self._refinement_context(), best_feasible, max_sweeps=int(peak_lock_in_max_sweeps)
             )
             if peak_info["accepted_moves"] > 0:
                 best_feasible = improved_cf
