@@ -5,7 +5,8 @@ import numpy as np
 import pytest
 from conftest import mixed_model
 
-from explainit.explainers.minlp_search import MINLPSearchExplainer, PrioritiesState
+from explainit.explainers.minlp import MINLPSearchExplainer
+from explainit.explainers.minlp.explainer import PrioritiesState
 
 SAMPLE = np.array([0.1, 0.2, 0.0, 1.0])
 TARGET = 1.0

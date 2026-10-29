@@ -37,7 +37,7 @@ counterfactual.
 
 ## Shapley-guided MINLP search (`MINLPSearchExplainer`)
 
-Source: [`explainit/explainers/minlp_search.py`](../explainit/explainers/minlp_search.py)
+Source: [`explainit/explainers/minlp/`](../explainit/explainers/minlp/)
 
 The search treats counterfactual generation as a mixed-integer nonlinear
 program: maximise $S(\mathbf{x}')$ subject to reaching the target, with

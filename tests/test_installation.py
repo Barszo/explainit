@@ -16,7 +16,7 @@ from explainit.priorities.nonlinear import exponential
 @pytest.mark.parametrize(
     "name",
     [
-        "explainit.explainers.minlp_search",
+        "explainit.explainers.minlp",
         "explainit.explainers.random_search",
         "explainit.priorities.linear",
         "explainit.priorities.nonlinear",
@@ -86,7 +86,7 @@ def test_import_does_not_configure_logging():
 
 
 def test_top_level_exports():
-    from explainit.explainers.minlp_search import MINLPSearchExplainer
+    from explainit.explainers.minlp import MINLPSearchExplainer
     from explainit.priorities.linear import basic_linear
 
     assert explainit.MINLPSearchExplainer is MINLPSearchExplainer
