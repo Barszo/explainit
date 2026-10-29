@@ -26,10 +26,8 @@ priorities -- mirrors the old
 - ``plot_probability_distributions(priorities, ...)`` - walks the priorities
   dict and produces a distribution plot per actionable entry.
 
-Sampling helpers:
-- ``sample_numeric_value(constraint, max_tries=100)`` - rejection sampler used
-  by the distribution plots. Exposed so callers can reuse the exact same
-  sampling logic that the plots rely on.
+The distribution plots sample with :func:`explainit.sampling.sample_numeric_value`,
+the same sampler the random search uses.
 
 All functions accept an optional ``save_dir`` (or explicit ``save_path``) so
 callers can persist plots to disk without touching matplotlib state.
@@ -46,6 +44,7 @@ from typing import Any
 import matplotlib.pyplot as plt
 import numpy as np
 
+from explainit.sampling import sample_numeric_value
 from explainit.utils.plot_styles import (
     COLORS,
     apply_style,
@@ -155,42 +154,6 @@ def _bar_width_for(num_categories: int) -> float:
     if num_categories <= 6:
         return 0.6
     return 0.8
-
-
-def sample_numeric_value(
-    constraint: Mapping[str, Any], max_tries: int = 100, rng: Any = None
-) -> float:
-    """Rejection-sample a value from the [min, max] range proportional to
-    ``constraint['function']`` (which must take values in [0, 1]).
-
-    Falls back to a discretised inverse-transform on a 256-point grid if
-    rejection sampling does not succeed within ``max_tries`` iterations.
-
-    ``rng`` is a ``numpy.random.RandomState`` (or the ``numpy.random`` module,
-    the default, which uses the global stream).
-    """
-    if rng is None:
-        rng = np.random
-
-    min_val = float(constraint["min"])
-    max_val = float(constraint["max"])
-    f = constraint["function"]
-
-    for _ in range(max_tries):
-        rv = rng.uniform(min_val, max_val)
-        w = float(np.asarray(f(rv)).squeeze())
-        if rng.random() < w:
-            return float(rv)
-
-    xs = np.linspace(min_val, max_val, 256)
-    ws = np.asarray(f(xs)).astype(float).ravel()
-    ws = np.clip(ws, 0.0, None)
-    if ws.sum() == 0 or not np.isfinite(ws).all():
-        return float(rng.uniform(min_val, max_val))
-    p = ws / ws.sum()
-    idx = rng.choice(len(xs), p=p)
-    jitter = (max_val - min_val) / 256 * (rng.random() - 0.5)
-    return float(np.clip(xs[idx] + jitter, min_val, max_val))
 
 
 def _finalize(fig: plt.Figure, save_path: PathLike | None, show: bool) -> None:
@@ -1589,5 +1552,4 @@ __all__ = [
     "plot_numerical_probability_distribution",
     "plot_priorities",
     "plot_probability_distributions",
-    "sample_numeric_value",
 ]
