@@ -1,16 +1,20 @@
 """Snapshot ("characterisation") tests.
 
 Each scenario runs an explainer and compares the outputs, plus the number of
-model calls and rows, with a recording in ``tests/snapshots/results.json``.
+model calls and rows, with a recording in ``tests/snapshots/<platform>.json``.
 Refactoring that should not change behaviour must keep these identical.
 
-Optimiser results depend on the NumPy/SciPy versions, so the comparison only
-runs with the versions the snapshots were recorded with (CI has a dedicated
-job for this); otherwise the tests are skipped.
+Optimiser results depend on floating-point details of the platform and on the
+NumPy/SciPy versions, so there is one recording per operating system, and the
+comparison only runs with the versions it was recorded with (CI has a
+dedicated Linux job); otherwise the tests are skipped.
 
 After an intentional behaviour change, re-record with::
 
     pytest tests/test_snapshots.py --update-snapshots
+
+The CI snapshot job also records a fresh ``linux.json`` and uploads it as the
+``snapshots-linux`` artifact, so it can be updated without a Linux machine.
 """
 
 import json
@@ -25,7 +29,7 @@ from problems import CountingModel
 
 from explainit import MINLPSearchExplainer, RandomSearchExplainer, basic_linear, exponential
 
-SNAPSHOT_FILE = Path(__file__).parent / "snapshots" / "results.json"
+SNAPSHOT_DIR = Path(__file__).parent / "snapshots"
 
 pytestmark = pytest.mark.snapshot
 
@@ -208,9 +212,14 @@ def _run(name):
         logging.disable(logging.NOTSET)
 
 
-def _load():
-    if SNAPSHOT_FILE.exists():
-        return json.loads(SNAPSHOT_FILE.read_text(encoding="utf-8"))
+def _snapshot_file(config):
+    directory = config.getoption("--snapshot-dir") or SNAPSHOT_DIR
+    return Path(directory) / f"{sys.platform}.json"
+
+
+def _load(path):
+    if path.exists():
+        return json.loads(path.read_text(encoding="utf-8"))
     return {"versions": None, "results": {}}
 
 
@@ -231,17 +240,20 @@ def _assert_matches(actual, expected, path="result"):
 
 @pytest.mark.parametrize("name", sorted(SCENARIOS))
 def test_snapshot(name, request):
+    path = _snapshot_file(request.config)
     if request.config.getoption("--update-snapshots"):
-        data = _load()
+        data = _load(path)
         data["versions"] = {**_versions(), "python": sys.version.split()[0]}
         data["results"][name] = _run(name)
-        SNAPSHOT_FILE.parent.mkdir(exist_ok=True)
+        path.parent.mkdir(parents=True, exist_ok=True)
         ordered = dict(sorted(data["results"].items()))
         text = json.dumps({**data, "results": ordered}, indent=1, sort_keys=False)
-        SNAPSHOT_FILE.write_text(text + "\n", encoding="utf-8")
+        path.write_text(text + "\n", encoding="utf-8")
         return
 
-    data = _load()
+    if not path.exists():
+        pytest.skip(f"no snapshots recorded for platform {sys.platform!r}")
+    data = _load(path)
     recorded = data["versions"] or {}
     current = _versions()
     if any(recorded.get(lib) != current[lib] for lib in current):

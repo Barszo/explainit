@@ -92,5 +92,10 @@ def pytest_addoption(parser):
     parser.addoption(
         "--update-snapshots",
         action="store_true",
-        help="re-record tests/snapshots/results.json instead of comparing with it",
+        help="re-record tests/snapshots/<platform>.json instead of comparing with it",
+    )
+    parser.addoption(
+        "--snapshot-dir",
+        default=None,
+        help="directory holding the snapshot files (default: tests/snapshots)",
     )
