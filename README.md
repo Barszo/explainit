@@ -266,7 +266,7 @@ logging.basicConfig(level=logging.INFO)
 
 ```text
 explainit/
-├── explainers/   # RandomSearchExplainer, MINLPSearchExplainer
+├── explainers/   # RandomSearchExplainer; minlp/ holds MINLPSearchExplainer, one module per stage
 ├── priorities/   # built-in priority functions
 └── utils/        # plotting helpers
 docs/             # additional documentation

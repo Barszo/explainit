@@ -75,7 +75,7 @@ On the benchmark (`benchmarks/`), 0% of MINLP answers respected the allowed
 ranges, compared with 100% for random search.
 
 **Root cause.** Stage 0,
-`MINLPSearchExplainer._derive_bounds_and_intervals_from_priorities`, replaces
+`derive_bounds_and_intervals` in `explainit/explainers/minlp/bounds.py`, replaces
 each feature's `min`/`max` with the region where the priority function is
 positive *within the dataset's range*. The built-in ramps (`basic_linear`,
 `exponential`) keep a positive value (1.0 or the full ramp) outside
@@ -98,9 +98,9 @@ the constructor has new `min`/`max` values and an `allowed_intervals` key.
 Reusing the same dictionary for another explainer (as the README examples do)
 silently changes that explainer's behaviour.
 
-**Root cause.** `PrioritiesState` stores the caller's dictionary without
-copying it, and Stage 0 (`_derive_bounds_and_intervals_from_priorities`)
-writes into the per-feature dictionaries.
+**Root cause.** `PrioritiesState` (`minlp/state.py`) stores the caller's
+dictionary without copying it, and Stage 0 (`derive_bounds_and_intervals` in
+`minlp/bounds.py`) writes into the per-feature dictionaries.
 
 **Suggested fix.** Deep-copy the priorities in the constructor (functions are
 shared by `copy.deepcopy`, which is fine), and keep derived bounds in
@@ -112,10 +112,10 @@ separate state.
 point) is returned as the counterfactual, immutable features (`function:
 None`) keep the anchor's values instead of the sample's.
 
-**Root cause.** `_stage1_find_exemplar` → `find_closest_elem` →
-`get_rows_in_priorities` skips immutable features when filtering the dataset,
-and `find_counterfactuals` returns the anchor unchanged
-(`best_feasible_source = "anchor"`).
+**Root cause.** `filter_rows` in `minlp/anchor.py` skips immutable features
+when filtering the dataset, and `MINLPSearchExplainer.find_counterfactuals`
+keeps the anchor unchanged as an incumbent (`Incumbents.set_anchor` in
+`minlp/incumbent.py`).
 
 **Suggested fix.** Overwrite immutable features of the anchor with the
 sample's values, or filter dataset rows to those matching them. Re-check the
@@ -129,8 +129,9 @@ target band.
 before. A later `find_counterfactuals` call on the same explainer uses these
 values.
 
-**Root cause.** `find_counterfactuals_for_binary` assigns `self.target` and
-`self.epsilon` to hard-coded values instead of using local variables.
+**Root cause.** `MINLPSearchExplainer.find_counterfactuals_for_binary`
+assigns `self.target` and `self.epsilon` to hard-coded values instead of using
+local variables.
 
 **Suggested fix.** Use local values. More broadly, binary search is a
 separate, older copy of the pipeline (see
@@ -144,9 +145,9 @@ regression pipeline.
 *ascending* order of score, and `return_top_n` keeps the first `n`, so it
 keeps the least preferable answers.
 
-**Root cause.** The score is `calculate_total_weight`, a benefit where higher
-is better, but the sort (`np.argsort(scores)`) and its comment ("lower
-cost/weight is better") treat it as a cost.
+**Root cause.** The score is the priority benefit, where higher is better,
+but `rank` in `minlp/binary.py` sorts with `np.argsort(scores)`, as if it were
+a cost.
 
 **Suggested fix.** Sort in descending order.
 
@@ -168,8 +169,8 @@ fails with `AssertionError: Expected exactly one target exemplar index`. This
 is likely with classifiers that output saturated probabilities, or with
 duplicated rows.
 
-**Root cause.** `find_closest_elem` asserts that exactly one row has the
-minimal distance.
+**Root cause.** `closest_row` in `minlp/anchor.py` asserts that exactly one
+row has the minimal distance.
 
 **Suggested fix.** Pick one deterministically (e.g. the first, or the one
 closest to the sample).

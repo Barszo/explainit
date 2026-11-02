@@ -39,6 +39,13 @@ listed explicitly.
   Matplotlib 3.9 (previously Python 3.13.5; the NumPy/SciPy minimums were not
   declared).
 - Packaging metadata moved from `setup.py` to `pyproject.toml`.
+- The MINLP search moved from `explainit.explainers.minlp_search` to the
+  `explainit.explainers.minlp` package, with one module per algorithm stage
+  (`anchor`, `shapley`, `surrogate`, `warm_start`, `optimizer`, `refinement`,
+  ...). Static helpers such as `MINLPSearchExplainer.solve_linear_constraint_lp`
+  are now module functions (`linear_program.solve_linear_constraint`), and
+  `PrioritiesState` lives in `explainit.explainers.minlp.state`. Results are
+  unchanged.
 
 ### Removed
 
