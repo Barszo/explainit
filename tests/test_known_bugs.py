@@ -106,6 +106,33 @@ class TestRandomSearch:
             RandomSearchExplainer(_sum_model, priorities)
 
 
+@_bug("PLOT-2: a continuous-target plot leaves an empty figure open", ASSERTION_FAILS)
+def test_plotting_closes_every_figure_it_creates():
+    rng = np.random.default_rng(0)
+    features = rng.uniform(0, 1, (100, 2))
+    plt.close("all")
+    logging.disable(logging.CRITICAL)
+    try:
+        plot_priorities(
+            _two_feature_priorities(),
+            feature_matrix=features,
+            target_values=features.sum(axis=1),
+            show=False,
+        )
+    finally:
+        logging.disable(logging.NOTSET)
+    assert plt.get_fignums() == []
+
+
+@_bug("PLOT-3: files that were not written are reported", ASSERTION_FAILS)
+def test_only_written_files_are_reported(tmp_path):
+    from explainit.plotting import plot_probability_distributions
+
+    priorities = {"numerical": {}, "categorical": {(0, 1): {(1, 0): 0, (0, 1): None}}}
+    written = plot_probability_distributions(priorities, save_dir=tmp_path)
+    assert all(path.exists() for path in written)
+
+
 @_bug("PLOT-1: plotting permanently changes the global Matplotlib style", ASSERTION_FAILS)
 def test_plotting_leaves_global_matplotlib_settings_unchanged():
     with plt.rc_context():

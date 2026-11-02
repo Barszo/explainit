@@ -66,12 +66,13 @@ jobs:
       - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           python-version: "3.13"
-      # Keep these pins equal to the versions in tests/snapshots/linux.json.
+      # Keep these pins equal to the versions in tests/snapshots/linux.json
+      # and tests/snapshots/figures.json.
       - name: Show NumPy runtime configuration
-        run: uv run --no-dev --group test --with numpy==2.3.3 --with scipy==1.16.2 python -c "import numpy; numpy.show_runtime()"
+        run: uv run --no-dev --group test --with numpy==2.3.3 --with scipy==1.16.2 --with matplotlib==3.10.7 python -c "import numpy; numpy.show_runtime()"
       - name: Record fresh Linux snapshots (for updating tests/snapshots/linux.json)
         run: >-
-          uv run --no-dev --group test --with numpy==2.3.3 --with scipy==1.16.2
+          uv run --no-dev --group test --with numpy==2.3.3 --with scipy==1.16.2 --with matplotlib==3.10.7
           pytest -m snapshot --update-snapshots --snapshot-dir "$RUNNER_TEMP/snapshots"
       - uses: actions/upload-artifact@v7
         with:
@@ -79,7 +80,7 @@ jobs:
           path: ${{ runner.temp }}/snapshots/linux.json
       - name: Compare results with the recorded snapshots
         run: >-
-          uv run --no-dev --group test --with numpy==2.3.3 --with scipy==1.16.2
+          uv run --no-dev --group test --with numpy==2.3.3 --with scipy==1.16.2 --with matplotlib==3.10.7
           pytest -m snapshot -rs
 
   benchmark:

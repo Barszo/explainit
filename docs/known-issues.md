@@ -34,6 +34,8 @@ How issues are tracked:
 | [RS-4](#rs-4-invalid-priorities-are-accepted) | Random search | Invalid priorities (e.g. `min > max`) are accepted | Medium | Yes |
 | [RS-5](#rs-5-empty-priorities-score-inconsistently) | Random search | Score of empty priorities is 1 in one method, 0 in another | Low | No |
 | [PLOT-1](#plot-1-plotting-changes-global-matplotlib-settings) | Plotting | Global Matplotlib settings are changed permanently | Medium | Yes |
+| [PLOT-2](#plot-2-an-empty-figure-is-left-open) | Plotting | Numerical plots with a continuous target leave an empty figure open | Low | Yes |
+| [PLOT-3](#plot-3-unwritten-files-are-reported-as-written) | Plotting | `plot_probability_distributions` reports files it did not write | Low | Yes |
 
 Algorithm limitations that are not bugs, but are candidates for improvement,
 are listed [at the end](#algorithm-limitations-and-improvement-ideas).
@@ -201,11 +203,37 @@ with clear error messages naming the offending feature.
 settings (fonts, colours, background) for the rest of the user's session, so
 the user's own later plots look different.
 
-**Root cause.** `explainit.utils.plot_styles.apply_style` writes to
+**Root cause.** `apply_style` in `explainit/plotting/style.py` writes to
 `plt.rcParams` directly.
 
 **Suggested fix.** Apply the style inside `with plt.rc_context(...)`, or only
 to the figures explainit creates.
+
+## PLOT-2: An empty figure is left open
+
+**Symptom.** A numerical priority plot with a continuous target
+(`plot_priorities(..., feature_matrix=..., target_values=...)`) leaves one
+extra, empty figure open. With `show=True` it appears as an empty window; in
+long notebooks or loops the open figures pile up.
+
+**Root cause.** `plot_numerical_priority` (`explainit/plotting/numerical.py`)
+opens a figure before choosing the continuous-target layout, which then
+creates its own figure.
+
+**Suggested fix.** Remove the extra `plt.subplots` call (marked with the
+issue ID).
+
+## PLOT-3: Unwritten files are reported as written
+
+**Symptom.** For a categorical group whose combinations all have weight `0`
+or `None`, `plot_probability_distributions(..., save_dir=...)` draws nothing
+but still lists the group's file name among the written files.
+
+**Root cause.** The walker in `explainit/plotting/distributions.py` appends
+the path without checking whether a figure was drawn.
+
+**Suggested fix.** Append the path only when the plot function returns a
+figure.
 
 ---
 

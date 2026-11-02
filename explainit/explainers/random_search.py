@@ -10,12 +10,12 @@ import numpy as np
 from explainit._random import make_rngs
 from explainit.explanation import Explanation
 from explainit.logging_config import logger
-from explainit.sampling import sample_category, sample_numeric_value
-from explainit.targets import resolve_target
-from explainit.utils.priority_plots import (
+from explainit.plotting import (
     plot_priorities as _plot_priorities,
     plot_probability_distributions as _plot_probability_distributions,
 )
+from explainit.sampling import sample_category, sample_numeric_value
+from explainit.targets import resolve_target
 
 
 class RandomSearchExplainer:
