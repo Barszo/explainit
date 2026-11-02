@@ -3,6 +3,7 @@ from conftest import linear_model, mixed_model
 
 from explainit.explainers.minlp import MINLPSearchExplainer
 from explainit.explainers.random_search import RandomSearchExplainer
+from explainit.sampling import sample_numeric_value
 from explainit.utils import priority_plots
 
 
@@ -50,7 +51,7 @@ def test_plot_probability_distributions(mixed_priorities, tmp_path):
 def test_sample_numeric_value_stays_in_bounds(numerical_priorities):
     rng = np.random.RandomState(0)
     constraint = numerical_priorities["numerical"][0]
-    values = [priority_plots.sample_numeric_value(constraint, rng=rng) for _ in range(200)]
+    values = [sample_numeric_value(constraint, rng=rng) for _ in range(200)]
     assert all(0.0 <= v <= 1.0 for v in values)
     assert np.mean(values) > 0.5  # increasing priority favours high values
 

@@ -15,8 +15,11 @@ listed explicitly.
   MINLPSearchExplainer, basic_linear, exponential, basic_linear_step,
   plot_priorities`.
 - `RandomSearchExplainer.generate_random_samples` accepts
-  `n_candidates_per_cf`.
-- `explainit.utils.priority_plots.sample_numeric_value` accepts an `rng`.
+  `n_candidates_per_cf` (default 1; the `n_candidates_per_cf` instance
+  attribute is no longer read).
+- `explainit.sampling` module with the priority-weighted samplers
+  (`sample_numeric_value`, moved from `explainit.utils.priority_plots`, now
+  with an `rng` argument, and `sample_category`).
 - Test suite, Ruff configuration, pre-commit hooks, and GitHub Actions CI.
 - Correctness tests against exact answers, property-based invariant tests,
   snapshot tests, a register of known bugs, and a quality benchmark with a
@@ -46,6 +49,9 @@ listed explicitly.
   are now module functions (`linear_program.solve_linear_constraint`), and
   `PrioritiesState` lives in `explainit.explainers.minlp.state`. Results are
   unchanged.
+- `RandomSearchExplainer.generate_random_samples` and `generate_for_binary`
+  share one search loop and differ only in how a valid prediction is defined.
+  Results are unchanged.
 
 ### Removed
 

@@ -35,6 +35,7 @@ How issues are tracked:
 | [RS-2](#rs-2-model-errors-are-silently-ignored) | Random search | Exceptions from the model are logged and skipped | **High**: a broken model looks like "no answer" | Yes |
 | [RS-3](#rs-3-a-forbidden-category-crashes-the-score) | Random search | Scoring a `None` (forbidden) category crashes | Medium | Yes |
 | [RS-4](#rs-4-invalid-priorities-are-accepted) | Random search | Invalid priorities (e.g. `min > max`) are accepted | Medium | Yes |
+| [RS-5](#rs-5-empty-priorities-score-inconsistently) | Random search | Score of empty priorities is 1 in one method, 0 in another | Low | No |
 | [PLOT-1](#plot-1-plotting-changes-global-matplotlib-settings) | Plotting | Global Matplotlib settings are changed permanently | Medium | Yes |
 
 Algorithm limitations that are not bugs, but are candidates for improvement,
@@ -183,9 +184,9 @@ candidate instead of keeping the person's value. For a sample
 `[0.1, 0.1, 5.0]` with priorities only for features 0 and 1, every
 counterfactual has `x[2] = 0`.
 
-**Root cause.** `generate_random_samples` and `generate_for_binary` start each
-candidate from `np.zeros(n_features)` and only fill the features listed in the
-priorities. MINLP starts from the sample instead, so the two methods disagree.
+**Root cause.** `RandomSearchExplainer._sample_candidate` starts each
+candidate from `np.zeros(n_features)` and only fills the features listed in
+the priorities. MINLP starts from the sample instead, so the two methods disagree.
 
 **Suggested fix.** Start each candidate from a copy of the sample.
 
@@ -196,7 +197,7 @@ columns, a bug), random search logs a warning and continues; the user just
 gets an empty result, as if no counterfactual existed.
 
 **Root cause.** A broad `except Exception` around the model call in
-`generate_random_samples` and `generate_for_binary`.
+`RandomSearchExplainer._search`.
 
 **Suggested fix.** Let exceptions propagate.
 
@@ -222,6 +223,16 @@ accepted and fail later, or not at all, with confusing results.
 
 **Suggested fix.** Validate priorities once, when the explainer is created,
 with clear error messages naming the offending feature.
+
+## RS-5: Empty priorities score inconsistently
+
+**Symptom.** With no scored features, `calculate_preference_score` returns
+`1.0` while `get_preference_breakdown` reports an overall score of `0.0`.
+
+**Root cause.** Different fallbacks in the two methods of
+`RandomSearchExplainer`.
+
+**Suggested fix.** Return `0.0` from both (the sum of no priorities).
 
 ## PLOT-1: Plotting changes global Matplotlib settings
 
