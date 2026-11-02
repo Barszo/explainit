@@ -95,18 +95,3 @@ def test_top_level_exports():
     assert explainit.exponential is exponential
     for name in explainit.__all__:
         assert hasattr(explainit, name)
-
-
-@pytest.mark.parametrize("module", ["explainit.explainers.minlp_search", "explainit.explainers"])
-def test_old_minlp_name_is_deprecated_alias(module):
-    mod = importlib.import_module(module)
-    with pytest.warns(DeprecationWarning, match="MINLPSearchExplainer"):
-        old = mod.MINLSearchExplainer
-    assert old is explainit.MINLPSearchExplainer
-
-
-def test_unknown_attribute_raises():
-    from explainit.explainers import minlp_search
-
-    with pytest.raises(AttributeError):
-        minlp_search.does_not_exist  # noqa: B018

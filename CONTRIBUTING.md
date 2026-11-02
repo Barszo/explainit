@@ -136,12 +136,15 @@ the benchmark in [`benchmarks/`](benchmarks/README.md).
 ## Public API and compatibility
 
 The public API is everything importable from `explainit`, the explainer
-classes and their public methods, the priority functions, and
-`explainit.utils.priority_plots`. `MINLPSearchExplainer.last_search_result`,
-`exemplar_source` and `exemplar_pred_distance` are also relied on by research
-code (see `LAST_SEARCH_RESULT_KEYS` in `tests/test_minlp_search.py`).
+classes and their public methods, and the priority functions.
 
-explainit is pre-1.0, but we still avoid breaking users silently:
+The project is being restructured towards a first stable API (0.2). Until
+then, the API may change without deprecation periods; every change is listed
+in the changelog. What must **not** change during the restructuring is
+behaviour: the snapshot tests guarantee that the algorithms return exactly
+the same results.
+
+From 0.2 on:
 
 - Prefer adding optional parameters over changing existing ones.
 - To rename or remove something, keep the old name working with a
