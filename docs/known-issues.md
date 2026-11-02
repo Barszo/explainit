@@ -25,20 +25,26 @@ How issues are tracked:
 | ID | Component | Problem | Impact | Tested |
 | --- | --- | --- | --- | --- |
 | [MINLP-1](#minlp-1-allowed-ranges-are-ignored) | MINLP | Allowed `min`/`max` ranges are ignored | **High**: answers outside the allowed range | Yes |
-| [MINLP-2](#minlp-2-the-callers-priorities-are-modified) | MINLP | The caller's priorities dictionary is modified | **High**: later runs silently use different ranges | Yes |
 | [MINLP-3](#minlp-3-the-anchor-can-carry-wrong-immutable-values) | MINLP | The returned anchor can have wrong immutable-feature values | **High**: "unchangeable" features change | Yes |
-| [MINLP-4](#minlp-4-binary-search-overwrites-the-explainers-settings) | MINLP binary | Overwrites the explainer's `target` and `epsilon` | Medium | Yes |
-| [MINLP-5](#minlp-5-binary-results-are-sorted-worst-first) | MINLP binary | Results are sorted worst-first | Medium | No (needs two results) |
-| [MINLP-6](#minlp-6-binary-search-ignores-expected_counterfactuals) | MINLP binary | `expected_counterfactuals` is ignored | Low | No |
+| [MINLP-5](#minlp-5-binary-results-are-sorted-worst-first) | MINLP binary | Results are sorted worst-first | Low | No (needs two results) |
 | [MINLP-7](#minlp-7-tied-predictions-crash-the-anchor-search) | MINLP | Tied dataset predictions raise `AssertionError` | Medium | No |
 | [RS-1](#rs-1-unlisted-features-are-set-to-zero) | Random search | Features missing from the priorities become 0 | **High**: nonsense counterfactuals | Yes |
 | [RS-2](#rs-2-model-errors-are-silently-ignored) | Random search | Exceptions from the model are logged and skipped | **High**: a broken model looks like "no answer" | Yes |
 | [RS-3](#rs-3-a-forbidden-category-crashes-the-score) | Random search | Scoring a `None` (forbidden) category crashes | Medium | Yes |
 | [RS-4](#rs-4-invalid-priorities-are-accepted) | Random search | Invalid priorities (e.g. `min > max`) are accepted | Medium | Yes |
+| [RS-5](#rs-5-empty-priorities-score-inconsistently) | Random search | Score of empty priorities is 1 in one method, 0 in another | Low | No |
 | [PLOT-1](#plot-1-plotting-changes-global-matplotlib-settings) | Plotting | Global Matplotlib settings are changed permanently | Medium | Yes |
 
 Algorithm limitations that are not bugs, but are candidates for improvement,
 are listed [at the end](#algorithm-limitations-and-improvement-ideas).
+
+**Resolved by the new API.** Three earlier entries cannot occur with
+`explain()`, because every call works on its own copy of the priorities and
+takes the target and tolerance as arguments:
+MINLP-2 (the caller's priorities dictionary was modified), MINLP-4 (binary
+search overwrote the explainer's target and tolerance), and MINLP-6 (binary
+search ignored `expected_counterfactuals`; the argument no longer exists).
+Results of a single search are unchanged.
 
 ---
 
@@ -64,10 +70,9 @@ priorities = {
     "categorical": {},
 }
 dataset = np.random.default_rng(0).uniform(0, 1, (200, 2))
-explainer = MINLPSearchExplainer(
-    lambda X: np.asarray(X).sum(axis=1), priorities, np.array([0.6, 0.2]), 1.0, dataset
-)
-counterfactual = explainer.find_counterfactuals(random_seed=0)
+explainer = MINLPSearchExplainer(lambda X: np.asarray(X).sum(axis=1), priorities, dataset)
+result = explainer.explain(np.array([0.6, 0.2]), target=1.0, random_seed=0)
+counterfactual = result.counterfactuals[0]
 # counterfactual is about [0.006, 0.995]: feature 0 is far below its minimum of 0.3
 ```
 
@@ -75,7 +80,7 @@ On the benchmark (`benchmarks/`), 0% of MINLP answers respected the allowed
 ranges, compared with 100% for random search.
 
 **Root cause.** Stage 0,
-`MINLPSearchExplainer._derive_bounds_and_intervals_from_priorities`, replaces
+`derive_bounds_and_intervals` in `explainit/explainers/minlp/bounds.py`, replaces
 each feature's `min`/`max` with the region where the priority function is
 positive *within the dataset's range*. The built-in ramps (`basic_linear`,
 `exponential`) keep a positive value (1.0 or the full ramp) outside
@@ -91,75 +96,33 @@ search.
 against the allowed ranges, some of their counterfactuals may lie outside
 them.
 
-## MINLP-2: The caller's priorities are modified
-
-**Symptom.** After `find_counterfactuals`, the priorities dictionary passed to
-the constructor has new `min`/`max` values and an `allowed_intervals` key.
-Reusing the same dictionary for another explainer (as the README examples do)
-silently changes that explainer's behaviour.
-
-**Root cause.** `PrioritiesState` stores the caller's dictionary without
-copying it, and Stage 0 (`_derive_bounds_and_intervals_from_priorities`)
-writes into the per-feature dictionaries.
-
-**Suggested fix.** Deep-copy the priorities in the constructor (functions are
-shared by `copy.deepcopy`, which is fine), and keep derived bounds in
-separate state.
-
 ## MINLP-3: The anchor can carry wrong immutable values
 
 **Symptom.** When the Stage 1 anchor (a dataset row, or a randomly generated
 point) is returned as the counterfactual, immutable features (`function:
 None`) keep the anchor's values instead of the sample's.
 
-**Root cause.** `_stage1_find_exemplar` → `find_closest_elem` →
-`get_rows_in_priorities` skips immutable features when filtering the dataset,
-and `find_counterfactuals` returns the anchor unchanged
-(`best_feasible_source = "anchor"`).
+**Root cause.** `filter_rows` in `minlp/anchor.py` skips immutable features
+when filtering the dataset, and `MINLPSearch.find_counterfactuals`
+(`minlp/search.py`) keeps the anchor unchanged as an incumbent (`Incumbents.set_anchor` in
+`minlp/incumbent.py`).
 
 **Suggested fix.** Overwrite immutable features of the anchor with the
 sample's values, or filter dataset rows to those matching them. Re-check the
 anchor's prediction afterwards, since the change can move it out of the
 target band.
 
-## MINLP-4: Binary search overwrites the explainer's settings
-
-**Symptom.** After `find_counterfactuals_for_binary`, the explainer's
-`target` is 0.75 (or 0.25) and its `epsilon` is 0.25, whatever they were
-before. A later `find_counterfactuals` call on the same explainer uses these
-values.
-
-**Root cause.** `find_counterfactuals_for_binary` assigns `self.target` and
-`self.epsilon` to hard-coded values instead of using local variables.
-
-**Suggested fix.** Use local values. More broadly, binary search is a
-separate, older copy of the pipeline (see
-[limitations](#algorithm-limitations-and-improvement-ideas)); expressing
-"probability above the threshold" as a target range would let it reuse the
-regression pipeline.
-
 ## MINLP-5: Binary results are sorted worst-first
 
-**Symptom.** `find_counterfactuals_for_binary` sorts its results in
-*ascending* order of score, and `return_top_n` keeps the first `n`, so it
-keeps the least preferable answers.
+**Symptom.** `MINLPSearchExplainer.explain(x, target_class=...)` returns its
+counterfactuals in *ascending* order of preference score, so the least
+preferable answer comes first.
 
-**Root cause.** The score is `calculate_total_weight`, a benefit where higher
-is better, but the sort (`np.argsort(scores)`) and its comment ("lower
-cost/weight is better") treat it as a cost.
+**Root cause.** The score is the priority benefit, where higher is better,
+but `rank` in `minlp/binary.py` sorts with `np.argsort(scores)`, as if it were
+a cost.
 
 **Suggested fix.** Sort in descending order.
-
-## MINLP-6: Binary search ignores `expected_counterfactuals`
-
-**Symptom.** `find_counterfactuals_for_binary(expected_counterfactuals=50)`
-returns the same results as `expected_counterfactuals=1`: at most one answer
-per surviving categorical combination.
-
-**Root cause.** The argument is documented but never used.
-
-**Suggested fix.** Remove the argument, or generate several answers (for
-example from different warm starts).
 
 ## MINLP-7: Tied predictions crash the anchor search
 
@@ -168,8 +131,8 @@ fails with `AssertionError: Expected exactly one target exemplar index`. This
 is likely with classifiers that output saturated probabilities, or with
 duplicated rows.
 
-**Root cause.** `find_closest_elem` asserts that exactly one row has the
-minimal distance.
+**Root cause.** `closest_row` in `minlp/anchor.py` asserts that exactly one
+row has the minimal distance.
 
 **Suggested fix.** Pick one deterministically (e.g. the first, or the one
 closest to the sample).
@@ -182,9 +145,9 @@ candidate instead of keeping the person's value. For a sample
 `[0.1, 0.1, 5.0]` with priorities only for features 0 and 1, every
 counterfactual has `x[2] = 0`.
 
-**Root cause.** `generate_random_samples` and `generate_for_binary` start each
-candidate from `np.zeros(n_features)` and only fill the features listed in the
-priorities. MINLP starts from the sample instead, so the two methods disagree.
+**Root cause.** `sample_candidate` in `explainers/random_search.py` starts each
+candidate from `np.zeros(n_features)` and only fills the features listed in
+the priorities. MINLP starts from the sample instead, so the two methods disagree.
 
 **Suggested fix.** Start each candidate from a copy of the sample.
 
@@ -195,21 +158,21 @@ columns, a bug), random search logs a warning and continues; the user just
 gets an empty result, as if no counterfactual existed.
 
 **Root cause.** A broad `except Exception` around the model call in
-`generate_random_samples` and `generate_for_binary`.
+`RandomSearchExplainer.explain`.
 
 **Suggested fix.** Let exceptions propagate.
 
 ## RS-3: A forbidden category crashes the score
 
-**Symptom.** `calculate_preference_score` raises `TypeError` for a sample
-whose categorical combination has weight `None`, although `None` is the
-documented way to forbid a category. `get_preference_breakdown` handles the
-same case correctly.
+**Symptom.** `RandomSearchExplainer.preference_score` raises `TypeError` for a
+sample whose categorical combination has weight `None`, although `None` is the
+documented way to forbid a category. `preference_breakdown` handles the same
+case correctly.
 
-**Root cause.** `float(possible_values.get(current_combo, 0))` with a `None`
-value.
+**Root cause.** `float(weights.get(combination, 0))` in `preference_score`
+(`explainers/random_search.py`) with a `None` value.
 
-**Suggested fix.** Treat `None` as 0, as `get_preference_breakdown` does.
+**Suggested fix.** Treat `None` as 0, as `preference_breakdown` does.
 
 ## RS-4: Invalid priorities are accepted
 
@@ -221,6 +184,16 @@ accepted and fail later, or not at all, with confusing results.
 
 **Suggested fix.** Validate priorities once, when the explainer is created,
 with clear error messages naming the offending feature.
+
+## RS-5: Empty priorities score inconsistently
+
+**Symptom.** With no scored features, `preference_score` returns `1.0` while
+`preference_breakdown` reports an overall score of `0.0`.
+
+**Root cause.** Different fallbacks in the two functions in
+`explainers/random_search.py`.
+
+**Suggested fix.** Return `0.0` from both (the sum of no priorities).
 
 ## PLOT-1: Plotting changes global Matplotlib settings
 

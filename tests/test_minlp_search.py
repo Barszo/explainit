@@ -5,14 +5,20 @@ import numpy as np
 import pytest
 from conftest import mixed_model
 
-from explainit.explainers.minlp_search import MINLPSearchExplainer, PrioritiesState
+from explainit.explainers.minlp import MINLPSearchExplainer, MINLPSettings
+from explainit.explainers.minlp.intervals import (
+    extract_positive_intervals,
+    in_allowed_intervals,
+    project_to_allowed_intervals,
+)
+from explainit.explainers.minlp.linear_program import solve_linear_constraint
+from explainit.explainers.minlp.state import PrioritiesState
 
 SAMPLE = np.array([0.1, 0.2, 0.0, 1.0])
 TARGET = 1.0
 EPSILON = 0.01
 
-# Attributes read by downstream experiment code (explainit-experiment-2);
-# removing or renaming them is a breaking change.
+# Diagnostics keys documented in docs/how-it-works.md.
 LAST_SEARCH_RESULT_KEYS = {
     "reached_target",
     "distance",
@@ -32,7 +38,12 @@ EXEMPLAR_SOURCES = {"dataset_priority_filtered", "dataset_actionable", "random_i
 
 @pytest.fixture
 def explainer(mixed_priorities, mixed_dataset):
-    return MINLPSearchExplainer(mixed_model, mixed_priorities, SAMPLE, TARGET, mixed_dataset)
+    return MINLPSearchExplainer(mixed_model, mixed_priorities, mixed_dataset)
+
+
+def _cf(result):
+    assert len(result) == 1
+    return result.counterfactuals[0]
 
 
 class TestPrioritiesState:
@@ -60,138 +71,160 @@ class TestIntervalHelpers:
         ("value", "expected"), [(0.1, True), (0.5, True), (0.3, False), (0.9, False)]
     )
     def test_in_allowed_intervals(self, value, expected):
-        assert MINLPSearchExplainer._in_allowed_intervals(value, self.INTERVALS) is expected
+        assert in_allowed_intervals(value, self.INTERVALS) is expected
 
     def test_empty_intervals_allow_nothing(self):
-        assert MINLPSearchExplainer._in_allowed_intervals(0.1, []) is False
+        assert in_allowed_intervals(0.1, []) is False
 
     @pytest.mark.parametrize(
         ("value", "expected"), [(0.1, 0.1), (0.3, 0.2), (0.4, 0.5), (1.0, 0.8)]
     )
     def test_project_to_nearest_allowed_value(self, value, expected):
-        projected = MINLPSearchExplainer._project_to_allowed_intervals(value, self.INTERVALS)
+        projected = project_to_allowed_intervals(value, self.INTERVALS)
         assert projected == pytest.approx(expected)
 
     def test_extract_positive_intervals(self):
         x = np.linspace(0.0, 1.0, 11)
         y = np.where((x < 0.25) | ((x > 0.55) & (x < 0.85)), 1.0, 0.0)
-        intervals = MINLPSearchExplainer._extract_positive_intervals(x, y)
+        intervals = extract_positive_intervals(x, y)
         np.testing.assert_allclose(intervals, [(0.0, 0.2), (0.6, 0.8)])
 
 
 class TestLinearProgram:
     def test_finds_point_on_hyperplane_within_bounds(self):
-        result = MINLPSearchExplainer.solve_linear_constraint_lp(
-            [1.0, 2.0], 1.5, [(0.0, 1.0), (0.0, 1.0)]
-        )
+        result = solve_linear_constraint([1.0, 2.0], 1.5, [(0.0, 1.0), (0.0, 1.0)])
         assert result["success"]
         x = result["solution"]
         assert np.dot([1.0, 2.0], x) == pytest.approx(1.5)
         assert np.all((x >= 0.0) & (x <= 1.0))
 
     def test_infeasible_target_fails(self):
-        result = MINLPSearchExplainer.solve_linear_constraint_lp(
-            [1.0, 1.0], 5.0, [(0.0, 1.0), (0.0, 1.0)]
-        )
+        result = solve_linear_constraint([1.0, 1.0], 5.0, [(0.0, 1.0), (0.0, 1.0)])
         assert not result["success"]
         assert result["solution"] is None
 
     def test_mismatched_bounds_are_rejected(self):
-        result = MINLPSearchExplainer.solve_linear_constraint_lp([1.0, 1.0], 1.0, [(0.0, 1.0)])
+        result = solve_linear_constraint([1.0, 1.0], 1.0, [(0.0, 1.0)])
         assert not result["success"]
 
     def test_all_zero_coefficients(self):
         bounds = [(0.0, 1.0), (2.0, 4.0)]
-        ok = MINLPSearchExplainer.solve_linear_constraint_lp([0.0, 0.0], 0.0, bounds)
+        ok = solve_linear_constraint([0.0, 0.0], 0.0, bounds)
         assert ok["success"]
         np.testing.assert_allclose(ok["solution"], [0.5, 3.0])
-        assert not MINLPSearchExplainer.solve_linear_constraint_lp([0.0, 0.0], 1.0, bounds)[
-            "success"
-        ]
+        assert not solve_linear_constraint([0.0, 0.0], 1.0, bounds)["success"]
 
 
-class TestFindCounterfactuals:
+class TestExplain:
     def test_reaches_target_within_bounds(self, explainer):
-        cf = np.asarray(explainer.find_counterfactuals(random_seed=1), dtype=float)
+        result = explainer.explain(SAMPLE, target=TARGET, random_seed=1)
+        cf = _cf(result)
+        assert result.valid.all()
         assert abs(mixed_model([cf])[0] - TARGET) <= EPSILON + 1e-9
+        assert result.predictions[0] == pytest.approx(mixed_model([cf])[0])
         assert np.all((cf[:2] >= 0.0) & (cf[:2] <= 1.0))
         assert tuple(cf[2:]) in {(1.0, 0.0), (0.0, 1.0)}
 
-    def test_last_search_result_contract(self, explainer):
-        explainer.find_counterfactuals(random_seed=1)
-        result = explainer.last_search_result
-        assert set(result) >= LAST_SEARCH_RESULT_KEYS
-        assert result["reached_target"] is True
-        assert result["cf_source"] in {"anchor", "optimiser"}
-        assert explainer.exemplar_source in EXEMPLAR_SOURCES
-        assert explainer.exemplar_pred_distance == pytest.approx(result["exemplar_pred_distance"])
+    def test_diagnostics_contract(self, explainer):
+        result = explainer.explain(SAMPLE, target=TARGET, random_seed=1)
+        diagnostics = result.diagnostics
+        assert set(diagnostics) >= LAST_SEARCH_RESULT_KEYS
+        assert diagnostics["reached_target"] is True
+        assert diagnostics["cf_source"] in {"anchor", "optimiser"}
+        assert diagnostics["exemplar_source"] in EXEMPLAR_SOURCES
+        assert result.scores[0] == pytest.approx(diagnostics["priority_score"])
 
-    def test_seed_makes_search_reproducible(self, mixed_priorities, mixed_dataset):
-        def run():
-            explainer = MINLPSearchExplainer(
-                mixed_model, mixed_priorities, SAMPLE, TARGET, mixed_dataset
-            )
-            return explainer.find_counterfactuals(random_seed=7)
+    def test_seed_makes_search_reproducible(self, explainer):
+        first = explainer.explain(SAMPLE, target=TARGET, random_seed=7)
+        second = explainer.explain(SAMPLE, target=TARGET, random_seed=7)
+        np.testing.assert_allclose(first.counterfactuals, second.counterfactuals)
 
-        np.testing.assert_allclose(run(), run())
+    def test_explainer_can_be_reused_without_side_effects(self, explainer, mixed_priorities):
+        before = {i: dict(c) for i, c in mixed_priorities["numerical"].items()}
+        first = explainer.explain(SAMPLE, target=TARGET, random_seed=1)
+        explainer.explain(np.array([0.5, 0.5, 1.0, 0.0]), target_class=1)
+        explainer.explain(np.array([0.9, 0.1, 0.0, 1.0]), target=0.6, random_seed=3)
+        again = explainer.explain(SAMPLE, target=TARGET, random_seed=1)
+        np.testing.assert_array_equal(first.counterfactuals, again.counterfactuals)
+        assert {i: dict(c) for i, c in mixed_priorities["numerical"].items()} == before
 
-    def test_seeded_search_leaves_global_random_state_untouched(self, explainer):
+    def test_seeded_search_leaves_global_random_state_untouched(
+        self, mixed_priorities, mixed_dataset
+    ):
+        settings = MINLPSettings(approximate_shapley=True, shapley_samples=20)
+        explainer = MINLPSearchExplainer(
+            mixed_model, mixed_priorities, mixed_dataset, settings=settings
+        )
         np_state = np.random.get_state()[1].copy()
         py_state = random.getstate()
-        explainer.find_counterfactuals(shap_approx=True, num_samples=20, random_seed=3)
+        explainer.explain(SAMPLE, target=TARGET, random_seed=3)
         np.testing.assert_array_equal(np.random.get_state()[1], np_state)
         assert random.getstate() == py_state
-
-    def test_approximate_shapley_values(self, explainer):
-        cf = explainer.find_counterfactuals(shap_approx=True, num_samples=50, random_seed=2)
-        assert abs(mixed_model([cf])[0] - TARGET) <= EPSILON + 1e-9
 
     @pytest.mark.parametrize(
         "options",
         [
+            {"approximate_shapley": True, "shapley_samples": 50},
             {"trust_region": False},
             {"residual_correction": False, "restoration": False},
             {"peak_lock_in": False},
         ],
     )
-    def test_optional_stages_can_be_disabled(self, explainer, options):
-        cf = explainer.find_counterfactuals(random_seed=1, **options)
+    def test_settings(self, mixed_priorities, mixed_dataset, options):
+        explainer = MINLPSearchExplainer(
+            mixed_model, mixed_priorities, mixed_dataset, settings=MINLPSettings(**options)
+        )
+        cf = _cf(explainer.explain(SAMPLE, target=TARGET, random_seed=2))
         assert abs(mixed_model([cf])[0] - TARGET) <= EPSILON + 1e-9
 
+    def test_settings_are_reported(self, explainer):
+        result = explainer.explain(SAMPLE, target=TARGET, random_seed=1)
+        assert result.diagnostics["settings"]["max_iterations"] == 10
+
     def test_workflow_logger_receives_progress(self, mixed_priorities, mixed_dataset, caplog):
-        workflow_logger = logging.getLogger("tests.workflow")
         explainer = MINLPSearchExplainer(
             mixed_model,
             mixed_priorities,
-            SAMPLE,
-            TARGET,
             mixed_dataset,
-            workflow_logger=workflow_logger,
+            workflow_logger=logging.getLogger("tests.workflow"),
             feature_names=["income", "savings", "owner", "renter"],
         )
         with caplog.at_level(logging.INFO, logger="tests.workflow"):
-            explainer.find_counterfactuals(random_seed=1)
+            explainer.explain(SAMPLE, target=TARGET, random_seed=1)
         assert any(r.name == "tests.workflow" for r in caplog.records)
 
     def test_unreachable_target_raises(self, mixed_priorities, mixed_dataset):
-        explainer = MINLPSearchExplainer(mixed_model, mixed_priorities, SAMPLE, 5.0, mixed_dataset)
-        explainer._fallback_random_max_iterations = 200
+        settings = MINLPSettings(anchor_sampling_iterations=200, return_when_fails=False)
+        explainer = MINLPSearchExplainer(
+            mixed_model, mixed_priorities, mixed_dataset, settings=settings
+        )
         with pytest.raises(Exception, match="Could not randomly generate"):
-            explainer.find_counterfactuals(random_seed=1, return_when_fails=False)
+            explainer.explain(SAMPLE, target=5.0, random_seed=1)
+
+    def test_probe_feasibility(self, explainer):
+        reachable = explainer.probe_feasibility(SAMPLE, target=TARGET, random_seed=0)
+        unreachable = explainer.probe_feasibility(
+            SAMPLE, target=5.0, max_iterations=100, random_seed=0
+        )
+        assert reachable["feasible_within_epsilon"] is True
+        assert unreachable == {
+            "feasible_within_epsilon": False,
+            "min_pred_distance": pytest.approx(unreachable["min_pred_distance"]),
+            "iterations_run": 100,
+        }
+        assert unreachable["min_pred_distance"] > 3.0
 
 
-class TestFindCounterfactualsForBinary:
+class TestExplainClass:
     @staticmethod
     def classifier(X):
         return 1.0 / (1.0 + np.exp(-4.0 * (mixed_model(X) - 0.9)))
 
     def test_counterfactuals_cross_threshold(self, mixed_priorities, mixed_dataset):
-        explainer = MINLPSearchExplainer(
-            self.classifier, mixed_priorities, SAMPLE, 1, mixed_dataset
-        )
-        cfs, preds, scores, counts = explainer.find_counterfactuals_for_binary(
-            target_class=1, threshold=0.5
-        )
-        assert len(cfs) == len(preds) == len(scores) == len(counts) > 0
-        assert np.all(np.asarray(preds) > 0.5)
-        np.testing.assert_allclose(self.classifier(np.asarray(cfs, dtype=float)), preds)
+        explainer = MINLPSearchExplainer(self.classifier, mixed_priorities, mixed_dataset)
+        result = explainer.explain(SAMPLE, target_class=1, threshold=0.5)
+        assert len(result) > 0
+        assert result.valid.all()
+        assert np.all(result.predictions > 0.5)
+        np.testing.assert_allclose(self.classifier(result.counterfactuals), result.predictions)
+        assert len(result.diagnostics["combination_numbers"]) == len(result)

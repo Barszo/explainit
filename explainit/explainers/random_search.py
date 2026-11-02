@@ -1,456 +1,285 @@
+"""Random (Monte Carlo) counterfactual search.
+
+Candidates are sampled from the region the priorities allow, with more
+desirable values sampled more often; the model checks each candidate, and the
+most preferable valid ones are returned.
+"""
+
 import numpy as np
 
 from explainit._random import make_rngs
+from explainit.explanation import Explanation
 from explainit.logging_config import logger
+from explainit.sampling import sample_category, sample_numeric_value
+from explainit.targets import resolve_target
 from explainit.utils.priority_plots import (
     plot_priorities as _plot_priorities,
     plot_probability_distributions as _plot_probability_distributions,
-    sample_numeric_value as _sample_numeric_value,
 )
 
 
 class RandomSearchExplainer:
+    """Counterfactual search by sampling from the priorities.
+
+    Args:
+        model: Callable mapping a 2-D array to one prediction per row, e.g.
+            ``lambda X: classifier.predict_proba(X)[:, 1]``.
+        priorities: ``{"numerical": ..., "categorical": ...}``; see the README.
+        max_iterations: Candidates sampled at most per counterfactual.
+        candidates_per_counterfactual: Valid candidates collected per
+            counterfactual; the most preferable one is kept.
+        use_monte_carlo: Sample in proportion to the priorities; otherwise
+            uniformly within the allowed ranges and categories.
+        max_tries: Rejection-sampling attempts per numerical value.
+    """
+
     def __init__(
         self,
-        model_pred,
+        model,
         priorities,
-        sample,
-        target,
+        *,
+        max_iterations=10000,
+        candidates_per_counterfactual=1,
+        use_monte_carlo=True,
+        max_tries=100,
     ):
-        self.model_pred = model_pred
+        self.model = model
         self.priorities = priorities
-        self.sample = sample
-        self.target = target
-        self.filtered_priorities = self.filter_priorities()
-        self._np_rng, self._py_rng = make_rngs(None)
+        self.max_iterations = max_iterations
+        self.candidates_per_counterfactual = candidates_per_counterfactual
+        self.use_monte_carlo = use_monte_carlo
+        self.max_tries = max_tries
 
-    def filter_priorities(self):
+    def explain(
+        self,
+        x,
+        *,
+        target=None,
+        tolerance=0.05,
+        target_class=None,
+        threshold=0.5,
+        n_counterfactuals=5,
+        top_n=None,
+        random_seed=None,
+    ) -> Explanation:
+        """Find counterfactuals for the sample ``x``.
+
+        Give either ``target`` (a prediction value, reached within
+        ``tolerance``) or ``target_class`` (1: probability above ``threshold``;
+        0: below it).
+
+        Args:
+            x: The sample to explain (1-D).
+            target: Desired prediction value.
+            tolerance: Accepted distance between prediction and ``target``.
+            target_class: Desired class of a binary classifier (0 or 1).
+            threshold: Decision threshold for ``target_class``.
+            n_counterfactuals: Number of counterfactuals to search for. Fewer
+                are returned when the search budget runs out.
+            top_n: Return only the ``top_n`` most preferable counterfactuals,
+                ordered by decreasing preference score.
+            random_seed: Seed for reproducible results.
+
+        Returns:
+            Explanation: ``diagnostics["iterations"]`` holds the iteration at
+            which each counterfactual was found.
         """
-        Filters the priorities dictionary by removing unactionable features.
-        Unactionable numerical features (with priority None or 0) are replaced with the sample value.
-        """
+        goal = resolve_target(target, tolerance, target_class, threshold)
+        sample = np.array(x, dtype=float)
+        filtered = filter_priorities(self.priorities, sample)
+        np_rng, py_rng = make_rngs(random_seed)
 
-        new_priorities = {"numerical": {}, "categorical": {}}
+        found = []
+        for cf_idx in range(n_counterfactuals):
+            candidates = []
+            for i in range(self.max_iterations):
+                candidate = sample_candidate(
+                    filtered, len(sample), self.use_monte_carlo, self.max_tries, np_rng, py_rng
+                )
+                try:
+                    pred = self.model(candidate.reshape(1, -1))[0]
+                    if goal.is_reached(pred):
+                        candidates.append(
+                            (candidate.copy(), pred, self.preference_score(candidate), i + 1)
+                        )
+                        if len(candidates) >= self.candidates_per_counterfactual:
+                            break
+                except Exception as e:  # known issue RS-2
+                    logger.warning(f"Could not get prediction for sample: {e}")
 
-        # Numerical: replace None or 0 with sample value
-        for idx, val in self.priorities["numerical"].items():
-            if val is None or (isinstance(val, (int, float)) and val == 0):
-                new_priorities["numerical"][idx] = self.sample[idx]
-            elif isinstance(val, dict) and val.get("function") is None:
-                # Non-actionable feature: fixed at its configured value
-                # (falls back to the sample value).
-                new_priorities["numerical"][idx] = val.get("min", self.sample[idx])
-            else:
-                new_priorities["numerical"][idx] = val
+            if not candidates:
+                logger.info(f"No valid candidates found for CF {cf_idx + 1}")
+                continue
+            found.append(_log_and_pick_best(cf_idx, candidates, self.candidates_per_counterfactual))
 
-        # Categorical: remove elements with value 0
-        for group, mapping in self.priorities["categorical"].items():
-            filtered_mapping = {k: v for k, v in mapping.items() if v != 0}
-            if filtered_mapping:
-                new_priorities["categorical"][group] = filtered_mapping
+        if top_n is not None:
+            found = sorted(found, key=lambda c: c[2], reverse=True)[: int(top_n)]
+        return Explanation.from_lists(
+            sample,
+            [c[0] for c in found],
+            [c[1] for c in found],
+            [c[2] for c in found],
+            [True] * len(found),
+            method="random_search",
+            diagnostics={"iterations": [c[3] for c in found], "target": goal},
+        )
 
-        return new_priorities
+    def preference_score(self, x) -> float:
+        """Sum of the priorities of ``x``'s feature values (higher is better)."""
+        return preference_score(self.priorities, x)
 
-    def sample_numeric_value(self, constraint, max_tries=100):
-        """Monte-Carlo sampler (rejection + grid fallback). Thin wrapper around
-        :func:`explainit.utils.priority_plots.sample_numeric_value` so the
-        sampling logic stays in lock-step with the distribution plots.
-        """
-        return _sample_numeric_value(constraint, max_tries=max_tries, rng=self._np_rng)
+    def preference_breakdown(self, x) -> dict:
+        """Per-feature priorities of ``x``; see :func:`preference_breakdown`."""
+        return preference_breakdown(self.priorities, x)
 
-    def display_priorities(self, exemplar=None, *, save_dir=None, show=True, feature_names=None):
-        """Plot the configured priorities (numerical + categorical).
+    def plot_priorities(
+        self, x=None, *, exemplar=None, feature_names=None, save_dir=None, show=True
+    ):
+        """Plot the priorities, marking ``x`` and ``exemplar`` if given.
 
-        Delegates to ``explainit.utils.priority_plots.plot_priorities``. Pass
-        ``save_dir`` to also write PNG files, and ``show=False`` to skip
-        opening the plots (useful in scripts and tests).
+        Pass ``save_dir`` to also write PNG files, and ``show=False`` to skip
+        opening the plots.
         """
         return _plot_priorities(
             self.priorities,
-            sample=self.sample,
+            sample=x,
             exemplar=exemplar,
             feature_names=feature_names,
             save_dir=save_dir,
             show=show,
         )
 
-    def investigate_probability_distribution(
-        self, n_samples=10000, *, save_dir=None, show=True, feature_names=None
+    def plot_sampling_distributions(
+        self, n_samples=10000, *, random_seed=None, feature_names=None, save_dir=None, show=True
     ):
-        """Render theoretical vs empirical probability distributions for the
-        priorities (numerical) and normalised category probabilities
-        (categorical).
-
-        Delegates to
-        :func:`explainit.utils.priority_plots.plot_probability_distributions`,
-        passing this explainer's own ``sample_numeric_value`` so the empirical
-        histogram comes from the exact sampler the search loop uses. Pass
-        ``save_dir`` to also write PNG files, and ``show=False`` to skip
-        opening the plots.
-        """
+        """Plot how the search samples each feature: theoretical vs. empirical distribution."""
+        np_rng = make_rngs(random_seed)[0]
         return _plot_probability_distributions(
             self.priorities,
             n_samples=n_samples,
-            sampler=self.sample_numeric_value,
+            sampler=lambda constraint: sample_numeric_value(
+                constraint, max_tries=self.max_tries, rng=np_rng
+            ),
             feature_names=feature_names,
             save_dir=save_dir,
             show=show,
         )
 
-    def calculate_preference_score(self, sample):
-        """
-        Calculate overall preference score for a sample.
 
-        Args:
-            sample: List of feature values
+def filter_priorities(priorities, sample):
+    """Priorities prepared for sampling.
 
-        Returns:
-            preference_score: Float value representing overall preference
-        """
-        scores = []
+    Immutable numerical features (``None``, ``0``, or no ``function``) are
+    replaced by the fixed value they keep; zero-weight categories are removed.
+    """
+    filtered = {"numerical": {}, "categorical": {}}
 
-        # Calculate scores for numerical features
-        for idx, constraint in self.priorities["numerical"].items():
-            if isinstance(constraint, dict) and constraint.get("function") is not None:
-                # Get weight from preference function
-                weight = float(np.asarray(constraint["function"](sample[idx])).squeeze())
-                scores.append(weight)
+    for idx, val in priorities["numerical"].items():
+        if val is None or (isinstance(val, (int, float)) and val == 0):
+            filtered["numerical"][idx] = sample[idx]
+        elif isinstance(val, dict) and val.get("function") is None:
+            # Fixed at its configured value, falling back to the sample value.
+            filtered["numerical"][idx] = val.get("min", sample[idx])
+        else:
+            filtered["numerical"][idx] = val
 
-        # Calculate scores for categorical features
-        for group_indices, possible_values in self.priorities["categorical"].items():
-            # Get current sample combination
-            current_combo = tuple(sample[idx] for idx in group_indices)
-            # Get weight for this combination (default to 0 if not found)
-            weight = possible_values.get(current_combo, 0)
-            scores.append(float(weight))
+    for group, mapping in priorities["categorical"].items():
+        allowed = {k: v for k, v in mapping.items() if v != 0}
+        if allowed:
+            filtered["categorical"][group] = allowed
 
-        # Overall score is the sum of the per-feature priorities, so each
-        # actionable feature contributes a value in [0, 1].
-        if len(scores) == 0:
-            return 1.0
-        return float(np.sum(scores))
+    return filtered
 
-    def get_preference_breakdown(self, sample):
-        """
-        Get detailed breakdown of preference scores for each feature.
 
-        Args:
-            sample: List of feature values
+def sample_candidate(filtered, n_features, use_monte_carlo, max_tries, np_rng, py_rng):
+    """One candidate inside the allowed region (known issue RS-1: starts from zeros)."""
+    candidate = np.zeros(n_features)
+    for idx, constraint in filtered["numerical"].items():
+        if isinstance(constraint, dict) and "function" in constraint:
+            candidate[idx] = (
+                sample_numeric_value(constraint, max_tries, rng=np_rng)
+                if use_monte_carlo
+                else np_rng.uniform(constraint["min"], constraint["max"])
+            )
+        else:
+            candidate[idx] = constraint
+    for group, weights in filtered["categorical"].items():
+        combination = sample_category(group, weights, use_monte_carlo, np_rng, py_rng)
+        for j, idx in enumerate(group):
+            candidate[idx] = combination[j]
+    return candidate
 
-        Returns:
-            breakdown: Dictionary with 'numerical' and 'categorical' contributions
-        """
-        breakdown = {"numerical": {}, "categorical": {}, "overall": 0.0}
 
-        all_scores = []
+def preference_score(priorities, x) -> float:
+    """Sum of the numerical priorities and categorical weights of ``x``."""
+    scores = []
+    for idx, constraint in priorities["numerical"].items():
+        if isinstance(constraint, dict) and constraint.get("function") is not None:
+            scores.append(float(np.asarray(constraint["function"](x[idx])).squeeze()))
+    for group, weights in priorities["categorical"].items():
+        combination = tuple(x[idx] for idx in group)
+        scores.append(float(weights.get(combination, 0)))  # known issue RS-3
+    if len(scores) == 0:
+        return 1.0  # known issue RS-5
+    return float(np.sum(scores))
 
-        # Calculate scores for numerical features
-        for idx, constraint in self.priorities["numerical"].items():
-            if isinstance(constraint, dict) and constraint.get("function") is not None:
-                # Get weight from preference function
-                weight = float(np.asarray(constraint["function"](sample[idx])).squeeze())
-                breakdown["numerical"][idx] = {
-                    "value": sample[idx],
-                    "weight": weight,
-                    "actionable": True,
-                }
-                all_scores.append(weight)
-            elif (
-                constraint is None
-                or (isinstance(constraint, (int, float)) and constraint == 0)
-                or (isinstance(constraint, dict) and constraint.get("function") is None)
-            ):
-                # Unactionable feature - fixed at sample value, doesn't affect preference score
-                breakdown["numerical"][idx] = {
-                    "value": sample[idx],
-                    "weight": None,
-                    "actionable": False,
-                }
-                # Don't add to all_scores - unactionable features don't contribute to preference
 
-        # Calculate scores for categorical features
-        for group_indices, possible_values in self.priorities["categorical"].items():
-            # Get current sample combination
-            current_combo = tuple(sample[idx] for idx in group_indices)
-            # Get weight for this combination (default to 0 if not found)
-            raw_weight = possible_values.get(current_combo, 0)
-            weight = 0.0 if raw_weight is None else float(raw_weight)
-            # A categorical feature is actionable only if the search may switch
-            # it to more than one combination, i.e. at least two combinations
-            # carry a selectable (non-None) weight. A feature pinned to the
-            # sample's category (all other combinations set to None) is not
-            # actionable.
-            selectable = sum(1 for w in possible_values.values() if w is not None)
-            actionable = selectable > 1
-            breakdown["categorical"][group_indices] = {
-                "combination": current_combo,
-                "weight": weight,
-                "actionable": actionable,
-            }
+def preference_breakdown(priorities, x) -> dict:
+    """Per-feature contributions to the preference score of ``x``.
+
+    Returns:
+        dict: ``{"numerical": {index: {"value", "weight", "actionable"}},
+        "categorical": {group: {"combination", "weight", "actionable"}},
+        "overall": total}``. Immutable features have weight ``None``.
+    """
+    breakdown = {"numerical": {}, "categorical": {}, "overall": 0.0}
+    all_scores = []
+
+    for idx, constraint in priorities["numerical"].items():
+        if isinstance(constraint, dict) and constraint.get("function") is not None:
+            weight = float(np.asarray(constraint["function"](x[idx])).squeeze())
+            breakdown["numerical"][idx] = {"value": x[idx], "weight": weight, "actionable": True}
             all_scores.append(weight)
+        elif (
+            constraint is None
+            or (isinstance(constraint, (int, float)) and constraint == 0)
+            or (isinstance(constraint, dict) and constraint.get("function") is None)
+        ):
+            breakdown["numerical"][idx] = {"value": x[idx], "weight": None, "actionable": False}
 
-        # Calculate overall score
-        breakdown["overall"] = float(np.sum(all_scores)) if len(all_scores) > 0 else 0.0
+    for group, weights in priorities["categorical"].items():
+        combination = tuple(x[idx] for idx in group)
+        raw_weight = weights.get(combination, 0)
+        weight = 0.0 if raw_weight is None else float(raw_weight)
+        # Actionable only if the search may pick more than one combination.
+        selectable = sum(1 for w in weights.values() if w is not None)
+        breakdown["categorical"][group] = {
+            "combination": combination,
+            "weight": weight,
+            "actionable": selectable > 1,
+        }
+        all_scores.append(weight)
 
-        return breakdown
+    breakdown["overall"] = float(np.sum(all_scores)) if len(all_scores) > 0 else 0.0
+    return breakdown
 
-    @staticmethod
-    def _top_n(results, n):
-        """Keep the ``n`` results with the highest preference score."""
-        if n is None:
-            return results
-        samples, predictions, scores, iterations = results
-        order = sorted(range(len(scores)), key=lambda k: scores[k], reverse=True)[: int(n)]
-        return (
-            [samples[k] for k in order],
-            [predictions[k] for k in order],
-            [scores[k] for k in order],
-            [iterations[k] for k in order],
+
+def _log_and_pick_best(cf_idx, candidates, requested):
+    """The most preferable ``(candidate, prediction, score, iteration)``; logs the top five."""
+    scores = [c[2] for c in candidates]
+    logger.info(
+        f"CF {cf_idx + 1}: Found {len(candidates)} valid candidates (requested: {requested})"
+    )
+    top = min(5, len(scores))
+    order = np.argsort(scores)[::-1]
+    logger.info(f"CF {cf_idx + 1}: Top {top} candidates by preference score:")
+    for rank in range(top):
+        cand, pred, score, iteration = candidates[order[rank]]
+        logger.info(
+            f"  Rank {rank + 1}: Score={score:.4f}, Iter={iteration}, Pred={pred:.4f}, Sample={cand}"
         )
-
-    def generate_random_samples(
-        self,
-        expected_counterfactuals=5,
-        max_iterations=10000,
-        epsilon=0.05,
-        random_seed=None,
-        use_monte_carlo=True,
-        max_tries=100,
-        return_top_n=None,
-        n_candidates_per_cf=None,
-    ):
-        """
-        Generate random samples based on filtered priorities.
-        Only keep samples whose prediction is within epsilon of the target.
-
-        Args:
-            expected_counterfactuals: desired number of counterfactuals to find
-            max_iterations: maximum number of iterations to try
-            epsilon: acceptable deviation from target prediction
-            random_seed: seed for reproducibility
-            use_monte_carlo: if True, use Monte Carlo sampling for numerical features; otherwise use uniform sampling
-            max_tries: maximum number of tries for rejection sampling in numerical features (only if use_monte_carlo is True)
-            return_top_n: if specified, return only the top N most preferable samples,
-                ordered by decreasing preference score (default: return all)
-            n_candidates_per_cf: number of valid candidates to collect per
-                counterfactual; the most preferable one is kept (default: 1)
-
-        Returns:
-            tuple: ``(counterfactuals, predictions, scores, iterations)`` -- four
-            lists with one entry per counterfactual found: the feature vector,
-            the model prediction, the preference score (see
-            :meth:`calculate_preference_score`) and the iteration at which it
-            was found. Fewer than ``expected_counterfactuals`` entries are
-            returned when the search budget runs out.
-        """
-        self._np_rng, self._py_rng = make_rngs(random_seed)
-        if n_candidates_per_cf is None:
-            # Backwards compatibility: this used to be read from an instance attribute.
-            n_candidates_per_cf = getattr(self, "n_candidates_per_cf", 1)
-
-        n_features = len(self.sample)
-        best_samples = []
-        best_predictions = []
-        best_scores = []
-        best_iteration_found = []
-        for cf_idx in range(expected_counterfactuals):
-            candidates = []
-            candidate_preds = []
-            candidate_scores = []
-            candidate_iters = []
-            found = 0
-            for i in range(max_iterations):
-                sample = np.zeros(n_features)
-                for idx, constraint in self.filtered_priorities["numerical"].items():
-                    if isinstance(constraint, dict) and "function" in constraint:
-                        sample[idx] = (
-                            self.sample_numeric_value(constraint, max_tries)
-                            if use_monte_carlo
-                            else self._np_rng.uniform(constraint["min"], constraint["max"])
-                        )
-                    else:
-                        sample[idx] = constraint
-                for group_indices, possible_values in self.filtered_priorities[
-                    "categorical"
-                ].items():
-                    combos = list(possible_values.keys())
-                    weights = np.array(list(possible_values.values()), dtype=float)
-                    allowed_mask = weights > 0
-                    if not np.any(allowed_mask):
-                        raise ValueError(
-                            f"All combinations for categorical group {group_indices} are forbidden (weight = 0). At least one combination must have weight > 0."
-                        )
-                    if use_monte_carlo:
-                        allowed_combos = [combos[j] for j in range(len(combos)) if allowed_mask[j]]
-                        allowed_weights = weights[allowed_mask]
-                        allowed_weights = allowed_weights / allowed_weights.sum()
-                        sel = allowed_combos[
-                            self._np_rng.choice(len(allowed_combos), p=allowed_weights)
-                        ]
-                    else:
-                        allowed_combos = [combos[j] for j in range(len(combos)) if allowed_mask[j]]
-                        sel = self._py_rng.choice(allowed_combos)
-                    for j, idx in enumerate(group_indices):
-                        sample[idx] = sel[j]
-                try:
-                    pred = self.model_pred(sample.reshape(1, -1))[0]
-                    if abs(pred - self.target) <= epsilon:
-                        candidates.append(sample.copy())
-                        candidate_preds.append(pred)
-                        candidate_scores.append(self.calculate_preference_score(sample))
-                        candidate_iters.append(i + 1)
-                        found += 1
-                        if found >= n_candidates_per_cf:
-                            break
-                except Exception as e:
-                    logger.warning(f"Could not get prediction for sample: {e}")
-            if candidates:
-                logger.info(
-                    f"CF {cf_idx + 1}: Found {len(candidates)} valid candidates (requested: {n_candidates_per_cf})"
-                )
-                # Log top 5 candidates by preference score
-                top_n = min(5, len(candidate_scores))
-                sorted_indices = np.argsort(candidate_scores)[::-1]
-                logger.info(f"CF {cf_idx + 1}: Top {top_n} candidates by preference score:")
-                for rank in range(top_n):
-                    idx = sorted_indices[rank]
-                    logger.info(
-                        f"  Rank {rank + 1}: Score={candidate_scores[idx]:.4f}, Iter={candidate_iters[idx]}, Pred={candidate_preds[idx]:.4f}, Sample={candidates[idx]}"
-                    )
-                best_idx = sorted_indices[0]
-                logger.info(
-                    f"CF {cf_idx + 1}: Selected candidate Rank 1 with Score={candidate_scores[best_idx]:.4f}, Iter={candidate_iters[best_idx]}, Pred={candidate_preds[best_idx]:.4f}, Sample={candidates[best_idx]}"
-                )
-                best_samples.append(candidates[best_idx])
-                best_predictions.append(candidate_preds[best_idx])
-                best_scores.append(candidate_scores[best_idx])
-                best_iteration_found.append(candidate_iters[best_idx])
-            else:
-                logger.info(f"No valid candidates found for CF {cf_idx + 1}")
-        return self._top_n(
-            (best_samples, best_predictions, best_scores, best_iteration_found), return_top_n
-        )
-
-    def generate_for_binary(
-        self,
-        expected_counterfactuals=100,
-        max_iterations=10000,
-        target_class=1,
-        threshold=0.5,
-        random_seed=None,
-        use_monte_carlo=True,
-        max_tries=100,
-        return_top_n=None,
-        n_candidates_per_cf=1,
-    ):
-        """
-        Generate random samples for binary classification.
-        Only keep samples whose prediction crosses the threshold in the desired direction.
-
-        Args:
-            expected_counterfactuals: desired number of counterfactuals to find
-            max_iterations: maximum number of iterations to try
-            target_class: desired class (0 or 1)
-            threshold: decision threshold for binary classification
-            random_seed: seed for reproducibility
-            use_monte_carlo: if True, use Monte Carlo sampling for numerical features; otherwise use uniform sampling
-            max_tries: maximum number of tries for rejection sampling in numerical features (only if use_monte_carlo is True)
-            return_top_n: if specified, return only the top N most preferable samples,
-                ordered by decreasing preference score (default: return all)
-            n_candidates_per_cf: number of valid candidates to collect per
-                counterfactual; the most preferable one is kept (default: 1)
-
-        Returns:
-            tuple: ``(counterfactuals, predictions, scores, iterations)`` -- four
-            lists with one entry per counterfactual found: the feature vector,
-            the model prediction, the preference score (see
-            :meth:`calculate_preference_score`) and the iteration at which it
-            was found. Fewer than ``expected_counterfactuals`` entries are
-            returned when the search budget runs out.
-        """
-        self._np_rng, self._py_rng = make_rngs(random_seed)
-
-        n_features = len(self.sample)
-        best_samples = []
-        best_predictions = []
-        best_scores = []
-        best_iteration_found = []
-        # Use n_candidates_per_cf argument directly
-        for cf_idx in range(expected_counterfactuals):
-            candidates = []
-            candidate_preds = []
-            candidate_scores = []
-            candidate_iters = []
-            found = 0
-            for i in range(max_iterations):
-                sample = np.zeros(n_features)
-                for idx, constraint in self.filtered_priorities["numerical"].items():
-                    if isinstance(constraint, dict) and "function" in constraint:
-                        sample[idx] = (
-                            self.sample_numeric_value(constraint, max_tries)
-                            if use_monte_carlo
-                            else self._np_rng.uniform(constraint["min"], constraint["max"])
-                        )
-                    else:
-                        sample[idx] = constraint
-                for group_indices, possible_values in self.filtered_priorities[
-                    "categorical"
-                ].items():
-                    combos = list(possible_values.keys())
-                    weights = np.array(list(possible_values.values()), dtype=float)
-                    allowed_mask = weights > 0
-                    if not np.any(allowed_mask):
-                        raise ValueError(
-                            f"All combinations for categorical group {group_indices} are forbidden (weight = 0). At least one combination must have weight > 0."
-                        )
-                    if use_monte_carlo:
-                        allowed_combos = [combos[j] for j in range(len(combos)) if allowed_mask[j]]
-                        allowed_weights = weights[allowed_mask]
-                        allowed_weights = allowed_weights / allowed_weights.sum()
-                        sel = allowed_combos[
-                            self._np_rng.choice(len(allowed_combos), p=allowed_weights)
-                        ]
-                    else:
-                        allowed_combos = [combos[j] for j in range(len(combos)) if allowed_mask[j]]
-                        sel = self._py_rng.choice(allowed_combos)
-                    for j, idx in enumerate(group_indices):
-                        sample[idx] = sel[j]
-                try:
-                    pred = self.model_pred(sample.reshape(1, -1))[0]
-                    is_valid = pred > threshold if target_class == 1 else pred < threshold
-                    if is_valid:
-                        candidates.append(sample.copy())
-                        candidate_preds.append(pred)
-                        candidate_scores.append(self.calculate_preference_score(sample))
-                        candidate_iters.append(i + 1)
-                        found += 1
-                        if found >= n_candidates_per_cf:
-                            break
-                except Exception as e:
-                    logger.warning(f"Could not get prediction for sample: {e}")
-            if candidates:
-                logger.info(
-                    f"CF {cf_idx + 1}: Found {len(candidates)} valid candidates (requested: {n_candidates_per_cf})"
-                )
-                # Log top 5 candidates by preference score
-                top_n = min(5, len(candidate_scores))
-                sorted_indices = np.argsort(candidate_scores)[::-1]
-                logger.info(f"CF {cf_idx + 1}: Top {top_n} candidates by preference score:")
-                for rank in range(top_n):
-                    idx = sorted_indices[rank]
-                    logger.info(
-                        f"  Rank {rank + 1}: Score={candidate_scores[idx]:.4f}, Iter={candidate_iters[idx]}, Pred={candidate_preds[idx]:.4f}, Sample={candidates[idx]}"
-                    )
-                best_idx = sorted_indices[0]
-                logger.info(
-                    f"CF {cf_idx + 1}: Selected candidate Rank 1 with Score={candidate_scores[best_idx]:.4f}, Iter={candidate_iters[best_idx]}, Pred={candidate_preds[best_idx]:.4f}, Sample={candidates[best_idx]}"
-                )
-                best_samples.append(candidates[best_idx])
-                best_predictions.append(candidate_preds[best_idx])
-                best_scores.append(candidate_scores[best_idx])
-                best_iteration_found.append(candidate_iters[best_idx])
-            else:
-                logger.info(f"No valid candidates found for CF {cf_idx + 1}")
-        return self._top_n(
-            (best_samples, best_predictions, best_scores, best_iteration_found), return_top_n
-        )
+    best = candidates[order[0]]
+    logger.info(
+        f"CF {cf_idx + 1}: Selected candidate Rank 1 with Score={best[2]:.4f}, Iter={best[3]}, Pred={best[1]:.4f}, Sample={best[0]}"
+    )
+    return best

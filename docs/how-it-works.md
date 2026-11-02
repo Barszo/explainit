@@ -19,7 +19,8 @@ proposed; the MINLP search also excludes zero-priority regions) and they
 
 ## Random search (`RandomSearchExplainer`)
 
-Source: [`explainit/explainers/random_search.py`](../explainit/explainers/random_search.py)
+Source: [`explainit/explainers/random_search.py`](../explainit/explainers/random_search.py);
+sampling in [`explainit/sampling.py`](../explainit/sampling.py)
 
 1. Immutable features are fixed at their sample value; forbidden categories
    are removed.
@@ -28,7 +29,7 @@ Source: [`explainit/explainers/random_search.py`](../explainit/explainers/random
    priority (rejection sampling), and categorical combinations proportional to
    their weight; otherwise sampling is uniform.
 3. The model checks each candidate. For every requested counterfactual the
-   search collects `n_candidates_per_cf` valid candidates and keeps the one with
+   search collects `candidates_per_counterfactual` valid candidates and keeps the one with
    the highest preference score.
 
 The method is model-agnostic and simple, and it returns diverse alternatives.
@@ -37,7 +38,7 @@ counterfactual.
 
 ## Shapley-guided MINLP search (`MINLPSearchExplainer`)
 
-Source: [`explainit/explainers/minlp_search.py`](../explainit/explainers/minlp_search.py)
+Source: [`explainit/explainers/minlp/`](../explainit/explainers/minlp/)
 
 The search treats counterfactual generation as a mixed-integer nonlinear
 program: maximise $S(\mathbf{x}')$ subject to reaching the target, with
@@ -45,24 +46,30 @@ categorical features as discrete choices. The true model is replaced locally by
 a linear surrogate built from Shapley values, and every candidate is re-checked
 with the real model. The stages match the `[Stage N]` messages in the log:
 
-| Stage | What happens |
-| --- | --- |
-| 0 | Derive each numerical feature's allowed region from where its priority is positive. |
-| 1 | Pick an **anchor**: a dataset row that respects the priorities and whose prediction is close to the target (falls back to random sampling of the allowed region). |
-| 3 | Compute Shapley values between the current point and the anchor (exact, or Monte-Carlo with `shap_approx=True`), giving a linear surrogate $h(\mathbf{x}')$. |
-| 4 | Prune categorical combinations that cannot help, then solve one linear program per combination for a feasible warm start. |
-| 5 | Optimise the preference score with SLSQP subject to $|h(\mathbf{x}') - y^*| \le \varepsilon$, inside a trust region. |
-| 6 | Evaluate the candidate with the real model, apply residual correction or restoration if it misses the band, and re-linearise around the new point. |
-| 7 | **Peak lock-in**: push features towards their highest-priority values while other features compensate, keeping the prediction in the band. |
+| Stage | What happens | Module |
+| --- | --- | --- |
+| 0 | Derive each numerical feature's allowed region from where its priority is positive. | `bounds.py` |
+| 1 | Pick an **anchor**: a dataset row that respects the priorities and whose prediction is close to the target (falls back to random sampling of the allowed region). | `anchor.py` |
+| 3 | Compute Shapley values between the current point and the anchor (exact, or Monte-Carlo with `MINLPSettings(approximate_shapley=True)`), giving a linear surrogate $h(\mathbf{x}')$. | `shapley.py`, `surrogate.py` |
+| 4 | Prune categorical combinations that cannot help, then solve one linear program per combination for a feasible warm start. | `combinations.py`, `linear_program.py`, `warm_start.py` |
+| 5 | Optimise the preference score with SLSQP subject to $\lvert h(\mathbf{x}') - y^*\rvert \le \varepsilon$, inside a trust region. | `optimizer.py`, `bounds.py` (`TrustRegion`) |
+| 6 | Evaluate the candidate with the real model, apply residual correction or restoration if it misses the band, and re-linearise around the new point. | `refinement.py`, `incumbent.py` |
+| 7 | **Peak lock-in**: push features towards their highest-priority values while other features compensate, keeping the prediction in the band. | `refinement.py` |
 
-Stages 3 to 6 repeat for up to `max_iterations` passes, stopping early after
-`patience` passes without improvement. The best valid candidate is returned;
-if none was found, the closest candidate is returned (or `None` with
-`return_when_fails=False`). If no anchor can be found at all (for example,
+`explainer.py` holds the public `MINLPSearchExplainer` and `MINLPSettings`;
+each `explain` call creates a `MINLPSearch` (`search.py`), which runs the
+stages in this order; `scoring.py` computes preference scores, `intervals.py` handles allowed
+intervals, and `binary.py` contains the separate search for binary
+classifiers.
+
+Stages 3 to 6 repeat for up to `MINLPSettings.max_iterations` passes, stopping
+early after `patience` passes without improvement. The best valid candidate is
+returned; if none was found, the closest candidate is returned with
+`valid=False` (or nothing with `return_when_fails=False`). If no anchor can be found at all (for example,
 the target is outside what the allowed region can reach), an exception is
 raised.
 
-After a run, `last_search_result` explains what happened:
+`Explanation.diagnostics` explains what happened:
 
 ```python
 import numpy as np
@@ -84,11 +91,11 @@ priorities = {
 }
 dataset = np.random.default_rng(0).uniform(0, 1, size=(50, 2))
 
-explainer = MINLPSearchExplainer(model, priorities, np.array([0.1, 0.2]), 1.0, dataset)
-explainer.find_counterfactuals(random_seed=0)
+explainer = MINLPSearchExplainer(model, priorities, dataset)
+result = explainer.explain(np.array([0.1, 0.2]), target=1.0, tolerance=0.01, random_seed=0)
 
-result = explainer.last_search_result
-print(result["reached_target"], result["distance"] <= explainer.epsilon)
+diagnostics = result.diagnostics
+print(diagnostics["reached_target"], diagnostics["distance"] <= 0.01)
 ```
 
 ```text
@@ -97,8 +104,8 @@ True True
 
 Useful keys include `stop_reason`, `distance` (to the target), `iterations_run`,
 `cf_source` (`anchor` or `optimiser`), `priority_score`, `history` (one entry
-per pass) and `step_control` (trust-region statistics). The anchor's origin
-is in `explainer.exemplar_source`.
+per pass), `step_control` (trust-region statistics), `exemplar_source` (where
+the anchor came from) and `settings`.
 
 ## Reproducibility
 

@@ -16,7 +16,7 @@ from explainit.priorities.nonlinear import exponential
 @pytest.mark.parametrize(
     "name",
     [
-        "explainit.explainers.minlp_search",
+        "explainit.explainers.minlp",
         "explainit.explainers.random_search",
         "explainit.priorities.linear",
         "explainit.priorities.nonlinear",
@@ -54,25 +54,17 @@ def test_readme_random_search_example():
         },
         "categorical": {},
     }
-    explainer = RandomSearchExplainer(model_pred, priorities, sample, target)
-    counterfactuals, predictions, scores, iterations = explainer.generate_random_samples(
-        expected_counterfactuals=3,
-        max_iterations=5000,
-        epsilon=0.05,
-        random_seed=42,
+    explainer = RandomSearchExplainer(model_pred, priorities, max_iterations=5000)
+    result = explainer.explain(
+        sample, target=target, tolerance=0.05, n_counterfactuals=3, random_seed=42
     )
-    assert len(counterfactuals) == 3
-    assert len(predictions) == 3
-    assert len(scores) == 3
-    assert np.all(np.abs(np.asarray(predictions) - target) <= 0.05)
-    np.testing.assert_allclose(model_pred(np.asarray(counterfactuals)), predictions)
+    assert len(result) == 3
+    assert np.all(np.abs(result.predictions - target) <= 0.05)
+    np.testing.assert_allclose(model_pred(result.counterfactuals), result.predictions)
     np.testing.assert_allclose(
-        scores,
-        [explainer.calculate_preference_score(row) for row in counterfactuals],
+        result.scores, [explainer.preference_score(row) for row in result.counterfactuals]
     )
-    assert np.all((np.asarray(scores) >= 0) & (np.asarray(scores) <= 2))
-    assert len(iterations) == 3
-    assert np.all((np.asarray(iterations) > 0) & (np.asarray(iterations) <= 5000))
+    assert np.all((result.scores >= 0) & (result.scores <= 2))
 
 
 def test_import_does_not_configure_logging():
@@ -86,7 +78,7 @@ def test_import_does_not_configure_logging():
 
 
 def test_top_level_exports():
-    from explainit.explainers.minlp_search import MINLPSearchExplainer
+    from explainit.explainers.minlp import MINLPSearchExplainer
     from explainit.priorities.linear import basic_linear
 
     assert explainit.MINLPSearchExplainer is MINLPSearchExplainer
