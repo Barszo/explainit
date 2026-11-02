@@ -9,10 +9,27 @@ numerical feature ``i`` and ``phi_g`` the Shapley value of categorical group
 ``g`` (counted when the group takes the anchor's category).
 """
 
+from collections.abc import Container, Iterable, Mapping
+from typing import Any
+
 import numpy as np
 
+from explainit.explainers.minlp._types import (
+    Assignment,
+    Bounds,
+    Group,
+    ShapleyValues,
+    Vector,
+)
 
-def unit_coefficients(numerical_shapley, sample, anchor, numerical_indices, immutable):
+
+def unit_coefficients(
+    numerical_shapley: Mapping[int, float],
+    sample: Vector,
+    anchor: Vector,
+    numerical_indices: Iterable[int],
+    immutable: Container[Any],
+) -> tuple[dict[int, float], float]:
     """Per-unit coefficients ``c_i`` and ``sum_i c_i x^k_i`` over mutable features.
 
     A feature with the same value in ``sample`` and ``anchor`` gets
@@ -32,7 +49,9 @@ def unit_coefficients(numerical_shapley, sample, anchor, numerical_indices, immu
     return coefficients, coefficient_times_sample
 
 
-def _categorical_term(values, group, group_shapley, sample, anchor):
+def _categorical_term(
+    values: Vector, group: Group, group_shapley: float, sample: Vector, anchor: Vector
+) -> float:
     current = tuple(float(values[idx]) for idx in group)
     if current == tuple(float(sample[idx]) for idx in group):
         return 0.0
@@ -41,7 +60,13 @@ def _categorical_term(values, group, group_shapley, sample, anchor):
     raise ValueError(f"Invalid categorical combination encountered for indices {group}: {current}")
 
 
-def categorical_contribution(combination, groups, categorical_shapley, sample, anchor):
+def categorical_contribution(
+    combination: Assignment,
+    groups: Iterable[Group],
+    categorical_shapley: Mapping[Group, float],
+    sample: Vector,
+    anchor: Vector,
+) -> float:
     """Surrogate contribution of a categorical assignment ``{column: value}``."""
     values = np.zeros(max(combination.keys()) + 1, dtype=float)
     for idx, val in combination.items():
@@ -53,8 +78,14 @@ def categorical_contribution(combination, groups, categorical_shapley, sample, a
 
 
 def surrogate_prediction(
-    x, coefficients, shapley, sample, anchor, priorities_for_search, basic_prediction
-):
+    x: Vector,
+    coefficients: Mapping[int, float],
+    shapley: ShapleyValues,
+    sample: Vector,
+    anchor: Vector,
+    priorities_for_search: Mapping[str, Mapping[Any, Any]],
+    basic_prediction: float,
+) -> float:
     """``h(x)`` for a full-length feature vector ``x``.
 
     Args:
@@ -78,7 +109,13 @@ def surrogate_prediction(
     return result
 
 
-def reachable_range(basic_prediction, coefficients, bounds, sample, immutable) -> tuple:
+def reachable_range(
+    basic_prediction: float,
+    coefficients: Mapping[int, float] | None,
+    bounds: Bounds,
+    sample: Vector,
+    immutable: Container[Any],
+) -> tuple[float, float]:
     """Interval ``h`` can span inside ``bounds`` (interval arithmetic, no model calls)."""
     lo_total = hi_total = float(basic_prediction)
     for idx, coefficient in (coefficients or {}).items():

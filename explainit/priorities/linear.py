@@ -1,11 +1,14 @@
 import numpy as np
+import numpy.typing as npt
 
 ################################
 # Linear functions
 #################################
 
 
-def basic_linear(x: float, x0: float, x1: float, increasing: bool = True) -> np.ndarray:
+def basic_linear(
+    x: npt.ArrayLike, x0: float, x1: float, increasing: bool = True
+) -> npt.NDArray[np.float64]:
     """
     Linear function from 0 to 1 (increasing) or 1 to 0 (decreasing).
     If increasing=True: 0 for x <= x0, 1 for x >= x1.

@@ -4,14 +4,16 @@ Used by the random search and by the probability-distribution plots, so both
 always describe the same sampling behaviour.
 """
 
-from collections.abc import Mapping
+from collections.abc import Hashable, Mapping
 from typing import Any
 
 import numpy as np
 
+from explainit._random import NumpyRandom, PythonRandom
+
 
 def sample_numeric_value(
-    constraint: Mapping[str, Any], max_tries: int = 100, rng: Any = None
+    constraint: Mapping[str, Any], max_tries: int = 100, rng: NumpyRandom = None
 ) -> float:
     """Draw a value from ``[min, max]`` with density proportional to the priority.
 
@@ -48,7 +50,13 @@ def sample_numeric_value(
     return float(np.clip(xs[idx] + jitter, min_val, max_val))
 
 
-def sample_category(group, weights: Mapping, weighted: bool, np_rng, py_rng) -> tuple:
+def sample_category[Combination: Hashable](
+    group: tuple[int, ...],
+    weights: Mapping[Combination, float | None],
+    weighted: bool,
+    np_rng: NumpyRandom,
+    py_rng: PythonRandom,
+) -> Combination:
     """Pick a categorical combination; combinations with weight ``<= 0`` or ``None`` are never picked.
 
     Args:
@@ -72,5 +80,7 @@ def sample_category(group, weights: Mapping, weighted: bool, np_rng, py_rng) -> 
     if weighted:
         allowed_weights = values[allowed_mask]
         allowed_weights = allowed_weights / allowed_weights.sum()
-        return allowed[np_rng.choice(len(allowed), p=allowed_weights)]
-    return py_rng.choice(allowed)
+        picked: Combination = allowed[np_rng.choice(len(allowed), p=allowed_weights)]
+        return picked
+    picked = py_rng.choice(allowed)
+    return picked

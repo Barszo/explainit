@@ -11,9 +11,9 @@ from typing import Any
 
 import matplotlib.pyplot as plt
 import numpy as np
+from matplotlib.figure import Figure
 
 from explainit.plotting._common import (
-    PathLike,
     PriorityCurve,
     draw_bar_label,
     draw_bars,
@@ -26,6 +26,7 @@ from explainit.plotting._common import (
 )
 from explainit.plotting.style import TEXT, apply_style, line_color, style_axes, styled_legend
 from explainit.sampling import sample_numeric_value
+from explainit.typing import PathLike
 
 
 def plot_numerical_probability_distribution(
@@ -38,7 +39,7 @@ def plot_numerical_probability_distribution(
     save_path: PathLike | None = None,
     save_dir: PathLike | None = None,
     show: bool = False,
-) -> plt.Figure | None:
+) -> Figure | None:
     """Theoretical vs. empirical sampling density of numerical feature ``idx``.
 
     The theoretical curve is the priority divided by its integral over
@@ -104,13 +105,13 @@ def plot_numerical_probability_distribution(
 
 def plot_categorical_probability_distribution(
     group_indices: tuple[int, ...],
-    mapping: Mapping[tuple[Any, ...], float],
+    mapping: Mapping[tuple[Any, ...], float | None],
     *,
     feature_names: Sequence[str] | None = None,
     save_path: PathLike | None = None,
     save_dir: PathLike | None = None,
     show: bool = False,
-) -> plt.Figure | None:
+) -> Figure | None:
     """Sampling probability of each allowed combination of a categorical group.
 
     Combinations with weight ``0`` or ``None`` are never sampled and are left

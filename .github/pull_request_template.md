@@ -5,7 +5,7 @@
 ## Checklist
 
 - [ ] Tests added or updated, and `pytest` passes
-- [ ] `pre-commit run --all-files` passes
+- [ ] `pre-commit run --all-files` and `mypy` pass
 - [ ] Documentation (`README.md`, `docs/`) updated if behaviour or the public API changed
 - [ ] `CHANGELOG.md` updated under `Unreleased`
 - [ ] Seeded search results are unchanged, or the change is called out in the changelog

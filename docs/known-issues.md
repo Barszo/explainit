@@ -28,6 +28,7 @@ How issues are tracked:
 | [MINLP-3](#minlp-3-the-anchor-can-carry-wrong-immutable-values) | MINLP | The returned anchor can have wrong immutable-feature values | **High**: "unchangeable" features change | Yes |
 | [MINLP-5](#minlp-5-binary-results-are-sorted-worst-first) | MINLP binary | Results are sorted worst-first | Low | No (needs two results) |
 | [MINLP-7](#minlp-7-tied-predictions-crash-the-anchor-search) | MINLP | Tied dataset predictions raise `AssertionError` | Medium | No |
+| [MINLP-8](#minlp-8-a-forbidden-current-category-makes-the-search-fail) | MINLP | A sample in a forbidden (`None`) category makes every pass fail | **High**: the random anchor is returned instead of an optimised answer | Yes |
 | [RS-1](#rs-1-unlisted-features-are-set-to-zero) | Random search | Features missing from the priorities become 0 | **High**: nonsense counterfactuals | Yes |
 | [RS-2](#rs-2-model-errors-are-silently-ignored) | Random search | Exceptions from the model are logged and skipped | **High**: a broken model looks like "no answer" | Yes |
 | [RS-3](#rs-3-a-forbidden-category-crashes-the-score) | Random search | Scoring a `None` (forbidden) category crashes | Medium | Yes |
@@ -138,6 +139,22 @@ row has the minimal distance.
 
 **Suggested fix.** Pick one deterministically (e.g. the first, or the one
 closest to the sample).
+
+## MINLP-8: A forbidden current category makes the search fail
+
+**Symptom.** If the sample's own category has weight `None` (forbidden), every
+refinement pass fails with `TypeError: unsupported operand type(s) for +:
+'float' and 'NoneType'`. The search stops with `stop_reason="search_failed"`
+and returns the Stage 1 anchor (`cf_source="anchor"`), so a user who wants to
+*leave* a forbidden category gets no optimisation at all.
+
+**Root cause.** `total_weight` in `minlp/scoring.py` adds the categorical
+weight of the evaluated point without checking for `None`; only `0`-weight
+categories are rejected with a `ValueError`, which the optimiser handles.
+Found by the type checker (the line carries a `# type: ignore[operator]`).
+
+**Suggested fix.** Treat `None` like a forbidden combination: raise the same
+`ValueError` (or score it as not allowed), and remove the `type: ignore`.
 
 ## RS-1: Unlisted features are set to zero
 
@@ -251,4 +268,5 @@ improvement work.
 | Random search diversity | Several "different" counterfactuals can be identical (e.g. the only allowed category is chosen every time). | De-duplicate, or add a diversity criterion. |
 | Random numbers | Seeding uses the legacy `RandomState`. | Use `numpy.random.Generator` and an `rng` argument ([SPEC 7](https://scientific-python.org/specs/spec-0007/)). This changes seeded results. |
 | Anchor tolerance | `target_exemplar_epsilon` (default 0.01) is independent of `epsilon`, so a looser `epsilon` does not make dataset anchors easier to find. | Default it to `epsilon`. |
+| LP fallback | `solve_linear_constraint` also tries the `"interior-point"` method, which SciPy removed in 1.11; the attempt always fails and falls through. | Remove it from the list of methods. |
 | Reproducibility across machines | MINLP results can differ in the 4th decimal between operating systems and CPUs (SciPy's optimiser and NumPy's CPU-specific code). | Document; consider rounding reported values. |

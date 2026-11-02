@@ -60,9 +60,15 @@ lint = [
     "pre-commit>=4",
     "ruff>=0.17",
 ]
+typecheck = [
+    "mypy>=2.4",
+    "pandas-stubs>=2.2",
+    "scipy-stubs>=1.16",
+]
 dev = [
     { include-group = "test" },
     { include-group = "lint" },
+    { include-group = "typecheck" },
 ]
 
 [tool.setuptools.dynamic]
@@ -70,6 +76,9 @@ version = { attr = "explainit.__version__" }
 
 [tool.setuptools.packages.find]
 include = ["explainit", "explainit.*"]
+
+[tool.setuptools.package-data]
+explainit = ["py.typed"]
 
 [tool.pytest.ini_options]
 minversion = "8"
@@ -123,6 +132,38 @@ allowed-confusables = ["×"]
 [tool.ruff.lint.isort]
 known-first-party = ["explainit"]
 combine-as-imports = true
+
+[tool.mypy]
+python_version = "3.12"
+files = ["explainit", "tests", "benchmarks"]
+# Everything is type-checked; tests and scripts need not be annotated.
+check_untyped_defs = true
+strict_equality = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+warn_unreachable = true
+extra_checks = true
+enable_error_code = ["ignore-without-code", "redundant-expr", "truthy-bool"]
+
+[[tool.mypy.overrides]]
+# The library itself is fully annotated (the rules of mypy --strict).
+module = ["explainit", "explainit.*"]
+disallow_any_generics = true
+disallow_incomplete_defs = true
+disallow_subclassing_any = true
+disallow_untyped_calls = true
+disallow_untyped_decorators = true
+disallow_untyped_defs = true
+no_implicit_reexport = true
+warn_return_any = true
+
+[[tool.mypy.overrides]]
+module = ["hypothesis.*"]
+follow_untyped_imports = true
+
+[[tool.mypy.overrides]]
+module = ["sklearn.*"]  # no type information published
+ignore_missing_imports = true
 
 [tool.coverage.run]
 source = ["explainit"]

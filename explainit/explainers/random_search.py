@@ -5,9 +5,14 @@ desirable values sampled more often; the model checks each candidate, and the
 most preferable valid ones are returned.
 """
 
-import numpy as np
+from collections.abc import Mapping, Sequence
+from pathlib import Path
+from typing import Any
 
-from explainit._random import make_rngs
+import numpy as np
+import numpy.typing as npt
+
+from explainit._random import NumpyRandom, PythonRandom, make_rngs
 from explainit.explanation import Explanation
 from explainit.logging_config import logger
 from explainit.plotting import (
@@ -16,6 +21,10 @@ from explainit.plotting import (
 )
 from explainit.sampling import sample_category, sample_numeric_value
 from explainit.targets import resolve_target
+from explainit.typing import FloatArray, Model, PathLike, Priorities
+
+# ``(candidate, prediction, preference score, iteration found)``.
+type _Candidate = tuple[FloatArray, Any, float, int]
 
 
 class RandomSearchExplainer:
@@ -35,14 +44,14 @@ class RandomSearchExplainer:
 
     def __init__(
         self,
-        model,
-        priorities,
+        model: Model,
+        priorities: Priorities,
         *,
-        max_iterations=10000,
-        candidates_per_counterfactual=1,
-        use_monte_carlo=True,
-        max_tries=100,
-    ):
+        max_iterations: int = 10000,
+        candidates_per_counterfactual: int = 1,
+        use_monte_carlo: bool = True,
+        max_tries: int = 100,
+    ) -> None:
         self.model = model
         self.priorities = priorities
         self.max_iterations = max_iterations
@@ -52,15 +61,15 @@ class RandomSearchExplainer:
 
     def explain(
         self,
-        x,
+        x: npt.ArrayLike,
         *,
-        target=None,
-        tolerance=0.05,
-        target_class=None,
-        threshold=0.5,
-        n_counterfactuals=5,
-        top_n=None,
-        random_seed=None,
+        target: float | None = None,
+        tolerance: float = 0.05,
+        target_class: int | None = None,
+        threshold: float = 0.5,
+        n_counterfactuals: int = 5,
+        top_n: int | None = None,
+        random_seed: int | None = None,
     ) -> Explanation:
         """Find counterfactuals for the sample ``x``.
 
@@ -89,9 +98,9 @@ class RandomSearchExplainer:
         filtered = filter_priorities(self.priorities, sample)
         np_rng, py_rng = make_rngs(random_seed)
 
-        found = []
+        found: list[_Candidate] = []
         for cf_idx in range(n_counterfactuals):
-            candidates = []
+            candidates: list[_Candidate] = []
             for i in range(self.max_iterations):
                 candidate = sample_candidate(
                     filtered, len(sample), self.use_monte_carlo, self.max_tries, np_rng, py_rng
@@ -124,17 +133,23 @@ class RandomSearchExplainer:
             diagnostics={"iterations": [c[3] for c in found], "target": goal},
         )
 
-    def preference_score(self, x) -> float:
+    def preference_score(self, x: npt.ArrayLike) -> float:
         """Sum of the priorities of ``x``'s feature values (higher is better)."""
         return preference_score(self.priorities, x)
 
-    def preference_breakdown(self, x) -> dict:
+    def preference_breakdown(self, x: npt.ArrayLike) -> dict[str, Any]:
         """Per-feature priorities of ``x``; see :func:`preference_breakdown`."""
         return preference_breakdown(self.priorities, x)
 
     def plot_priorities(
-        self, x=None, *, exemplar=None, feature_names=None, save_dir=None, show=True
-    ):
+        self,
+        x: npt.ArrayLike | None = None,
+        *,
+        exemplar: npt.ArrayLike | None = None,
+        feature_names: Sequence[str] | None = None,
+        save_dir: PathLike | None = None,
+        show: bool = True,
+    ) -> list[Path]:
         """Plot the priorities, marking ``x`` and ``exemplar`` if given.
 
         Pass ``save_dir`` to also write PNG files, and ``show=False`` to skip
@@ -150,8 +165,14 @@ class RandomSearchExplainer:
         )
 
     def plot_sampling_distributions(
-        self, n_samples=10000, *, random_seed=None, feature_names=None, save_dir=None, show=True
-    ):
+        self,
+        n_samples: int = 10000,
+        *,
+        random_seed: int | None = None,
+        feature_names: Sequence[str] | None = None,
+        save_dir: PathLike | None = None,
+        show: bool = True,
+    ) -> list[Path]:
         """Plot how the search samples each feature: theoretical vs. empirical distribution."""
         np_rng = make_rngs(random_seed)[0]
         return _plot_probability_distributions(
@@ -166,13 +187,15 @@ class RandomSearchExplainer:
         )
 
 
-def filter_priorities(priorities, sample):
+def filter_priorities(
+    priorities: Priorities, sample: Sequence[float] | FloatArray
+) -> dict[str, dict[Any, Any]]:
     """Priorities prepared for sampling.
 
     Immutable numerical features (``None``, ``0``, or no ``function``) are
     replaced by the fixed value they keep; zero-weight categories are removed.
     """
-    filtered = {"numerical": {}, "categorical": {}}
+    filtered: dict[str, dict[Any, Any]] = {"numerical": {}, "categorical": {}}
 
     for idx, val in priorities["numerical"].items():
         if val is None or (isinstance(val, (int, float)) and val == 0):
@@ -191,7 +214,14 @@ def filter_priorities(priorities, sample):
     return filtered
 
 
-def sample_candidate(filtered, n_features, use_monte_carlo, max_tries, np_rng, py_rng):
+def sample_candidate(
+    filtered: Mapping[str, Mapping[Any, Any]],
+    n_features: int,
+    use_monte_carlo: bool,
+    max_tries: int,
+    np_rng: NumpyRandom,
+    py_rng: PythonRandom,
+) -> FloatArray:
     """One candidate inside the allowed region (known issue RS-1: starts from zeros)."""
     candidate = np.zeros(n_features)
     for idx, constraint in filtered["numerical"].items():
@@ -210,7 +240,7 @@ def sample_candidate(filtered, n_features, use_monte_carlo, max_tries, np_rng, p
     return candidate
 
 
-def preference_score(priorities, x) -> float:
+def preference_score(priorities: Priorities, x: Any) -> float:
     """Sum of the numerical priorities and categorical weights of ``x``."""
     scores = []
     for idx, constraint in priorities["numerical"].items():
@@ -224,7 +254,7 @@ def preference_score(priorities, x) -> float:
     return float(np.sum(scores))
 
 
-def preference_breakdown(priorities, x) -> dict:
+def preference_breakdown(priorities: Priorities, x: Any) -> dict[str, Any]:
     """Per-feature contributions to the preference score of ``x``.
 
     Returns:
@@ -232,8 +262,8 @@ def preference_breakdown(priorities, x) -> dict:
         "categorical": {group: {"combination", "weight", "actionable"}},
         "overall": total}``. Immutable features have weight ``None``.
     """
-    breakdown = {"numerical": {}, "categorical": {}, "overall": 0.0}
-    all_scores = []
+    breakdown: dict[str, Any] = {"numerical": {}, "categorical": {}, "overall": 0.0}
+    all_scores: list[float] = []
 
     for idx, constraint in priorities["numerical"].items():
         if isinstance(constraint, dict) and constraint.get("function") is not None:
@@ -264,7 +294,7 @@ def preference_breakdown(priorities, x) -> dict:
     return breakdown
 
 
-def _log_and_pick_best(cf_idx, candidates, requested):
+def _log_and_pick_best(cf_idx: int, candidates: list[_Candidate], requested: int) -> _Candidate:
     """The most preferable ``(candidate, prediction, score, iteration)``; logs the top five."""
     scores = [c[2] for c in candidates]
     logger.info(
@@ -278,7 +308,7 @@ def _log_and_pick_best(cf_idx, candidates, requested):
         logger.info(
             f"  Rank {rank + 1}: Score={score:.4f}, Iter={iteration}, Pred={pred:.4f}, Sample={cand}"
         )
-    best = candidates[order[0]]
+    best: _Candidate = candidates[order[0]]
     logger.info(
         f"CF {cf_idx + 1}: Selected candidate Rank 1 with Score={best[2]:.4f}, Iter={best[3]}, Pred={best[1]:.4f}, Sample={best[0]}"
     )

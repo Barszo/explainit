@@ -7,28 +7,45 @@ issue MINLP-5.
 """
 
 import traceback
+from collections.abc import Mapping, Sequence
+from typing import Any
 
 import numpy as np
 from scipy.optimize import minimize
 
+from explainit.explainers.minlp._types import Bounds, NumericalPriorities, Vector, VectorFunction
 from explainit.explainers.minlp.intervals import (
     allowed_interval_constraint_value,
     project_to_allowed_intervals,
 )
 from explainit.logging_config import logger
+from explainit.typing import FloatArray, Model
+
+# ``(counterfactuals, predictions, scores, combination_numbers)``.
+type BinaryResults = tuple[list[Vector], list[Any], list[float], list[int]]
+
+
+def class_target(target_class: int, threshold: float) -> tuple[float, float]:
+    """Internal ``(target, tolerance)`` of a class goal.
+
+    The search aims at 0.75 (class 1) or 0.25 (class 0), with a tolerance
+    that keeps it comfortably on the requested side of ``threshold``.
+    """
+    target = 0.75 if target_class == 1 else 0.25
+    return target, max(0.1, abs(target - threshold))
 
 
 def optimise_for_class(
-    start,
-    numerical_indices,
-    numerical_priorities,
-    bounds,
-    model,
-    objective,
-    target_class,
-    threshold,
-    max_iterations,
-):
+    start: Vector,
+    numerical_indices: Sequence[int],
+    numerical_priorities: NumericalPriorities,
+    bounds: Bounds,
+    model: Model,
+    objective: VectorFunction,
+    target_class: int,
+    threshold: float,
+    max_iterations: int,
+) -> tuple[Vector, Any, float] | None:
     """Run SLSQP from ``start`` with the classification constraint.
 
     Returns:
@@ -36,28 +53,32 @@ def optimise_for_class(
         on the requested side of the threshold, otherwise ``None``.
     """
 
-    def to_full(x, start=start):
+    def to_full(x: FloatArray, start: Vector = start) -> Vector:
         full = start.copy()
         for i, idx in enumerate(numerical_indices):
             if i < len(x):
                 full[idx] = x[i]
         return full
 
-    def benefit(x):
+    def benefit(x: FloatArray) -> float:
         try:
             return objective(to_full(x))
         except ValueError:
             return -1e12
 
-    def classification_constraint(x):
+    def negative_benefit(x: FloatArray) -> float:
+        return -benefit(x)
+
+    def classification_constraint(x: FloatArray) -> Any:
         pred = model([to_full(x)])[0]
         if target_class == 1:
             return pred - threshold
         return threshold - pred
 
-    constraints = [{"type": "ineq", "fun": classification_constraint}]
+    # SciPy's legacy dict constraints; the stubs' TypedDict expects array-valued ``fun``.
+    constraints: list[Any] = [{"type": "ineq", "fun": classification_constraint}]
 
-    x0 = np.array([start[idx] for idx in numerical_indices])
+    x0: FloatArray = np.array([start[idx] for idx in numerical_indices])
     bounds_list = [bounds[idx] for idx in numerical_indices]
     for j, feature_idx in enumerate(numerical_indices):
         cfg = numerical_priorities.get(feature_idx, {})
@@ -79,7 +100,7 @@ def optimise_for_class(
     logger.debug(f"Bounds: {bounds_list}")
 
     result = minimize(
-        lambda x: -benefit(x),
+        negative_benefit,
         x0,
         method="SLSQP",
         bounds=bounds_list,
@@ -103,22 +124,25 @@ def optimise_for_class(
 
 
 def search_combinations(
-    warm_starts,
-    sample,
-    numerical_priorities,
-    bounds,
-    model,
-    objective,
-    target_class,
-    threshold,
-    max_iterations,
-):
+    warm_starts: Mapping[int, Mapping[str, Any]],
+    sample: Vector,
+    numerical_priorities: NumericalPriorities,
+    bounds: Bounds,
+    model: Model,
+    objective: VectorFunction,
+    target_class: int,
+    threshold: float,
+    max_iterations: int,
+) -> BinaryResults:
     """:func:`optimise_for_class` for every warm start.
 
     Returns:
         tuple: ``(counterfactuals, predictions, scores, combination_numbers)``.
     """
-    counterfactuals, predictions, scores, found_counts = [], [], [], []
+    counterfactuals: list[Vector] = []
+    predictions: list[Any] = []
+    scores: list[float] = []
+    found_counts: list[int] = []
     numerical_indices = list(numerical_priorities.keys())
 
     for combo_id, values in warm_starts.items():
@@ -163,7 +187,13 @@ def search_combinations(
     return counterfactuals, predictions, scores, found_counts
 
 
-def rank(counterfactuals, predictions, scores, found_counts, return_top_n=None):
+def rank(
+    counterfactuals: list[Vector],
+    predictions: list[Any],
+    scores: list[float],
+    found_counts: list[int],
+    return_top_n: int | None = None,
+) -> BinaryResults:
     """Sort the results by ascending score (known issue MINLP-5) and keep ``return_top_n``."""
     if not counterfactuals:
         logger.warning("No valid counterfactuals found!")

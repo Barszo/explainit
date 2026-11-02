@@ -1,6 +1,10 @@
 """Best counterfactuals found so far during the MINLP refinement loop."""
 
+from collections.abc import Mapping
 from dataclasses import dataclass
+from typing import Any
+
+from explainit.explainers.minlp._types import Vector
 
 
 @dataclass
@@ -13,12 +17,12 @@ class Incumbents:
       ranked by distance to the target.
     """
 
-    feasible: list | None = None
+    feasible: Vector | None = None
     feasible_priority: float = float("-inf")
     feasible_distance: float = float("inf")
     feasible_source: str | None = None
     feasible_prediction: float | None = None
-    infeasible: list | None = None
+    infeasible: Vector | None = None
     infeasible_distance: float = float("inf")
     infeasible_prediction: float | None = None
 
@@ -26,7 +30,13 @@ class Incumbents:
     def reached_target(self) -> bool:
         return self.feasible is not None
 
-    def set_anchor(self, cf, priority, distance, prediction=None) -> None:
+    def set_anchor(
+        self,
+        cf: list[float],
+        priority: float | None,
+        distance: float,
+        prediction: float | None = None,
+    ) -> None:
         """Start from an anchor that is already inside the band."""
         self.feasible = cf
         self.feasible_prediction = prediction
@@ -34,7 +44,7 @@ class Incumbents:
         self.feasible_distance = distance
         self.feasible_source = "anchor"
 
-    def offer(self, cf, evaluation) -> bool:
+    def offer(self, cf: Vector, evaluation: Mapping[str, Any]) -> bool:
         """Consider a candidate; returns whether it became an incumbent."""
         priority = evaluation["priority"]
         if evaluation["feasible"]:

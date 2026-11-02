@@ -6,17 +6,24 @@ feature, because the Shapley-linear surrogate is only accurate near the point
 it was linearised at.
 """
 
+from collections.abc import Callable
 from dataclasses import dataclass
 
 import numpy as np
 
+from explainit.explainers.minlp._types import Bound, Bounds, NumericalPriorities, Vector
 from explainit.explainers.minlp.intervals import extract_positive_intervals
 from explainit.logging_config import logger
+from explainit.typing import FloatArray
 
 
 def derive_bounds_and_intervals(
-    numerical_priorities, dataset, sample, feature_label, grid_size=2000
-):
+    numerical_priorities: NumericalPriorities,
+    dataset: FloatArray,
+    sample: Vector,
+    feature_label: Callable[[int], str],
+    grid_size: int = 2000,
+) -> None:
     """Write ``min``, ``max`` and ``allowed_intervals`` into each feature config.
 
     The allowed region is where the priority function is positive within the
@@ -127,12 +134,12 @@ class TrustRegion:
         self.fraction = max(self.minimum, self.fraction * self.contract)
         logger.info("[Trust region] Shrunk to %.3f of each feature's allowed span.", self.fraction)
 
-    def limit(self, bounds, center) -> dict[int, tuple]:
+    def limit(self, bounds: Bounds, center: Vector) -> dict[int, Bound]:
         """Per-feature ``(lo, hi)``: ``bounds`` intersected with the region around ``center``."""
         if self.fraction is None:
             return dict(bounds)
         center = np.asarray(center, dtype=float)
-        limited = {}
+        limited: dict[int, Bound] = {}
         for idx, (lo, hi) in bounds.items():
             if lo is None or hi is None:
                 limited[idx] = (lo, hi)

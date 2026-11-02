@@ -10,10 +10,13 @@
 
 from collections.abc import Callable
 from dataclasses import dataclass
+from typing import Any
 
 import numpy as np
 
+from explainit.explainers.minlp._types import Vector, VectorFunction
 from explainit.logging_config import logger
+from explainit.typing import Model
 
 
 @dataclass(frozen=True)
@@ -34,24 +37,24 @@ class RefinementContext:
         feature_label: Display name of a column.
     """
 
-    model: Callable
+    model: Model
     target: float
     epsilon: float
-    coefficients: dict | None
-    immutable: set
-    surrogate: Callable
-    priority_benefit: Callable
-    feature_priority: Callable
-    clip: Callable
-    priority_peaks: Callable
-    feature_label: Callable
+    coefficients: dict[int, float] | None
+    immutable: set[Any]
+    surrogate: VectorFunction
+    priority_benefit: Callable[[Vector], float | None]
+    feature_priority: Callable[[int, float], float]
+    clip: Callable[[int, float], float]
+    priority_peaks: Callable[[], dict[int, tuple[float, float]]]
+    feature_label: Callable[[int], str]
 
 
-def _prediction(model, values) -> float:
+def _prediction(model: Model, values: Vector) -> float:
     return float(np.asarray(model([list(values)])).reshape(-1)[0])
 
 
-def evaluate_candidate(ctx: RefinementContext, cf) -> dict:
+def evaluate_candidate(ctx: RefinementContext, cf: Vector) -> dict[str, Any]:
     """Score ``cf`` against the real model and the surrogate.
 
     Returns:
@@ -74,7 +77,7 @@ def evaluate_candidate(ctx: RefinementContext, cf) -> dict:
     }
 
 
-def select_best_candidate(ctx: RefinementContext, counterfactuals):
+def select_best_candidate(ctx: RefinementContext, counterfactuals: list[Vector]) -> Vector:
     """Stage 6: the candidate with the highest priority benefit.
 
     Raises:
@@ -109,7 +112,9 @@ def select_best_candidate(ctx: RefinementContext, counterfactuals):
     return best_counterfactual
 
 
-def restore_to_band(ctx: RefinementContext, cf, eval_info, max_steps: int = 3):
+def restore_to_band(
+    ctx: RefinementContext, cf: Vector, eval_info: dict[str, Any], max_steps: int = 3
+) -> tuple[list[float], dict[str, Any]] | tuple[None, None]:
     """Pull a near-miss candidate back into the target band.
 
     Least-norm Shapley-Newton correction: ``dx = -r c / ||c||^2`` moves the
@@ -157,7 +162,9 @@ def restore_to_band(ctx: RefinementContext, cf, eval_info, max_steps: int = 3):
     return None, None
 
 
-def peak_lock_in(ctx: RefinementContext, cf, max_sweeps: int = 3, max_compensators: int = 3):
+def peak_lock_in(
+    ctx: RefinementContext, cf: Vector | None, max_sweeps: int = 3, max_compensators: int = 3
+) -> tuple[Vector | None, dict[str, Any]]:
     """Stage 7: greedy peak lock-in with Shapley compensation.
 
     For each mutable numerical feature ``i`` (largest possible gain first),
@@ -173,7 +180,7 @@ def peak_lock_in(ctx: RefinementContext, cf, max_sweeps: int = 3, max_compensato
         tuple: ``(cf, info)`` where ``info`` reports the priority before and
         after, the accepted moves and the model calls spent.
     """
-    info = {
+    info: dict[str, Any] = {
         "applied": False,
         "sweeps_run": 0,
         "accepted_moves": 0,
@@ -215,7 +222,7 @@ def peak_lock_in(ctx: RefinementContext, cf, max_sweeps: int = 3, max_compensato
         accepted_in_sweep = 0
         order = sorted(
             actionable,
-            key=lambda i: -(peaks[i][1] - ctx.feature_priority(i, cur[i])),
+            key=lambda i: -(peaks[i][1] - ctx.feature_priority(i, float(cur[i]))),
         )
         for i in order:
             peak_v, peak_w = peaks[i]

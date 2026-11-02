@@ -12,6 +12,7 @@ import logging
 import matplotlib.pyplot as plt
 import numpy as np
 import pytest
+from conftest import mixed_model
 
 from explainit import MINLPSearchExplainer, RandomSearchExplainer, basic_linear, plot_priorities
 
@@ -67,6 +68,13 @@ class TestMINLPSearch:
         explainer = MINLPSearchExplainer(model, mixed_priorities, mixed_dataset)
         cf = explainer.explain(sample, target=0.8, random_seed=1).counterfactuals[0]
         assert cf[1] == pytest.approx(0.2)
+
+    @_bug("MINLP-8: a forbidden current category makes every pass fail", ASSERTION_FAILS)
+    def test_sample_in_a_forbidden_category_is_optimised(self, mixed_priorities, mixed_dataset):
+        mixed_priorities["categorical"][(2, 3)][(0, 1)] = None
+        explainer = MINLPSearchExplainer(mixed_model, mixed_priorities, mixed_dataset)
+        explanation = explainer.explain(np.array([0.1, 0.2, 0.0, 1.0]), target=0.8, random_seed=0)
+        assert explanation.diagnostics["search_exception"] is None
 
 
 class TestRandomSearch:

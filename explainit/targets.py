@@ -19,16 +19,21 @@ class Target:
     def is_class(self) -> bool:
         return self.target_class is not None
 
-    def is_reached(self, prediction) -> bool:
+    def is_reached(self, prediction: float) -> bool:
         """Whether a model prediction reaches the target."""
         if self.is_class:
+            assert self.threshold is not None
             if self.target_class == 1:
-                return prediction > self.threshold
-            return prediction < self.threshold
-        return abs(prediction - self.value) <= self.tolerance
+                return bool(prediction > self.threshold)
+            return bool(prediction < self.threshold)
+        assert self.value is not None
+        assert self.tolerance is not None
+        return bool(abs(prediction - self.value) <= self.tolerance)
 
 
-def resolve_target(target, tolerance, target_class, threshold) -> Target:
+def resolve_target(
+    target: float | None, tolerance: float | None, target_class: int | None, threshold: float
+) -> Target:
     """Validate the target arguments of ``explain``.
 
     Exactly one of ``target`` (a prediction value, reached within

@@ -21,6 +21,7 @@ import json
 import logging
 import sys
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pytest
@@ -71,7 +72,7 @@ def _mixed_model(X):
 
 
 def _mixed_priorities(fixed_feature=False):
-    priorities = {
+    priorities: dict[str, Any] = {
         "numerical": {
             0: {"min": 0.0, "max": 1.0, "function": _ramp(0.2, 0.8)},
             1: {"min": 0.0, "max": 1.0, "function": _ramp(0.1, 0.7, increasing=False)},

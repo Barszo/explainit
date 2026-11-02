@@ -21,8 +21,10 @@ import platform
 import subprocess
 import sys
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import scipy
@@ -55,7 +57,7 @@ class CountingModel:
 class Task:
     name: str
     kind: str  # "regression" or "binary"
-    predict: object
+    predict: Callable[..., Any]
     priorities: dict
     fixed: dict
     instances: np.ndarray
@@ -93,7 +95,7 @@ class Task:
 def _priorities(X, fixed_columns, seed):
     """Ranges from the 5th-95th percentile; a ramp per feature in a seeded direction."""
     rng = np.random.default_rng(seed)
-    numerical = {}
+    numerical: dict[int, dict[str, Any]] = {}
     for i in range(X.shape[1]):
         if i in fixed_columns:
             numerical[i] = {"min": None, "max": None, "function": None}

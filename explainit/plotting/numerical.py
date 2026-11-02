@@ -16,9 +16,11 @@ from typing import Any
 
 import matplotlib.pyplot as plt
 import numpy as np
+import numpy.typing as npt
+from matplotlib.axes import Axes
+from matplotlib.figure import Figure
 
 from explainit.plotting._common import (
-    PathLike,
     PriorityCurve,
     draw_connector,
     draw_curve,
@@ -44,6 +46,10 @@ from explainit.plotting.style import (
     style_axes,
     styled_legend,
 )
+from explainit.typing import FloatArray, PathLike
+
+# One value per sample/exemplar pair; ``None`` where it is missing.
+type Pair = Sequence[float | None]
 
 
 def plot_numerical_priority(
@@ -54,15 +60,15 @@ def plot_numerical_priority(
     exemplar: Any | None = None,
     sample_target_value: Any | None = None,
     exemplar_target_value: Any | None = None,
-    feature_values: Sequence[float] | None = None,
-    target_values: Sequence[float] | None = None,
+    feature_values: npt.ArrayLike | None = None,
+    target_values: npt.ArrayLike | None = None,
     target_name: str = "target",
     target_threshold: float | None = None,
     feature_name: str | None = None,
     save_path: PathLike | None = None,
     save_dir: PathLike | None = None,
     show: bool = False,
-) -> plt.Figure | None:
+) -> Figure | None:
     """Plot the priority of numerical feature ``idx``.
 
     Args:
@@ -127,7 +133,9 @@ def plot_numerical_priority(
     return fig
 
 
-def _dataset(feature_values, target_values):
+def _dataset(
+    feature_values: npt.ArrayLike | None, target_values: npt.ArrayLike | None
+) -> tuple[FloatArray, FloatArray] | None:
     """Finite ``(features, targets)`` pairs, or ``None`` if fewer than three."""
     if feature_values is None or target_values is None:
         return None
@@ -140,7 +148,7 @@ def _dataset(feature_values, target_values):
     return features, targets
 
 
-def _curve_figure(curve, title_name, samples, exemplars):
+def _curve_figure(curve: PriorityCurve, title_name: str, samples: Pair, exemplars: Pair) -> Figure:
     fig, ax = plt.subplots(figsize=(12, 8))
     draw_curve(ax, curve)
     draw_pairs_on_curve(ax, curve, samples, exemplars, size=12, edge_width=2)
@@ -155,8 +163,15 @@ def _curve_figure(curve, title_name, samples, exemplars):
 
 
 def _discrete_feature_figure(
-    curve, title_name, samples, exemplars, features, targets, target_name, target_threshold
-):
+    curve: PriorityCurve,
+    title_name: str,
+    samples: Pair,
+    exemplars: Pair,
+    features: FloatArray,
+    targets: FloatArray,
+    target_name: str,
+    target_threshold: float | None,
+) -> Figure:
     """One target histogram per feature value, above a bar chart of their priorities."""
     f = curve.function
     ordered_vals = np.sort(np.unique(features))
@@ -260,10 +275,12 @@ def _discrete_feature_figure(
     return fig
 
 
-def _draw_pairs_on_bars(ax, ordered_vals, pvals, samples, exemplars):
+def _draw_pairs_on_bars(
+    ax: Axes, ordered_vals: FloatArray, pvals: FloatArray, samples: Pair, exemplars: Pair
+) -> None:
     """Mark samples/exemplars on the bar of the feature value they have."""
 
-    def bar_index(value):
+    def bar_index(value: float | None) -> int | None:
         if value is None:
             return None
         match = np.where(np.isclose(ordered_vals, value, atol=1e-9))[0]
@@ -291,17 +308,17 @@ def _draw_pairs_on_bars(ax, ordered_vals, pvals, samples, exemplars):
 
 
 def _density_figure(
-    curve,
-    title_name,
-    samples,
-    exemplars,
-    sample_targets,
-    exemplar_targets,
-    features,
-    targets,
-    target_name,
-    target_threshold,
-):
+    curve: PriorityCurve,
+    title_name: str,
+    samples: Pair,
+    exemplars: Pair,
+    sample_targets: Pair | None,
+    exemplar_targets: Pair | None,
+    features: FloatArray,
+    targets: FloatArray,
+    target_name: str,
+    target_threshold: float | None,
+) -> Figure:
     """2-D density of feature vs. target, above the priority curve."""
     fig, (ax_top, ax_bottom) = plt.subplots(
         2, 1, figsize=(12, 12), gridspec_kw={"height_ratios": [3, 2]}
@@ -382,7 +399,15 @@ def _density_figure(
     return fig
 
 
-def _class_target_figure(curve, title_name, samples, exemplars, features, targets, target_name):
+def _class_target_figure(
+    curve: PriorityCurve,
+    title_name: str,
+    samples: Pair,
+    exemplars: Pair,
+    features: FloatArray,
+    targets: FloatArray,
+    target_name: str,
+) -> Figure:
     """Feature histograms per target class, with the priority curve on a second axis."""
     fig, ax = plt.subplots(figsize=(12, 8))
     bins = min(50, max(10, int(np.sqrt(features.size))))
