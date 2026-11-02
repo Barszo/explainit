@@ -21,35 +21,37 @@ SEEDS = range(8)
 def test_minlp_is_close_to_the_exact_optimum(seed):
     problem = random_linear_problem(seed)
     explainer = MINLPSearchExplainer(
-        problem.model,
-        problem.priorities,
-        problem.sample,
-        problem.target,
-        problem.dataset(seed=100 + seed),
-        epsilon=problem.epsilon,
+        problem.model, problem.priorities, problem.dataset(seed=100 + seed)
     )
-    cf = explainer.find_counterfactuals(random_seed=0)
+    result = explainer.explain(
+        problem.sample, target=problem.target, tolerance=problem.epsilon, random_seed=0
+    )
+    cf = result.counterfactuals[0]
 
     assert abs(problem.model([cf])[0] - problem.target) <= problem.epsilon + 1e-9
     score, optimum = problem.score(cf), problem.optimum()
     assert score <= optimum + 1e-6, "no valid counterfactual can beat the optimum"
     assert optimum - score <= 0.05
-    assert explainer.last_search_result["priority_score"] == pytest.approx(score)
+    assert result.scores[0] == pytest.approx(score)
 
 
 @pytest.mark.parametrize("seed", SEEDS)
 def test_random_search_is_close_to_the_exact_optimum(seed):
     problem = random_linear_problem(seed)
     explainer = RandomSearchExplainer(
-        problem.model, problem.priorities, problem.sample, problem.target
-    )
-    cfs, predictions, scores, _ = explainer.generate_random_samples(
-        expected_counterfactuals=1,
+        problem.model,
+        problem.priorities,
         max_iterations=20000,
-        epsilon=problem.epsilon,
-        random_seed=0,
-        n_candidates_per_cf=200,
+        candidates_per_counterfactual=200,
     )
+    result = explainer.explain(
+        problem.sample,
+        target=problem.target,
+        tolerance=problem.epsilon,
+        n_counterfactuals=1,
+        random_seed=0,
+    )
+    cfs, predictions, scores = result.counterfactuals, result.predictions, result.scores
 
     assert len(cfs) == 1
     assert abs(predictions[0] - problem.target) <= problem.epsilon
@@ -74,9 +76,9 @@ def test_minlp_moves_a_feature_the_model_ignores_to_its_best_value():
         "categorical": {},
     }
     dataset = np.random.default_rng(0).uniform(0.0, 1.0, size=(100, 3))
-    explainer = MINLPSearchExplainer(model, priorities, np.array([0.1, 0.1, 0.2]), 1.0, dataset)
+    explainer = MINLPSearchExplainer(model, priorities, dataset)
 
-    cf = explainer.find_counterfactuals(random_seed=0)
+    cf = explainer.explain(np.array([0.1, 0.1, 0.2]), target=1.0, random_seed=0).counterfactuals[0]
 
     assert cf[2] == pytest.approx(1.0, abs=0.01)
 

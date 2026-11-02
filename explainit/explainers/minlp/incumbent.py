@@ -17,16 +17,19 @@ class Incumbents:
     feasible_priority: float = float("-inf")
     feasible_distance: float = float("inf")
     feasible_source: str | None = None
+    feasible_prediction: float | None = None
     infeasible: list | None = None
     infeasible_distance: float = float("inf")
+    infeasible_prediction: float | None = None
 
     @property
     def reached_target(self) -> bool:
         return self.feasible is not None
 
-    def set_anchor(self, cf, priority, distance) -> None:
+    def set_anchor(self, cf, priority, distance, prediction=None) -> None:
         """Start from an anchor that is already inside the band."""
         self.feasible = cf
+        self.feasible_prediction = prediction
         self.feasible_priority = priority if priority is not None else float("-inf")
         self.feasible_distance = distance
         self.feasible_source = "anchor"
@@ -41,11 +44,13 @@ class Incumbents:
                 self.feasible = list(cf)
                 self.feasible_priority = priority if priority is not None else float("-inf")
                 self.feasible_distance = evaluation["distance"]
+                self.feasible_prediction = evaluation.get("model_pred")
                 self.feasible_source = "optimiser"
                 return True
         elif self.feasible is None and evaluation["distance"] < self.infeasible_distance:
             self.infeasible = list(cf)
             self.infeasible_distance = evaluation["distance"]
+            self.infeasible_prediction = evaluation.get("model_pred")
             return True
         return False
 

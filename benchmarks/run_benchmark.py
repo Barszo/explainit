@@ -156,28 +156,28 @@ def breast_cancer_task():
                 rows, np.ones(len(rows)), X_train)  # fmt: skip
 
 
+def _goal(task, target):
+    if task.kind == "binary":
+        return {"target_class": 1, "threshold": 0.5}
+    return {"target": target, "tolerance": EPSILON}
+
+
 def run_random(task, x, target, priorities):
     model = CountingModel(task.predict)
-    explainer = RandomSearchExplainer(model, priorities, x, target)
-    common = {"expected_counterfactuals": 1, "max_iterations": 5000, "random_seed": 0,
-              "n_candidates_per_cf": 50}  # fmt: skip
-    if task.kind == "binary":
-        cfs, *_ = explainer.generate_for_binary(target_class=1, threshold=0.5, **common)
-    else:
-        cfs, *_ = explainer.generate_random_samples(epsilon=EPSILON, **common)
-    return (np.asarray(cfs[0], dtype=float) if cfs else None), model.rows
+    explainer = RandomSearchExplainer(
+        model, priorities, max_iterations=5000, candidates_per_counterfactual=50
+    )
+    result = explainer.explain(x, n_counterfactuals=1, random_seed=0, **_goal(task, target))
+    return (result.counterfactuals[0] if len(result) else None), model.rows
 
 
 def run_minlp(task, x, target, priorities):
     model = CountingModel(task.predict)
-    explainer = MINLPSearchExplainer(model, priorities, x, target, task.dataset, epsilon=EPSILON)
-    if task.kind == "binary":
-        cfs, _, scores, _ = explainer.find_counterfactuals_for_binary(target_class=1)
-        cf = np.asarray(cfs[int(np.argmax(scores))], dtype=float) if cfs else None
-    else:
-        result = explainer.find_counterfactuals(random_seed=0)
-        cf = None if result is None else np.asarray(result, dtype=float)
-    return cf, model.rows
+    explainer = MINLPSearchExplainer(model, priorities, task.dataset)
+    result = explainer.explain(x, random_seed=0, **_goal(task, target))
+    if not len(result):
+        return None, model.rows
+    return result.counterfactuals[int(np.argmax(result.scores))], model.rows
 
 
 METHODS = {"random_search": run_random, "minlp_search": run_minlp}

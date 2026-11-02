@@ -27,7 +27,13 @@ import pytest
 import scipy
 from problems import CountingModel
 
-from explainit import MINLPSearchExplainer, RandomSearchExplainer, basic_linear, exponential
+from explainit import (
+    MINLPSearchExplainer,
+    MINLPSettings,
+    RandomSearchExplainer,
+    basic_linear,
+    exponential,
+)
 
 SNAPSHOT_DIR = Path(__file__).parent / "snapshots"
 
@@ -93,47 +99,50 @@ def _sigmoid(fn, shift):
     return lambda X: 1.0 / (1.0 + np.exp(-6.0 * (fn(X) - shift)))
 
 
-def _random_search(model, priorities, sample, target, method, **kwargs):
+def _random_search(model, priorities, sample, settings=None, **explain_kwargs):
     counted = CountingModel(model)
-    explainer = RandomSearchExplainer(counted, priorities, sample, target)
-    cfs, preds, scores, iterations = getattr(explainer, method)(**kwargs)
+    explainer = RandomSearchExplainer(counted, priorities, **(settings or {}))
+    result = explainer.explain(sample, **explain_kwargs)
+    assert result.valid.all()
     return {
-        "counterfactuals": np.asarray(cfs, dtype=float).tolist(),
-        "predictions": np.asarray(preds, dtype=float).tolist(),
-        "scores": np.asarray(scores, dtype=float).tolist(),
-        "iterations": [int(i) for i in iterations],
+        "counterfactuals": result.counterfactuals.tolist(),
+        "predictions": result.predictions.tolist(),
+        "scores": result.scores.tolist(),
+        "iterations": [int(i) for i in result.diagnostics["iterations"]],
         "model_calls": counted.calls,
         "model_rows": counted.rows,
     }
 
 
-def _minlp(model, priorities, sample, target, dataset, **kwargs):
+def _minlp(model, priorities, sample, dataset, settings=None, **explain_kwargs):
     counted = CountingModel(model)
-    explainer = MINLPSearchExplainer(counted, priorities, sample, target, dataset)
-    cf = explainer.find_counterfactuals(**kwargs)
-    result = explainer.last_search_result
+    explainer = MINLPSearchExplainer(
+        counted, priorities, dataset, settings=MINLPSettings(**(settings or {}))
+    )
+    result = explainer.explain(sample, **explain_kwargs)
+    d = result.diagnostics
+    assert list(result.valid) == [d["reached_target"]] * len(result)
     return {
-        "counterfactual": None if cf is None else np.asarray(cf, dtype=float).tolist(),
-        "reached_target": bool(result["reached_target"]),
-        "stop_reason": result["stop_reason"],
-        "iterations_run": int(result["iterations_run"]),
-        "exemplar_source": explainer.exemplar_source,
-        "cf_source": result["cf_source"],
-        "priority_score": float(result["priority_score"]),
+        "counterfactual": result.counterfactuals[0].tolist() if len(result) else None,
+        "reached_target": bool(d["reached_target"]),
+        "stop_reason": d["stop_reason"],
+        "iterations_run": int(d["iterations_run"]),
+        "exemplar_source": d["exemplar_source"],
+        "cf_source": d["cf_source"],
+        "priority_score": float(d["priority_score"]),
         "model_calls": counted.calls,
         "model_rows": counted.rows,
     }
 
 
-def _minlp_binary(model, priorities, sample, dataset, **kwargs):
+def _minlp_binary(model, priorities, sample, dataset, **explain_kwargs):
     counted = CountingModel(model)
-    explainer = MINLPSearchExplainer(counted, priorities, sample, 1, dataset)
-    cfs, preds, scores, counts = explainer.find_counterfactuals_for_binary(**kwargs)
+    result = MINLPSearchExplainer(counted, priorities, dataset).explain(sample, **explain_kwargs)
     return {
-        "counterfactuals": np.asarray(cfs, dtype=float).tolist(),
-        "predictions": np.asarray(preds, dtype=float).tolist(),
-        "scores": np.asarray(scores, dtype=float).tolist(),
-        "counts": [int(c) for c in counts],
+        "counterfactuals": result.counterfactuals.tolist(),
+        "predictions": result.predictions.tolist(),
+        "scores": result.scores.tolist(),
+        "counts": [int(c) for c in result.diagnostics["combination_numbers"]],
         "model_calls": counted.calls,
         "model_rows": counted.rows,
     }
@@ -145,54 +154,56 @@ def scenarios():
     mixed = _mixed_priorities
     return {
         "random/regression-monte-carlo": lambda: _random_search(
-            num()[0], num()[1], num()[2], 0.9, "generate_random_samples",
-            expected_counterfactuals=3, max_iterations=5000, epsilon=0.05, random_seed=42,
+            num()[0], num()[1], num()[2], settings={"max_iterations": 5000},
+            target=0.9, tolerance=0.05, n_counterfactuals=3, random_seed=42,
         ),
         "random/regression-uniform": lambda: _random_search(
-            num()[0], num()[1], num()[2], 0.9, "generate_random_samples",
-            expected_counterfactuals=3, max_iterations=5000, epsilon=0.05, random_seed=5,
-            use_monte_carlo=False,
+            num()[0], num()[1], num()[2],
+            settings={"max_iterations": 5000, "use_monte_carlo": False},
+            target=0.9, tolerance=0.05, n_counterfactuals=3, random_seed=5,
         ),
         "random/regression-mixed-best-of-20": lambda: _random_search(
-            _mixed_model, mixed(), MIXED_SAMPLE, 1.2, "generate_random_samples",
-            expected_counterfactuals=4, max_iterations=5000, epsilon=0.05, random_seed=3,
-            n_candidates_per_cf=20, return_top_n=2,
+            _mixed_model, mixed(), MIXED_SAMPLE,
+            settings={"max_iterations": 5000, "candidates_per_counterfactual": 20},
+            target=1.2, tolerance=0.05, n_counterfactuals=4, top_n=2, random_seed=3,
         ),
         "random/regression-fixed-feature": lambda: _random_search(
-            _mixed_model, mixed(fixed_feature=True), MIXED_SAMPLE, 1.2,
-            "generate_random_samples",
-            expected_counterfactuals=2, max_iterations=5000, epsilon=0.05, random_seed=8,
+            _mixed_model, mixed(fixed_feature=True), MIXED_SAMPLE,
+            settings={"max_iterations": 5000},
+            target=1.2, tolerance=0.05, n_counterfactuals=2, random_seed=8,
         ),
         "random/binary": lambda: _random_search(
-            _sigmoid(_mixed_model, 1.2), mixed(), MIXED_SAMPLE, 1, "generate_for_binary",
-            expected_counterfactuals=3, max_iterations=3000, random_seed=0,
-            n_candidates_per_cf=10,
+            _sigmoid(_mixed_model, 1.2), mixed(), MIXED_SAMPLE,
+            settings={"max_iterations": 3000, "candidates_per_counterfactual": 10},
+            target_class=1, n_counterfactuals=3, random_seed=0,
         ),
         "minlp/default": lambda: _minlp(
-            _mixed_model, mixed(), MIXED_SAMPLE, 1.2, _mixed_dataset(400), random_seed=1
+            _mixed_model, mixed(), MIXED_SAMPLE, _mixed_dataset(400), target=1.2, random_seed=1
         ),
         "minlp/approximate-shapley": lambda: _minlp(
-            _mixed_model, mixed(), MIXED_SAMPLE, 1.2, _mixed_dataset(400),
-            random_seed=2, shap_approx=True, num_samples=50,
+            _mixed_model, mixed(), MIXED_SAMPLE, _mixed_dataset(400),
+            settings={"approximate_shapley": True, "shapley_samples": 50},
+            target=1.2, random_seed=2,
         ),
         "minlp/no-trust-region": lambda: _minlp(
-            _mixed_model, mixed(), MIXED_SAMPLE, 1.2, _mixed_dataset(400),
-            random_seed=1, trust_region=False,
+            _mixed_model, mixed(), MIXED_SAMPLE, _mixed_dataset(400),
+            settings={"trust_region": False}, target=1.2, random_seed=1,
         ),
         "minlp/no-corrections": lambda: _minlp(
-            _mixed_model, mixed(), MIXED_SAMPLE, 1.2, _mixed_dataset(400),
-            random_seed=1, residual_correction=False, restoration=False, peak_lock_in=False,
+            _mixed_model, mixed(), MIXED_SAMPLE, _mixed_dataset(400),
+            settings={"residual_correction": False, "restoration": False, "peak_lock_in": False},
+            target=1.2, random_seed=1,
         ),
         "minlp/fixed-feature": lambda: _minlp(
-            _mixed_model, mixed(fixed_feature=True), MIXED_SAMPLE, 1.0, _mixed_dataset(400),
-            random_seed=1,
+            _mixed_model, mixed(fixed_feature=True), MIXED_SAMPLE, _mixed_dataset(400),
+            target=1.0, random_seed=1,
         ),
         "minlp/random-anchor": lambda: _minlp(
-            _mixed_model, mixed(), MIXED_SAMPLE, 1.2, _mixed_dataset(30), random_seed=4
+            _mixed_model, mixed(), MIXED_SAMPLE, _mixed_dataset(30), target=1.2, random_seed=4
         ),
         "minlp/numerical-only": lambda: _minlp(
-            num()[0], num()[1], num()[2], 0.9,
-            np.random.default_rng(1).uniform(0, 1, (400, 2)), random_seed=0,
+            num()[0], num()[1], num()[2], np.random.default_rng(1).uniform(0, 1, (400, 2)),
+            target=0.9, random_seed=0,
         ),
         "minlp/binary": lambda: _minlp_binary(
             _sigmoid(_mixed_model, 1.2), mixed(), MIXED_SAMPLE, _mixed_dataset(400),

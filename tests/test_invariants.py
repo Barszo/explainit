@@ -12,7 +12,13 @@ import numpy as np
 import pytest
 from hypothesis import HealthCheck, event, given, settings, strategies as st
 
-from explainit import MINLPSearchExplainer, RandomSearchExplainer, basic_linear, exponential
+from explainit import (
+    MINLPSearchExplainer,
+    MINLPSettings,
+    RandomSearchExplainer,
+    basic_linear,
+    exponential,
+)
 
 EPSILON = 0.02
 TOL = 1e-9
@@ -137,17 +143,15 @@ SETTINGS = settings(
 @given(problems(allow_fixed=True), st.booleans())
 def test_random_search_answers_follow_the_rules(problem, use_monte_carlo):
     explainer = RandomSearchExplainer(
-        problem.model, problem.priorities, problem.sample, problem.target
+        problem.model, problem.priorities, max_iterations=3000, use_monte_carlo=use_monte_carlo
     )
-    cfs, predictions, scores, _ = explainer.generate_random_samples(
-        expected_counterfactuals=2,
-        max_iterations=3000,
-        epsilon=EPSILON,
-        random_seed=0,
-        use_monte_carlo=use_monte_carlo,
+    result = explainer.explain(
+        problem.sample, target=problem.target, tolerance=EPSILON, n_counterfactuals=2, random_seed=0
     )
-    event(f"counterfactuals found: {len(cfs)}/2")
-    for cf, prediction, score in zip(cfs, predictions, scores, strict=True):
+    event(f"counterfactuals found: {len(result)}/2")
+    for cf, prediction, score in zip(
+        result.counterfactuals, result.predictions, result.scores, strict=True
+    ):
         problem.check(cf)
         assert prediction == pytest.approx(problem.model([cf])[0])
         assert abs(prediction - problem.target) <= EPSILON
@@ -158,33 +162,32 @@ def test_random_search_answers_follow_the_rules(problem, use_monte_carlo):
 @given(problems(allow_fixed=False))
 def test_minlp_answers_follow_the_rules(problem):
     explainer = MINLPSearchExplainer(
-        problem.model,
-        problem.priorities,
-        problem.sample,
-        problem.target,
-        problem.dataset,
-        epsilon=EPSILON,
+        problem.model, problem.priorities, problem.dataset, settings=MINLPSettings(max_iterations=5)
     )
-    cf = explainer.find_counterfactuals(random_seed=0, max_iterations=5)
-    result = explainer.last_search_result
-    event(f"anchor: {explainer.exemplar_source}")
+    result = explainer.explain(
+        problem.sample, target=problem.target, tolerance=EPSILON, random_seed=0
+    )
+    event(f"anchor: {result.diagnostics['exemplar_source']}")
 
+    cf = result.counterfactuals[0]
     problem.check(cf)
     distance = abs(problem.model([cf])[0] - problem.target)
-    assert result["reached_target"] == (distance <= EPSILON + TOL)
-    assert result["reached_target"], "the target is reachable by construction"
-    assert result["priority_score"] == pytest.approx(problem.score(cf))
+    assert bool(result.valid[0]) == (distance <= EPSILON + TOL)
+    assert result.valid[0], "the target is reachable by construction"
+    assert result.predictions[0] == pytest.approx(problem.model([cf])[0])
+    assert result.scores[0] == pytest.approx(problem.score(cf))
 
 
 @settings(deadline=None)
 @given(problems(allow_fixed=True), st.integers(0, 2**31 - 1))
 def test_random_search_is_deterministic_for_a_seed(problem, seed):
     def run():
-        explainer = RandomSearchExplainer(
-            problem.model, problem.priorities, problem.sample, problem.target
-        )
-        return explainer.generate_random_samples(2, 500, EPSILON, random_seed=seed)
+        explainer = RandomSearchExplainer(problem.model, problem.priorities, max_iterations=500)
+        return explainer.explain(
+            problem.sample, target=problem.target, tolerance=EPSILON, n_counterfactuals=2,
+            random_seed=seed,
+        )  # fmt: skip
 
     first, second = run(), run()
-    np.testing.assert_array_equal(np.asarray(first[0]), np.asarray(second[0]))
-    assert first[2] == second[2]
+    np.testing.assert_array_equal(first.counterfactuals, second.counterfactuals)
+    np.testing.assert_array_equal(first.scores, second.scores)

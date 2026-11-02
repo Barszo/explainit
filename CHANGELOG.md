@@ -9,49 +9,66 @@ listed explicitly.
 
 ## [Unreleased]
 
+### Breaking: new API
+
+Explainers are now configured once with the model and the priorities, and
+`explain(x, ...)` works for any sample, returning an `Explanation` object.
+The search algorithms are unchanged: for the same inputs and seed, results
+are identical to 0.1.0.
+
+| 0.1.0 | Now |
+| --- | --- |
+| `RandomSearchExplainer(model, priorities, sample, target)` | `RandomSearchExplainer(model, priorities, max_iterations=..., candidates_per_counterfactual=..., use_monte_carlo=..., max_tries=...)` |
+| `.generate_random_samples(expected_counterfactuals, max_iterations, epsilon, random_seed, ..., return_top_n)` | `.explain(sample, target=..., tolerance=..., n_counterfactuals=..., top_n=..., random_seed=...)` |
+| `.generate_for_binary(target_class=..., threshold=...)` | `.explain(sample, target_class=..., threshold=...)` |
+| `cfs, preds, scores, iterations = ...` | `result.counterfactuals`, `result.predictions`, `result.scores`, `result.diagnostics["iterations"]` |
+| `.calculate_preference_score(x)`, `.get_preference_breakdown(x)` | `.preference_score(x)`, `.preference_breakdown(x)` |
+| `.display_priorities(...)`, `.investigate_probability_distribution(...)` | `.plot_priorities(x, ...)`, `.plot_sampling_distributions(...)` |
+| `MINLSearchExplainer(model, priorities, sample, target, dataset, target_exemplar_epsilon, epsilon, ...)` | `MINLPSearchExplainer(model, priorities, dataset, settings=MINLPSettings(anchor_tolerance=...))` |
+| `.find_counterfactuals(shap_approx, num_samples, max_iterations, trust_region, ...)` | `.explain(sample, target=..., tolerance=..., random_seed=...)` with options in `MINLPSettings(approximate_shapley=..., shapley_samples=..., max_iterations=..., trust_region=..., ...)` |
+| `.find_counterfactuals_for_binary(target_class, threshold, max_iterations)` | `.explain(sample, target_class=..., threshold=...)`, `MINLPSettings(binary_max_iterations=...)` |
+| `.last_search_result`, `.exemplar_source` | `result.diagnostics` (includes `exemplar_source` and the new `prediction`) |
+| `.probe_allowed_region_feasibility(...)` | `.probe_feasibility(sample, target=..., tolerance=...)` |
+| `explainit.explainers.minlp_search` | `explainit.explainers.minlp` (one module per algorithm stage) |
+| `explainit.utils.priority_plots.sample_numeric_value` | `explainit.sampling.sample_numeric_value` |
+
+Because each `explain` call works on its own copy of the priorities, the
+caller's priorities are no longer modified, and binary searches no longer
+change later searches (formerly known issues MINLP-2 and MINLP-4).
+
 ### Added
 
+- `Explanation` result object with `counterfactuals`, `predictions`,
+  `scores`, `valid`, `changes`, `diagnostics` and `to_frame()` (pandas,
+  optional: `pip install explainit[pandas]`).
+- `MINLPSettings` for the MINLP tuning options.
 - Top-level imports: `from explainit import RandomSearchExplainer,
-  MINLPSearchExplainer, basic_linear, exponential, basic_linear_step,
-  plot_priorities`.
-- `RandomSearchExplainer.generate_random_samples` accepts
-  `n_candidates_per_cf` (default 1; the `n_candidates_per_cf` instance
-  attribute is no longer read).
-- `explainit.sampling` module with the priority-weighted samplers
-  (`sample_numeric_value`, moved from `explainit.utils.priority_plots`, now
-  with an `rng` argument, and `sample_category`).
-- Test suite, Ruff configuration, pre-commit hooks, and GitHub Actions CI.
-- Correctness tests against exact answers, property-based invariant tests,
-  snapshot tests, a register of known bugs, and a quality benchmark with a
-  recorded baseline.
-- README quick start, `docs/how-it-works.md`, contributing guide, code of
-  conduct, security policy, and citation metadata.
+  MINLPSearchExplainer, MINLPSettings, Explanation, basic_linear,
+  exponential, basic_linear_step, plot_priorities`.
+- `explainit.sampling` with the priority-weighted samplers used by the search
+  and the plots.
+- Test suite (unit, exact-answer, property-based, snapshot, known-bug and
+  documentation tests), a quality benchmark with a recorded baseline, Ruff,
+  pre-commit hooks, and GitHub Actions CI.
+- README quick start, `docs/how-it-works.md`, `docs/known-issues.md`,
+  contributing guide, code of conduct, security policy, and citation
+  metadata.
 
 ### Changed
 
-- `MINLSearchExplainer` is renamed to `MINLPSearchExplainer`.
+- The code is restructured: the MINLP search is a package with one module per
+  stage, and random search uses one loop for all target types. Results are
+  unchanged.
 - Importing explainit no longer calls `logging.basicConfig(level=DEBUG)`.
   Configure logging in your application to see search progress.
 - Seeded searches no longer reset the global NumPy and `random` state. Results
   for a given seed are unchanged.
-- `RandomSearchExplainer.display_priorities` and
-  `investigate_probability_distribution` no longer write PNG files to
-  `./images` by default; they show the plots instead. Pass `save_dir` to write
-  files.
+- Plotting methods show plots by default and write files only when
+  `save_dir` is given (previously random search wrote to `./images`).
 - Minimum requirements are now Python 3.12, NumPy 2.0, SciPy 1.13, and
   Matplotlib 3.9 (previously Python 3.13.5; the NumPy/SciPy minimums were not
   declared).
 - Packaging metadata moved from `setup.py` to `pyproject.toml`.
-- The MINLP search moved from `explainit.explainers.minlp_search` to the
-  `explainit.explainers.minlp` package, with one module per algorithm stage
-  (`anchor`, `shapley`, `surrogate`, `warm_start`, `optimizer`, `refinement`,
-  ...). Static helpers such as `MINLPSearchExplainer.solve_linear_constraint_lp`
-  are now module functions (`linear_program.solve_linear_constraint`), and
-  `PrioritiesState` lives in `explainit.explainers.minlp.state`. Results are
-  unchanged.
-- `RandomSearchExplainer.generate_random_samples` and `generate_for_binary`
-  share one search loop and differ only in how a valid prediction is defined.
-  Results are unchanged.
 
 ### Removed
 
@@ -61,8 +78,8 @@ listed explicitly.
 
 ### Fixed
 
-- `return_top_n` in `RandomSearchExplainer.generate_random_samples` and
-  `generate_for_binary` was accepted but ignored.
+- `return_top_n` of the random search was accepted but ignored (now
+  `top_n`).
 - Priority plots with a target distribution used the `boxplot(labels=...)`
   argument removed in Matplotlib 3.11.
 
