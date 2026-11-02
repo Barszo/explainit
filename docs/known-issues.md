@@ -83,7 +83,7 @@ On the benchmark (`benchmarks/`), 0% of MINLP answers respected the allowed
 ranges, compared with 100% for random search.
 
 **Root cause.** Stage 0,
-`derive_bounds_and_intervals` in `explainit/explainers/minlp/bounds.py`, replaces
+`derive_bounds_and_intervals` in `src/explainit/explainers/minlp/bounds.py`, replaces
 each feature's `min`/`max` with the region where the priority function is
 positive *within the dataset's range*. The built-in ramps (`basic_linear`,
 `exponential`) keep a positive value (1.0 or the full ramp) outside
@@ -220,7 +220,7 @@ with clear error messages naming the offending feature.
 settings (fonts, colours, background) for the rest of the user's session, so
 the user's own later plots look different.
 
-**Root cause.** `apply_style` in `explainit/plotting/style.py` writes to
+**Root cause.** `apply_style` in `src/explainit/plotting/style.py` writes to
 `plt.rcParams` directly.
 
 **Suggested fix.** Apply the style inside `with plt.rc_context(...)`, or only
@@ -233,7 +233,7 @@ to the figures explainit creates.
 extra, empty figure open. With `show=True` it appears as an empty window; in
 long notebooks or loops the open figures pile up.
 
-**Root cause.** `plot_numerical_priority` (`explainit/plotting/numerical.py`)
+**Root cause.** `plot_numerical_priority` (`src/explainit/plotting/numerical.py`)
 opens a figure before choosing the continuous-target layout, which then
 creates its own figure.
 
@@ -246,7 +246,7 @@ issue ID).
 or `None`, `plot_probability_distributions(..., save_dir=...)` draws nothing
 but still lists the group's file name among the written files.
 
-**Root cause.** The walker in `explainit/plotting/distributions.py` appends
+**Root cause.** The walker in `src/explainit/plotting/distributions.py` appends
 the path without checking whether a figure was drawn.
 
 **Suggested fix.** Append the path only when the plot function returns a

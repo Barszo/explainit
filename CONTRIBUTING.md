@@ -96,8 +96,8 @@ short, imperative summary (e.g. "Add peaked priority function").
   `pyproject.toml`. Don't reformat unrelated code.
 - **Types**: the package is fully annotated and checked with `mypy` in strict
   mode (tests and benchmarks are checked, but need not be annotated). Shared
-  aliases live in `explainit/typing.py` (public) and
-  `explainit/explainers/minlp/_types.py` (internal). Prefer precise types to
+  aliases live in `src/explainit/typing.py` (public) and
+  `src/explainit/explainers/minlp/_types.py` (internal). Prefer precise types to
   `Any`; a `# type: ignore[code]` needs a comment explaining why.
 - **Tests**: every bug fix needs a test that fails without the fix; every new
   feature needs tests for its main behaviour and edge cases. Tests use plain
@@ -137,9 +137,9 @@ the benchmark in [`benchmarks/`](benchmarks/README.md).
 
 ### Adding a priority function
 
-1. Implement it in `explainit/priorities/` (linear or nonlinear module) with a
+1. Implement it in `src/explainit/priorities/` (linear or nonlinear module) with a
    docstring describing its shape and parameters.
-2. Export it from `explainit/priorities/__init__.py` and `explainit/__init__.py`.
+2. Export it from `src/explainit/priorities/__init__.py` and `src/explainit/__init__.py`.
 3. Add it to the parameterised tests in `tests/test_priorities.py`.
 4. Add it to the priority function table in `README.md`.
 
@@ -164,7 +164,7 @@ From 0.2 on:
 
 ## Releasing (maintainers)
 
-1. Update the version in `explainit/__init__.py` following
+1. Update the version in `src/explainit/__init__.py` following
    [Semantic Versioning](https://semver.org/) (pre-1.0: breaking changes bump
    the minor version).
 2. Move the `Unreleased` changelog entries under the new version and date.

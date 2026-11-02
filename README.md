@@ -268,14 +268,15 @@ logging.basicConfig(level=logging.INFO)
 ## Project layout
 
 ```text
-explainit/
-├── explainers/   # RandomSearchExplainer; minlp/ holds MINLPSearchExplainer, one module per stage
-├── priorities/   # built-in priority functions
-├── plotting/     # priority and sampling-distribution plots
-├── sampling.py   # priority-weighted sampling
-└── typing.py     # type aliases for annotating your own code
-docs/             # additional documentation
-tests/            # pytest suite, including the examples in the docs
+src/explainit/      # the package
+├── explainers/     # RandomSearchExplainer; minlp/ holds MINLPSearchExplainer, one module per stage
+├── priorities/     # built-in priority functions
+├── plotting/       # priority and sampling-distribution plots
+├── sampling.py     # priority-weighted sampling
+└── typing.py       # type aliases for annotating your own code
+docs/               # additional documentation
+tests/              # pytest suite, including the examples in the docs
+benchmarks/         # quality benchmark and its recorded baseline
 ```
 
 ## Contributing
