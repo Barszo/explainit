@@ -30,7 +30,9 @@ are identical to 0.1.0.
 | `.last_search_result`, `.exemplar_source` | `result.diagnostics` (includes `exemplar_source` and the new `prediction`) |
 | `.probe_allowed_region_feasibility(...)` | `.probe_feasibility(sample, target=..., tolerance=...)` |
 | `explainit.explainers.minlp_search` | `explainit.explainers.minlp` (one module per algorithm stage) |
+| `explainit.utils.priority_plots` (all plot functions) | `explainit.plotting` (same function names) |
 | `explainit.utils.priority_plots.sample_numeric_value` | `explainit.sampling.sample_numeric_value` |
+| `explainit.utils.plot_styles` | `explainit.plotting.style` (`style_axes` replaces `style_numerical_plot`/`style_categorical_plot`) |
 
 Because each `explain` call works on its own copy of the priorities, the
 caller's priorities are no longer modified, and binary searches no longer
@@ -57,8 +59,9 @@ change later searches (formerly known issues MINLP-2 and MINLP-4).
 ### Changed
 
 - The code is restructured: the MINLP search is a package with one module per
-  stage, and random search uses one loop for all target types. Results are
-  unchanged.
+  stage, random search uses one loop for all target types, and the plots are a
+  `explainit.plotting` package with one module per plot kind. Results and
+  plots are unchanged (plots verified pixel-identical).
 - Importing explainit no longer calls `logging.basicConfig(level=DEBUG)`.
   Configure logging in your application to see search progress.
 - Seeded searches no longer reset the global NumPy and `random` state. Results
@@ -72,6 +75,8 @@ change later searches (formerly known issues MINLP-2 and MINLP-4).
 
 ### Removed
 
+- Unused plotting helpers `get_bar_gradient_colors` and
+  `create_gradient_background`.
 - Unused MINLP code: the disconnected "bounds adjustment" suggestions
   (`find_required_bounds_adjustments` and its helpers) and a duplicate
   random-anchor fallback.

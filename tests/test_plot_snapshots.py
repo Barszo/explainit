@@ -24,14 +24,10 @@ import pytest
 from matplotlib.colors import to_hex
 from matplotlib.patches import Rectangle
 
+from explainit import plotting as plots
 from explainit.priorities.linear import basic_linear
 from explainit.priorities.nonlinear import exponential
 from explainit.sampling import sample_numeric_value
-
-try:
-    from explainit import plotting as plots
-except ImportError:  # layout before the plotting package existed
-    from explainit.utils import priority_plots as plots
 
 SNAPSHOT_FILE = Path(__file__).parent / "snapshots" / "figures.json"
 

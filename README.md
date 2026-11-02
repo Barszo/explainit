@@ -267,7 +267,8 @@ logging.basicConfig(level=logging.INFO)
 explainit/
 ├── explainers/   # RandomSearchExplainer; minlp/ holds MINLPSearchExplainer, one module per stage
 ├── priorities/   # built-in priority functions
-└── utils/        # plotting helpers
+├── plotting/     # priority and sampling-distribution plots
+└── sampling.py   # priority-weighted sampling
 docs/             # additional documentation
 tests/            # pytest suite, including the examples in the docs
 ```

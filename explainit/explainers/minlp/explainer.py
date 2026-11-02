@@ -8,8 +8,8 @@ import numpy as np
 
 from explainit.explainers.minlp.search import MINLPSearch
 from explainit.explanation import Explanation
+from explainit.plotting import plot_priorities as _plot_priorities
 from explainit.targets import resolve_target
-from explainit.utils.priority_plots import plot_priorities as _plot_priorities
 
 
 @dataclass(frozen=True)

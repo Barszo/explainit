@@ -20,8 +20,11 @@ from explainit.priorities.nonlinear import exponential
         "explainit.explainers.random_search",
         "explainit.priorities.linear",
         "explainit.priorities.nonlinear",
-        "explainit.utils.plot_styles",
-        "explainit.utils.priority_plots",
+        "explainit.plotting",
+        "explainit.plotting.categorical",
+        "explainit.plotting.distributions",
+        "explainit.plotting.numerical",
+        "explainit.plotting.style",
     ],
 )
 def test_public_modules_are_installed(name):

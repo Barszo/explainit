@@ -124,6 +124,15 @@ def test_plotting_closes_every_figure_it_creates():
     assert plt.get_fignums() == []
 
 
+@_bug("PLOT-3: files that were not written are reported", ASSERTION_FAILS)
+def test_only_written_files_are_reported(tmp_path):
+    from explainit.plotting import plot_probability_distributions
+
+    priorities = {"numerical": {}, "categorical": {(0, 1): {(1, 0): 0, (0, 1): None}}}
+    written = plot_probability_distributions(priorities, save_dir=tmp_path)
+    assert all(path.exists() for path in written)
+
+
 @_bug("PLOT-1: plotting permanently changes the global Matplotlib style", ASSERTION_FAILS)
 def test_plotting_leaves_global_matplotlib_settings_unchanged():
     with plt.rc_context():

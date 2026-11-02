@@ -1,10 +1,10 @@
 import numpy as np
 from conftest import linear_model, mixed_model
 
+from explainit import plotting
 from explainit.explainers.minlp import MINLPSearchExplainer
 from explainit.explainers.random_search import RandomSearchExplainer
 from explainit.sampling import sample_numeric_value
-from explainit.utils import priority_plots
 
 
 def _pngs(directory):
@@ -12,7 +12,7 @@ def _pngs(directory):
 
 
 def test_plot_priorities_writes_one_file_per_actionable_entry(mixed_priorities, tmp_path):
-    written = priority_plots.plot_priorities(
+    written = plotting.plot_priorities(
         mixed_priorities,
         sample=[0.1, 0.2, 0, 1],
         exemplar=[0.6, 0.7, 1, 0],
@@ -25,12 +25,12 @@ def test_plot_priorities_writes_one_file_per_actionable_entry(mixed_priorities, 
 
 def test_plot_priorities_without_save_dir_writes_nothing(mixed_priorities, tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
-    assert priority_plots.plot_priorities(mixed_priorities) == []
+    assert plotting.plot_priorities(mixed_priorities) == []
     assert list(tmp_path.iterdir()) == []
 
 
 def test_plot_priorities_with_target_distribution(mixed_priorities, mixed_dataset, tmp_path):
-    written = priority_plots.plot_priorities(
+    written = plotting.plot_priorities(
         mixed_priorities,
         sample=mixed_dataset[0],
         feature_matrix=mixed_dataset,
@@ -42,7 +42,7 @@ def test_plot_priorities_with_target_distribution(mixed_priorities, mixed_datase
 
 
 def test_plot_probability_distributions(mixed_priorities, tmp_path):
-    written = priority_plots.plot_probability_distributions(
+    written = plotting.plot_probability_distributions(
         mixed_priorities, n_samples=300, save_dir=tmp_path
     )
     assert len(written) == 3
