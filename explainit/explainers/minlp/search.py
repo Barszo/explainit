@@ -4,18 +4,26 @@ The stages themselves live in the sibling modules; see
 ``docs/how-it-works.md`` for the stage-to-module map.
 """
 
-from collections.abc import Sequence
+import logging
+from collections.abc import Mapping, Sequence
+from typing import Any, cast
 
 import numpy as np
 
 from explainit._random import make_rngs
+from explainit.explainers.minlp._types import Bound, ShapleyValues, Vector
 from explainit.explainers.minlp.anchor import (
     closest_row,
     filter_rows,
     generate_in_range,
     probe_feasibility,
 )
-from explainit.explainers.minlp.binary import rank, search_combinations
+from explainit.explainers.minlp.binary import (
+    BinaryResults,
+    class_target,
+    rank,
+    search_combinations,
+)
 from explainit.explainers.minlp.bounds import TrustRegion, derive_bounds_and_intervals
 from explainit.explainers.minlp.combinations import limit_combinations
 from explainit.explainers.minlp.incumbent import Incumbents
@@ -47,6 +55,7 @@ from explainit.explainers.minlp.surrogate import (
 )
 from explainit.explainers.minlp.warm_start import solve_warm_starts, warm_start_health
 from explainit.logging_config import logger
+from explainit.typing import FloatArray, Model
 
 
 class MINLPSearch:
@@ -72,16 +81,16 @@ class MINLPSearch:
 
     def __init__(
         self,
-        model_pred,
-        priorities,
-        sample,
-        target,
-        dataset,
-        target_exemplar_epsilon=0.01,
-        epsilon=0.01,
-        workflow_logger=None,
+        model_pred: Model,
+        priorities: dict[str, Any],
+        sample: Vector,
+        target: float,
+        dataset: FloatArray,
+        target_exemplar_epsilon: float = 0.01,
+        epsilon: float = 0.01,
+        workflow_logger: logging.Logger | None = None,
         feature_names: Sequence[str] | None = None,
-    ):
+    ) -> None:
         self.sample_state = SampleState(sample=sample)
         self.priorities_state = PrioritiesState(priorities=priorities)
         # TODO: model_pred needs to be prepared before to be used here. It should be changed so that it would be more universal
@@ -94,22 +103,22 @@ class MINLPSearch:
         self.workflow_logger = workflow_logger
         self.feature_names = list(feature_names) if feature_names is not None else None
         # Cached argmax of every actionable priority function (Stage 7).
-        self._priority_peaks_cache = None
+        self._priority_peaks_cache: dict[int, tuple[float, float]] | None = None
         # Records which strategy produced the target exemplar for the last run
         # (see ``_stage1_find_exemplar``): one of ``dataset_priority_filtered``,
         # ``dataset_actionable``, ``random_in_range`` or ``none``.
-        self.exemplar_source = None
+        self.exemplar_source: str | None = None
         # |model_pred(target_exemplar) - target| for the anchor of the last run.
-        self.exemplar_pred_distance = None
+        self.exemplar_pred_distance: float | None = None
         # Warm-start (Stage 4 LP) health captured on the first refinement pass.
-        self._warm_start_info = None
+        self._warm_start_info: dict[str, Any] | None = None
         # Exception text if a refinement pass aborted (stop_reason=search_failed).
-        self._last_search_exception = None
-        self.last_search_result = {}
+        self._last_search_exception: str | None = None
+        self.last_search_result: dict[str, Any] = {}
         self._fallback_random_max_iterations = 10000
         # Seed for the only stochastic part of the search (the Stage 1
         # fallback anchor); set per run by ``find_counterfactuals``.
-        self._random_seed = None
+        self._random_seed: int | None = None
         # Random streams for the stochastic steps (see ``make_rngs``); replaced
         # per run by ``find_counterfactuals``.
         self._np_rng, self._py_rng = make_rngs(None)
@@ -120,10 +129,15 @@ class MINLPSearch:
         # measured model residual.
         self._target_correction = 0.0
         self._residual_correction_enabled = False
-        self._pass_targets = {}
+        self._pass_targets: dict[int, float] = {}
         self._restoration_enabled = False
+        # Model output at the current iterate; set in Stage 4.2.
+        self.basic_prediction: float
+        # Iterate whose Shapley values are cached, and the current iteration.
+        self._last_shapley_sample: list[float] | None = None
+        self._workflow_iteration: int | None = None
 
-    def _workflow_log(self, message, *args):
+    def _workflow_log(self, message: str, *args: Any) -> None:
         if self.workflow_logger is not None:
             self.workflow_logger.info(message, *args)
 
@@ -132,7 +146,7 @@ class MINLPSearch:
             return str(self.feature_names[idx])
         return f"feature_{idx}"
 
-    def _log_workflow_initial_and_bounds(self):
+    def _log_workflow_initial_and_bounds(self) -> None:
         log_workflow_summary(
             self._workflow_log,
             self.model_pred,
@@ -143,7 +157,7 @@ class MINLPSearch:
             self._feature_label,
         )
 
-    def _derive_bounds_and_intervals_from_priorities(self, grid_size: int = 2000):
+    def _derive_bounds_and_intervals_from_priorities(self, grid_size: int = 2000) -> None:
         derive_bounds_and_intervals(
             self.priorities_state.numerical_priorities,
             self.dataset,
@@ -176,7 +190,9 @@ class MINLPSearch:
     # Calculating Shapley values (3)
     ##################################
 
-    def calc_shapley(self, r, use_approximation: bool = False, num_samples: int = 200):
+    def calc_shapley(
+        self, r: Vector, use_approximation: bool = False, num_samples: int = 200
+    ) -> FloatArray:
         """Stage 3: Shapley values of ``r`` against the target exemplar.
 
         Stores them in ``sample_state.shapley_values``; see
@@ -198,7 +214,7 @@ class MINLPSearch:
     # Confirm existence of solution for each categorical combination (4)
     #################################################################
 
-    def extract_for_linear_search(self):
+    def extract_for_linear_search(self) -> dict[int, float]:
         """Stage 4.3: linearise the model and build one LP target per combination.
 
         Sets ``sample_state.shap_coeffs`` (per-unit coefficients) and returns
@@ -214,7 +230,7 @@ class MINLPSearch:
         )
         self.sample_state.shap_coeffs = coefficients
 
-        new_targets = {}
+        new_targets: dict[int, float] = {}
         if len(cat_combinations[0]) != 0:
             groups = list(self.sample_state.limited_priorities["categorical"])
             for combo_idx, combo in cat_combinations.items():
@@ -238,7 +254,7 @@ class MINLPSearch:
             new_targets[0] = self._pass_target(0, 0.0) - self.basic_prediction + coef_times_original
         return new_targets
 
-    def _reachable_surrogate_range(self) -> tuple:
+    def _reachable_surrogate_range(self) -> tuple[float, float]:
         return reachable_range(
             self.basic_prediction,
             self.sample_state.shap_coeffs,
@@ -272,7 +288,7 @@ class MINLPSearch:
         self._pass_targets[combo_idx] = float(clipped)
         return float(clipped)
 
-    def confirm_existence_of_solution_for_combo(self):
+    def confirm_existence_of_solution_for_combo(self) -> dict[int, dict[str, Any]]:
         """Stage 4: prune combinations, linearise, and find one warm start per combination.
 
         Returns:
@@ -322,14 +338,16 @@ class MINLPSearch:
             "[Stage 4.4] Selecting actionable numerical features and gathering "
             "their bounds for the LP solver."
         )
+        shap_coeffs = self._shap_coeffs()
         indices_to_modify = [
-            i
-            for i in self.sample_state.shap_coeffs
-            if i not in self.priorities_state.non_actionable_indices
+            i for i in shap_coeffs if i not in self.priorities_state.non_actionable_indices
         ]
-        coefficients = [self.sample_state.shap_coeffs[key] for key in indices_to_modify]
+        coefficients = [shap_coeffs[key] for key in indices_to_modify]
         search_bounds = self._search_bounds()
-        bounds = [search_bounds[key] for key in indices_to_modify]
+        # Stage 0 gives every actionable feature a finite ``(min, max)``.
+        bounds = cast(
+            "list[tuple[float, float]]", [search_bounds[key] for key in indices_to_modify]
+        )
         logger.info(
             "[Stage 4.4] %d actionable numerical features: %s",
             len(indices_to_modify),
@@ -368,13 +386,25 @@ class MINLPSearch:
     # Functions for optimisation
     #################################################################
 
+    def _shap_coeffs(self) -> dict[int, float]:
+        coefficients = self.sample_state.shap_coeffs
+        if coefficients is None:
+            raise RuntimeError("Shapley coefficients are computed in Stage 4.3.")
+        return coefficients
+
     def constraint_function(
-        self, x, shap_dict, sample, target_exemplar, priorities_for_search, basic_prediction
-    ):
+        self,
+        x: Vector,
+        shap_dict: ShapleyValues,
+        sample: Vector,
+        target_exemplar: Vector,
+        priorities_for_search: Mapping[str, Mapping[Any, Any]],
+        basic_prediction: float,
+    ) -> float:
         """Surrogate prediction ``h(x)``; see :func:`surrogate.surrogate_prediction`."""
         return surrogate_prediction(
             x,
-            self.sample_state.shap_coeffs,
+            self._shap_coeffs(),
             shap_dict,
             sample,
             target_exemplar,
@@ -382,7 +412,7 @@ class MINLPSearch:
             basic_prediction,
         )
 
-    def _surrogate(self, x):
+    def _surrogate(self, x: Vector) -> float:
         """``h(x)`` linearised at the current point."""
         return self.constraint_function(
             x,
@@ -393,7 +423,7 @@ class MINLPSearch:
             basic_prediction=self.basic_prediction,
         )
 
-    def calculate_total_weight(self, values):
+    def calculate_total_weight(self, values: Vector) -> float:
         """Priority benefit of ``values``; see :func:`scoring.total_weight`."""
         return total_weight(
             values,
@@ -405,7 +435,7 @@ class MINLPSearch:
     # Main function to find counterfactuals
     #################################################################
 
-    def _stage1_find_exemplar(self):
+    def _stage1_find_exemplar(self) -> None:
         """Locate the anchor exemplar, with one fallback.
 
         Selection strategy, tried in order (the first that succeeds wins):
@@ -477,7 +507,9 @@ class MINLPSearch:
         )
         return abs(pred - float(self.target))
 
-    def _generate_exemplar_in_range(self, max_iterations: int = 10000, random_seed=None) -> float:
+    def _generate_exemplar_in_range(
+        self, max_iterations: int = 10000, random_seed: int | None = None
+    ) -> float:
         """Stage 1 fallback: a random in-range anchor; returns its distance to the target."""
         if random_seed is not None:
             self._np_rng = make_rngs(random_seed)[0]
@@ -493,8 +525,8 @@ class MINLPSearch:
         return distance
 
     def probe_allowed_region_feasibility(
-        self, max_iterations: int = 5000, random_seed=None
-    ) -> dict:
+        self, max_iterations: int = 5000, random_seed: int | None = None
+    ) -> dict[str, Any]:
         """Measure whether the allowed region can reach the target at all.
 
         Randomly samples the allowed region (ignoring priorities) and reports
@@ -528,11 +560,11 @@ class MINLPSearch:
         """
         return float(self.target) - float(self._target_correction)
 
-    def _search_bounds(self) -> dict[int, tuple]:
+    def _search_bounds(self) -> dict[int, Bound]:
         """Per-feature ``(lo, hi)`` for the LP and SLSQP, trust region included."""
         return self._trust_region.limit(self.priorities_state.bounds, self.sample_state.sample)
 
-    def _run_one_pass(self, shap_approx, num_samples):
+    def _run_one_pass(self, shap_approx: bool, num_samples: int) -> list[Vector]:
         """Execute stages 3, 4 and 5 once for the current ``sample_state.sample``.
 
         Returns the list of candidate counterfactuals (one per surviving
@@ -550,7 +582,7 @@ class MINLPSearch:
         )
         current_sample = [float(v) for v in np.asarray(self.sample_state.sample, dtype=float)]
         if (
-            self.sample_state.shapley_values is not None
+            self.sample_state.has_shapley_values()
             and getattr(self, "_last_shapley_sample", None) == current_sample
         ):
             logger.info(
@@ -601,7 +633,7 @@ class MINLPSearch:
         )
         bounds = self._search_bounds()
         numerical_indices = list(self.priorities_state.numerical_priorities.keys())
-        counterfactuals = []
+        counterfactuals: list[Vector] = []
         for i, values in init_vals_per_combo.items():
             label = f"[combo {i + 1}/{len(init_vals_per_combo)}]"
             logger.info(
@@ -665,7 +697,7 @@ class MINLPSearch:
 
         return counterfactuals
 
-    def _priority_benefit(self, cf):
+    def _priority_benefit(self, cf: Vector) -> float | None:
         return priority_benefit(
             cf,
             self.priorities_state.numerical_priorities,
@@ -675,11 +707,13 @@ class MINLPSearch:
     def _feature_priority(self, idx: int, value: float) -> float:
         return feature_priority(self.priorities_state.numerical_priorities.get(idx, {}), value)
 
-    def _priority_peaks(self) -> dict[int, tuple]:
+    def _priority_peaks(self) -> dict[int, tuple[float, float]]:
         """Cached :func:`scoring.priority_peaks`; priorities do not change during a run."""
-        if getattr(self, "_priority_peaks_cache", None) is None:
-            self._priority_peaks_cache = priority_peaks(self.priorities_state.numerical_priorities)
-        return self._priority_peaks_cache
+        peaks = self._priority_peaks_cache
+        if peaks is None:
+            peaks = priority_peaks(self.priorities_state.numerical_priorities)
+            self._priority_peaks_cache = peaks
+        return peaks
 
     def _clip_to_allowed(self, idx: int, value: float) -> float:
         return clip_to_allowed(
@@ -694,7 +728,7 @@ class MINLPSearch:
             model=self.model_pred,
             target=self.target,
             epsilon=self.epsilon,
-            coefficients=getattr(self.sample_state, "shap_coeffs", None),
+            coefficients=self.sample_state.shap_coeffs,
             immutable=set(self.priorities_state.non_actionable_indices),
             surrogate=self._surrogate,
             priority_benefit=self._priority_benefit,
@@ -706,22 +740,22 @@ class MINLPSearch:
 
     def find_counterfactuals(
         self,
-        shap_approx=False,
-        num_samples=200,
-        max_iterations=10,
-        patience=5,
-        return_when_fails=True,
-        fallback_random_max_iterations=10000,
-        peak_lock_in=True,
-        peak_lock_in_max_sweeps=3,
-        random_seed=None,
-        trust_region=True,
-        trust_region_init=0.25,
-        trust_region_min=0.02,
-        trust_region_max=1.0,
-        residual_correction=True,
-        restoration=True,
-    ):
+        shap_approx: bool = False,
+        num_samples: int = 200,
+        max_iterations: int = 10,
+        patience: int = 5,
+        return_when_fails: bool = True,
+        fallback_random_max_iterations: int = 10000,
+        peak_lock_in: bool = True,
+        peak_lock_in_max_sweeps: int = 3,
+        random_seed: int | None = None,
+        trust_region: bool = True,
+        trust_region_init: float = 0.25,
+        trust_region_min: float = 0.02,
+        trust_region_max: float = 1.0,
+        residual_correction: bool = True,
+        restoration: bool = True,
+    ) -> list[float] | None:
         """Find a counterfactual via iterative Shapley re-linearisation.
 
         Stages 1 and 2 (locate target exemplar, gather bounds) run once.
@@ -858,7 +892,7 @@ class MINLPSearch:
             )
 
         no_progress = 0
-        history = []
+        history: list[dict[str, Any]] = []
         stop_reason = "max_iterations"
         restoration_hits = 0
 
@@ -934,7 +968,7 @@ class MINLPSearch:
         self.sample_state.sample = original_sample
         self._workflow_iteration = None
 
-        peak_info = None
+        peak_info: dict[str, Any] | None = None
         if peak_lock_in and incumbents.reached_target:
             peak_info = self._apply_peak_lock_in(incumbents, peak_lock_in_max_sweeps)
 
@@ -997,15 +1031,15 @@ class MINLPSearch:
     def _start_run(
         self,
         *,
-        fallback_random_max_iterations,
-        random_seed,
-        trust_region,
-        trust_region_init,
-        trust_region_min,
-        trust_region_max,
-        residual_correction,
-        restoration,
-    ):
+        fallback_random_max_iterations: int,
+        random_seed: int | None,
+        trust_region: bool,
+        trust_region_init: float,
+        trust_region_min: float,
+        trust_region_max: float,
+        residual_correction: bool,
+        restoration: bool,
+    ) -> None:
         """Reset the per-search state."""
         self.exemplar_source = None
         self.exemplar_pred_distance = None
@@ -1026,7 +1060,7 @@ class MINLPSearch:
         self._last_shapley_sample = None
         self._pass_targets = {}
 
-    def _evaluate_anchor(self) -> dict:
+    def _evaluate_anchor(self) -> dict[str, Any]:
         """The anchor as a candidate answer: ``cf``, ``prediction``, ``distance``, ``priority``."""
         cf = list(np.asarray(self.sample_state.target_exemplar, dtype=float))
         prediction = float(np.asarray(self.model_pred([cf])).reshape(-1)[0])
@@ -1037,18 +1071,18 @@ class MINLPSearch:
             "priority": self._priority_benefit(cf),
         }
 
-    def _evaluate_with_restoration(self, cf):
+    def _evaluate_with_restoration(self, cf: Vector) -> tuple[Vector, dict[str, Any], int]:
         """Evaluate ``cf``; restore it into the band if it just missed (Stage 6)."""
         evaluation = evaluate_candidate(self._refinement_context(), cf)
         if not evaluation["feasible"] and self._restoration_enabled:
             restored_cf, restored_evaluation = restore_to_band(
                 self._refinement_context(), cf, evaluation
             )
-            if restored_cf is not None:
+            if restored_cf is not None and restored_evaluation is not None:
                 return restored_cf, restored_evaluation, 1
         return cf, evaluation, 0
 
-    def _step_quality(self, evaluation):
+    def _step_quality(self, evaluation: Mapping[str, Any]) -> tuple[bool, float, float]:
         """``(accepted, rho, residual)`` of the step to ``evaluation``'s candidate.
 
         ``rho`` compares the real and the surrogate change of the prediction
@@ -1065,7 +1099,15 @@ class MINLPSearch:
         accepted = bool(evaluation["feasible"] or evaluation["distance"] < iterate_distance - 1e-12)
         return accepted, rho, residual
 
-    def _log_iteration(self, iteration, evaluation, incumbents, improved, rho, residual):
+    def _log_iteration(
+        self,
+        iteration: int,
+        evaluation: Mapping[str, Any],
+        incumbents: Incumbents,
+        improved: bool,
+        rho: float,
+        residual: float,
+    ) -> None:
         priority = evaluation["priority"]
         best_priority, best_distance = incumbents.describe()
         logger.info(
@@ -1089,7 +1131,9 @@ class MINLPSearch:
             else "off",
         )
 
-    def _update_step_control(self, iteration, accepted, rho, residual):
+    def _update_step_control(
+        self, iteration: int, accepted: bool, rho: float, residual: float
+    ) -> None:
         """Grow the trust region after a good step; shrink it and correct the target after a bad one."""
         if accepted:
             self._target_correction = 0.0
@@ -1107,7 +1151,9 @@ class MINLPSearch:
             )
         self._trust_region.shrink()
 
-    def _advance(self, iteration, cf, evaluation, accepted):
+    def _advance(
+        self, iteration: int, cf: Vector, evaluation: Mapping[str, Any], accepted: bool
+    ) -> None:
         """Move the iterate to ``cf`` after an accepted step.
 
         The surrogate is then always re-linearised at a point the real model
@@ -1127,7 +1173,7 @@ class MINLPSearch:
                 float(self.epsilon),
             )
 
-    def _apply_peak_lock_in(self, incumbents, max_sweeps):
+    def _apply_peak_lock_in(self, incumbents: Incumbents, max_sweeps: int) -> dict[str, Any]:
         """Stage 7 on the feasible incumbent; returns its report."""
         improved_cf, peak_info = lock_in_priority_peaks(
             self._refinement_context(), incumbents.feasible, max_sweeps=int(max_sweeps)
@@ -1142,7 +1188,7 @@ class MINLPSearch:
             incumbents.feasible_source = f"{incumbents.feasible_source}+peak_lock_in"
         return peak_info
 
-    def _log_search_done(self):
+    def _log_search_done(self) -> None:
         result = self.last_search_result
         best_distance = result["distance"]
         logger.info("=" * 78)
@@ -1169,7 +1215,7 @@ class MINLPSearch:
             )
         logger.info("=" * 78)
 
-    def _final_answer(self, return_when_fails):
+    def _final_answer(self, return_when_fails: bool) -> list[float] | None:
         result = self.last_search_result
         # A copy, so changing the returned list does not change the result record.
         best_cf = None if result["best_cf"] is None else list(result["best_cf"])
@@ -1194,12 +1240,12 @@ class MINLPSearch:
 
     def find_counterfactuals_for_binary(
         self,
-        target_class=1,
-        threshold=0.5,
-        max_iterations=100,
-        shap_approx=False,
-        num_samples=200,
-    ):
+        target_class: int = 1,
+        threshold: float = 0.5,
+        max_iterations: int = 100,
+        shap_approx: bool = False,
+        num_samples: int = 200,
+    ) -> BinaryResults:
         """Search for counterfactuals of a binary classifier.
 
         Sets the internal target to 0.75 (class 1) or 0.25 (class 0) with a
@@ -1222,16 +1268,7 @@ class MINLPSearch:
         logger.info("Starting MINLP-based binary classification counterfactual search...")
         logger.info(f"Target class: {target_class}, Threshold: {threshold}")
 
-        # Set target prediction value based on desired class
-        # For class 1: target ~0.75 (well above threshold)
-        # For class 0: target ~0.25 (well below threshold)
-        if target_class == 1:
-            self.target = 0.75
-        else:
-            self.target = 0.25
-
-        # Set confidence interval (epsilon) to ensure we're comfortably across the threshold
-        self.epsilon = max(0.1, abs(self.target - threshold))
+        self.target, self.epsilon = class_target(target_class, threshold)
 
         logger.info(f"Set internal target to {self.target} with epsilon {self.epsilon}")
         self._derive_bounds_and_intervals_from_priorities()
@@ -1266,6 +1303,7 @@ class MINLPSearch:
 
         ###########
         # 4. Create initial values per categorical combination
+        init_vals_per_combo: dict[int, dict[str, Any]]
         try:
             init_vals_per_combo = self.confirm_existence_of_solution_for_combo()
         except (ValueError, AssertionError) as e:

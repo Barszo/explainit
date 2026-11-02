@@ -6,23 +6,30 @@ categorical group is a single unit, so its columns always switch together.
 """
 
 import itertools
+from collections.abc import Iterable
 from math import factorial
 
 import numpy as np
 
+from explainit._random import PythonRandom
+from explainit.explainers.minlp._types import Group, ShapleyValues, Vector
 from explainit.logging_config import logger
+from explainit.typing import FloatArray, Model
+
+# A Shapley unit's value: a number (numerical feature) or a tuple (categorical group).
+type Unit = float | tuple[float, ...]
 
 
 def shapley_values(
-    model,
-    reference,
-    anchor,
-    numerical_indices,
-    categorical_groups,
-    use_approximation=False,
-    num_samples=200,
-    py_rng=None,
-):
+    model: Model,
+    reference: Vector,
+    anchor: Vector,
+    numerical_indices: Iterable[int],
+    categorical_groups: Iterable[Group],
+    use_approximation: bool = False,
+    num_samples: int = 200,
+    py_rng: PythonRandom = None,
+) -> tuple[FloatArray, ShapleyValues]:
     """Shapley values of moving from ``reference`` towards ``anchor``.
 
     Args:
@@ -44,9 +51,9 @@ def shapley_values(
     numerical_indices = list(numerical_indices)
     cat_groups = [list(group) for group in categorical_groups]
 
-    def create_feature_mapping():
+    def create_feature_mapping() -> tuple[dict[int, int], int]:
         """Map every original column to its Shapley unit."""
-        feature_map = {}
+        feature_map: dict[int, int] = {}
         shapley_idx = 0
 
         for num_idx in numerical_indices:
@@ -60,10 +67,12 @@ def shapley_values(
 
         return feature_map, shapley_idx
 
-    def create_consolidated_vectors(original_r, original_x, feature_map, total_units):
+    def create_consolidated_vectors(
+        original_r: Vector, original_x: Vector, feature_map: dict[int, int], total_units: int
+    ) -> tuple[list[Unit], list[Unit]]:
         """One entry per unit; categorical units hold a tuple of column values."""
-        consolidated_r = [0] * total_units
-        consolidated_x = [0] * total_units
+        consolidated_r: list[Unit] = [0] * total_units
+        consolidated_x: list[Unit] = [0] * total_units
 
         for num_idx in numerical_indices:
             shapley_idx = feature_map[num_idx]
@@ -77,9 +86,11 @@ def shapley_values(
 
         return consolidated_r, consolidated_x
 
-    def expand_to_original_format(consolidated_vector, feature_map, original_length):
+    def expand_to_original_format(
+        consolidated_vector: list[Unit], feature_map: dict[int, int], original_length: int
+    ) -> list[Unit]:
         """Inverse of :func:`create_consolidated_vectors`."""
-        expanded = [0] * original_length
+        expanded: list[Unit] = [0] * original_length
 
         for num_idx in numerical_indices:
             shapley_idx = feature_map[num_idx]
@@ -97,7 +108,13 @@ def shapley_values(
 
         return expanded
 
-    def coalition_batch(subsets, consolidated_r, consolidated_x, feature_map, original_length):
+    def coalition_batch(
+        subsets: list[set[int]],
+        consolidated_r: list[Unit],
+        consolidated_x: list[Unit],
+        feature_map: dict[int, int],
+        original_length: int,
+    ) -> FloatArray:
         """Rows that take the anchor's values for the units in each subset."""
         z_batch = []
         for S in subsets:
@@ -108,8 +125,14 @@ def shapley_values(
         return np.array(z_batch)
 
     def marginal_contributions(
-        subsets, subsets_with_i, consolidated_x, consolidated_r, f, feature_map, original_length
-    ):
+        subsets: list[set[int]],
+        subsets_with_i: list[set[int]],
+        consolidated_x: list[Unit],
+        consolidated_r: list[Unit],
+        f: Model,
+        feature_map: dict[int, int],
+        original_length: int,
+    ) -> FloatArray:
         z_without = coalition_batch(
             subsets, consolidated_r, consolidated_x, feature_map, original_length
         )
@@ -122,14 +145,23 @@ def shapley_values(
             pred_without = pred_without.flatten()
         if pred_with.ndim > 1:
             pred_with = pred_with.flatten()
-        return pred_with - pred_without
+        diff: FloatArray = pred_with - pred_without
+        return diff
 
-    def exact_value(i, consolidated_x, consolidated_r, f, n, feature_map, original_length):
+    def exact_value(
+        i: int,
+        consolidated_x: list[Unit],
+        consolidated_r: list[Unit],
+        f: Model,
+        n: int,
+        feature_map: dict[int, int],
+        original_length: int,
+    ) -> float:
         others = [j for j in range(n) if j != i]
 
-        subsets = []
-        subsets_with_i = []
-        weights = []
+        subsets: list[set[int]] = []
+        subsets_with_i: list[set[int]] = []
+        weights: list[float] = []
 
         logger.info(
             "[Stage 3] Exact Shapley for unit %d/%d: enumerating %d subsets (O(2^(n-1)) work).",
@@ -139,8 +171,8 @@ def shapley_values(
         )
 
         for k in range(len(others) + 1):
-            for S in itertools.combinations(others, k):
-                S = set(S)
+            for combination in itertools.combinations(others, k):
+                S = set(combination)
                 weight = factorial(len(S)) * factorial(n - len(S) - 1) / factorial(n)
                 subsets.append(S)
                 subsets_with_i.append(S | {i})
@@ -155,11 +187,18 @@ def shapley_values(
             feature_map,
             original_length,
         )
-        return np.sum(np.array(weights) * diff)
+        return float(np.sum(np.array(weights) * diff))
 
     def approximate_value(
-        i, consolidated_x, consolidated_r, f, n, feature_map, original_length, num_samples
-    ):
+        i: int,
+        consolidated_x: list[Unit],
+        consolidated_r: list[Unit],
+        f: Model,
+        n: int,
+        feature_map: dict[int, int],
+        original_length: int,
+        num_samples: int,
+    ) -> float:
         others = [j for j in range(n) if j != i]
 
         logger.info(
@@ -170,8 +209,8 @@ def shapley_values(
             num_samples,
         )
 
-        subsets = []
-        subsets_with_i = []
+        subsets: list[set[int]] = []
+        subsets_with_i: list[set[int]] = []
         for _ in range(num_samples):
             subset_size = py_rng.randint(0, len(others))
             if subset_size == 0:
@@ -192,7 +231,7 @@ def shapley_values(
             feature_map,
             original_length,
         )
-        return np.mean(diff)
+        return float(np.mean(diff))
 
     original_length = len(reference)
     feature_map, total_units = create_feature_mapping()
@@ -240,7 +279,7 @@ def shapley_values(
             for i in range(total_units)
         ]
 
-    values = {"numerical": {}, "categorical": {}}
+    values: ShapleyValues = {"numerical": {}, "categorical": {}}
     unit = 0
     for num_idx in numerical_indices:
         values["numerical"][num_idx] = phi[unit]

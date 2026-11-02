@@ -1,15 +1,21 @@
 """``MINLPSearchExplainer``: Shapley-guided counterfactual search."""
 
 import copy
+import logging
 from collections.abc import Sequence
 from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Any, cast
 
 import numpy as np
+import numpy.typing as npt
 
+from explainit.explainers.minlp.binary import class_target
 from explainit.explainers.minlp.search import MINLPSearch
 from explainit.explanation import Explanation
 from explainit.plotting import plot_priorities as _plot_priorities
-from explainit.targets import resolve_target
+from explainit.targets import Target, resolve_target
+from explainit.typing import Model, PathLike, Priorities
 
 
 @dataclass(frozen=True)
@@ -82,14 +88,14 @@ class MINLPSearchExplainer:
 
     def __init__(
         self,
-        model,
-        priorities,
-        dataset,
+        model: Model,
+        priorities: Priorities,
+        dataset: npt.ArrayLike,
         *,
         settings: MINLPSettings | None = None,
         feature_names: Sequence[str] | None = None,
-        workflow_logger=None,
-    ):
+        workflow_logger: logging.Logger | None = None,
+    ) -> None:
         self.model = model
         self.priorities = priorities
         self.dataset = np.asarray(dataset)
@@ -99,13 +105,13 @@ class MINLPSearchExplainer:
 
     def explain(
         self,
-        x,
+        x: npt.ArrayLike,
         *,
-        target=None,
-        tolerance=0.01,
-        target_class=None,
-        threshold=0.5,
-        random_seed=None,
+        target: float | None = None,
+        tolerance: float = 0.01,
+        target_class: int | None = None,
+        threshold: float = 0.5,
+        random_seed: int | None = None,
     ) -> Explanation:
         """Find a counterfactual for the sample ``x``.
 
@@ -122,9 +128,11 @@ class MINLPSearchExplainer:
         """
         goal = resolve_target(target, tolerance, target_class, threshold)
         sample = np.array(x, dtype=float)
-        search = self._search(sample, target=goal.value, tolerance=goal.tolerance)
         if goal.is_class:
-            return self._explain_class(search, sample, goal)
+            return self._explain_class(sample, goal)
+        assert goal.value is not None
+        assert goal.tolerance is not None
+        search = self._search(sample, target=goal.value, tolerance=goal.tolerance)
 
         s = self.settings
         cf = search.find_counterfactuals(
@@ -157,8 +165,14 @@ class MINLPSearchExplainer:
         )
 
     def probe_feasibility(
-        self, x, *, target, tolerance=0.01, max_iterations=5000, random_seed=None
-    ) -> dict:
+        self,
+        x: npt.ArrayLike,
+        *,
+        target: float,
+        tolerance: float = 0.01,
+        max_iterations: int = 5000,
+        random_seed: int | None = None,
+    ) -> dict[str, Any]:
         """Check whether random points of the allowed region can reach ``target``.
 
         Separates *feasibility* failures (the allowed region cannot reach the
@@ -173,7 +187,14 @@ class MINLPSearchExplainer:
             max_iterations=max_iterations, random_seed=random_seed
         )
 
-    def plot_priorities(self, x=None, *, feature_names=None, save_dir=None, show=True):
+    def plot_priorities(
+        self,
+        x: npt.ArrayLike | None = None,
+        *,
+        feature_names: Sequence[str] | None = None,
+        save_dir: PathLike | None = None,
+        show: bool = True,
+    ) -> list[Path]:
         """Plot the priorities, marking ``x`` if given.
 
         Pass ``save_dir`` to also write PNG files, and ``show=False`` to skip
@@ -187,11 +208,12 @@ class MINLPSearchExplainer:
             show=show,
         )
 
-    def _search(self, sample, *, target, tolerance) -> MINLPSearch:
+    def _search(self, sample: npt.NDArray[Any], *, target: float, tolerance: float) -> MINLPSearch:
         """A fresh search with its own copy of the priorities."""
         return MINLPSearch(
             self.model,
-            copy.deepcopy(self.priorities),
+            # The search fills in derived bounds, so it needs a mutable copy.
+            cast("dict[str, Any]", copy.deepcopy(self.priorities)),
             sample,
             target,
             self.dataset,
@@ -201,7 +223,11 @@ class MINLPSearchExplainer:
             feature_names=self.feature_names,
         )
 
-    def _explain_class(self, search, sample, goal) -> Explanation:
+    def _explain_class(self, sample: npt.NDArray[Any], goal: Target) -> Explanation:
+        assert goal.target_class is not None
+        assert goal.threshold is not None
+        internal_target, internal_tolerance = class_target(goal.target_class, goal.threshold)
+        search = self._search(sample, target=internal_target, tolerance=internal_tolerance)
         s = self.settings
         cfs, predictions, scores, combinations = search.find_counterfactuals_for_binary(
             target_class=goal.target_class,

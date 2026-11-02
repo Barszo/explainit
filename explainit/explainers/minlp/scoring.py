@@ -7,11 +7,20 @@ weights.
 
 import numpy as np
 
+from explainit.explainers.minlp._types import (
+    CategoricalPriorities,
+    NumericalPriorities,
+    Vector,
+)
 from explainit.explainers.minlp.intervals import in_allowed_intervals
 from explainit.logging_config import logger
 
 
-def total_weight(values, numerical_priorities, categorical_priorities):
+def total_weight(
+    values: Vector,
+    numerical_priorities: NumericalPriorities,
+    categorical_priorities: CategoricalPriorities,
+) -> float:
     """Priority benefit of ``values`` (a full feature vector).
 
     Immutable features (``function=None``) contribute nothing.
@@ -20,7 +29,7 @@ def total_weight(values, numerical_priorities, categorical_priorities):
         ValueError: If a numerical value is outside its range or in a
             zero-priority gap, or a categorical combination is not allowed.
     """
-    total = 0
+    total: float = 0
 
     for feature_id, feature_config in numerical_priorities.items():
         if feature_id >= len(values):
@@ -65,12 +74,17 @@ def total_weight(values, numerical_priorities, categorical_priorities):
                 f"Allowed combinations: {allowed_combinations}"
             )
 
-        total += categorical_weights[value_tuple]
+        # A forbidden (None) weight raises TypeError here: known issue MINLP-8.
+        total += categorical_weights[value_tuple]  # type: ignore[operator]
 
     return total
 
 
-def priority_benefit(values, numerical_priorities, categorical_priorities):
+def priority_benefit(
+    values: Vector,
+    numerical_priorities: NumericalPriorities,
+    categorical_priorities: CategoricalPriorities,
+) -> float | None:
     """:func:`total_weight` as a float, or ``None`` when ``values`` is not allowed.
 
     The optimiser can still produce out-of-range values, so callers get
@@ -83,7 +97,7 @@ def priority_benefit(values, numerical_priorities, categorical_priorities):
         return None
 
 
-def feature_priority(config, value: float) -> float:
+def feature_priority(config: object, value: float) -> float:
     """Priority of one numerical feature at ``value`` (0 if immutable or invalid)."""
     fn = config.get("function") if isinstance(config, dict) else None
     if fn is None:
@@ -95,13 +109,15 @@ def feature_priority(config, value: float) -> float:
     return w if np.isfinite(w) else 0.0
 
 
-def priority_peaks(numerical_priorities, grid_size: int = 1000) -> dict[int, tuple]:
+def priority_peaks(
+    numerical_priorities: NumericalPriorities, grid_size: int = 1000
+) -> dict[int, tuple[float, float]]:
     """``{feature_index: (peak_value, peak_priority)}`` for mutable features.
 
     The peak is the argmax of the priority function over the feature's allowed
     intervals, found on a grid (no model calls).
     """
-    peaks: dict[int, tuple] = {}
+    peaks: dict[int, tuple[float, float]] = {}
     for idx, cfg in numerical_priorities.items():
         if not isinstance(cfg, dict) or cfg.get("function") is None:
             continue

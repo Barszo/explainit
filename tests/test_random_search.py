@@ -110,10 +110,10 @@ class TestExplain:
         np.testing.assert_array_equal(first.sample, other)
 
     def test_seeded_search_leaves_global_random_state_untouched(self, explainer):
-        np_state = np.random.get_state()[1].copy()
+        np_state = np.random.get_state(legacy=False)["state"]["key"].copy()
         py_state = random.getstate()
         _explain(explainer, random_seed=123)
-        np.testing.assert_array_equal(np.random.get_state()[1], np_state)
+        np.testing.assert_array_equal(np.random.get_state(legacy=False)["state"]["key"], np_state)
         assert random.getstate() == py_state
 
     def test_top_n_keeps_most_preferable(self, explainer):

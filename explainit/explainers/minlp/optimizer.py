@@ -6,27 +6,32 @@ features stay in their (trust-region) bounds and allowed intervals, and the
 priority benefit is as high as possible.
 """
 
-import numpy as np
-from scipy.optimize import minimize
+from collections.abc import Sequence
+from typing import Any
 
+import numpy as np
+from scipy.optimize import OptimizeResult, minimize
+
+from explainit.explainers.minlp._types import Bounds, NumericalPriorities, Vector, VectorFunction
 from explainit.explainers.minlp.intervals import (
     allowed_interval_constraint_value,
     project_to_allowed_intervals,
 )
 from explainit.logging_config import logger
+from explainit.typing import FloatArray
 
 
 def optimise_combination(
-    start,
-    numerical_indices,
-    numerical_priorities,
-    bounds,
-    surrogate,
-    objective,
-    pass_target,
-    epsilon,
-    label="",
-):
+    start: Vector,
+    numerical_indices: Sequence[int],
+    numerical_priorities: NumericalPriorities,
+    bounds: Bounds,
+    surrogate: VectorFunction,
+    objective: VectorFunction,
+    pass_target: float,
+    epsilon: float,
+    label: str = "",
+) -> tuple[OptimizeResult, Vector, float]:
     """Run SLSQP from ``start`` over the numerical features.
 
     Args:
@@ -47,33 +52,34 @@ def optimise_combination(
         feature vector and the surrogate value there.
     """
 
-    def to_full(x, start=start):
+    def to_full(x: FloatArray, start: Vector = start) -> Vector:
         full = start.copy()
         for j, idx in enumerate(numerical_indices):
             full[idx] = x[j]
         return full
 
-    def h(x):
+    def h(x: FloatArray) -> float:
         return surrogate(to_full(x))
 
-    def negative_benefit(x):
+    def negative_benefit(x: FloatArray) -> float:
         try:
             benefit = objective(to_full(x))
         except ValueError:
             benefit = -1e12
         return -benefit
 
-    def lower_constraint(x):
+    def lower_constraint(x: FloatArray) -> float:
         return h(x) - (pass_target - epsilon)
 
-    def upper_constraint(x):
+    def upper_constraint(x: FloatArray) -> float:
         return (pass_target + epsilon) - h(x)
 
-    constraints = [
+    # SciPy's legacy dict constraints; the stubs' TypedDict expects array-valued ``fun``.
+    constraints: list[Any] = [
         {"type": "ineq", "fun": lower_constraint},
         {"type": "ineq", "fun": upper_constraint},
     ]
-    x0 = np.array([start[idx] for idx in numerical_indices])
+    x0: FloatArray = np.array([start[idx] for idx in numerical_indices])
     bounds_list = [bounds[idx] for idx in numerical_indices]
     for j, feature_idx in enumerate(numerical_indices):
         cfg = numerical_priorities.get(feature_idx, {})

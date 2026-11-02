@@ -1,9 +1,16 @@
 """The result of explaining one sample."""
 
+from collections.abc import Sequence
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
+import numpy.typing as npt
+
+from explainit.typing import FloatArray
+
+if TYPE_CHECKING:
+    import pandas as pd
 
 
 @dataclass(frozen=True)
@@ -21,16 +28,25 @@ class Explanation:
         diagnostics: Method-specific details about the search.
     """
 
-    sample: np.ndarray
-    counterfactuals: np.ndarray
-    predictions: np.ndarray
-    scores: np.ndarray
-    valid: np.ndarray
+    sample: FloatArray
+    counterfactuals: FloatArray
+    predictions: FloatArray
+    scores: FloatArray
+    valid: npt.NDArray[np.bool_]
     method: str
     diagnostics: dict[str, Any] = field(default_factory=dict, repr=False)
 
     @classmethod
-    def from_lists(cls, sample, counterfactuals, predictions, scores, valid, method, diagnostics):
+    def from_lists(
+        cls,
+        sample: npt.ArrayLike,
+        counterfactuals: Sequence[npt.ArrayLike],
+        predictions: Sequence[float],
+        scores: Sequence[float | None],
+        valid: Sequence[bool],
+        method: str,
+        diagnostics: dict[str, Any],
+    ) -> "Explanation":
         """Build an explanation from per-counterfactual lists."""
         sample = np.asarray(sample, dtype=float)
         rows = np.asarray(counterfactuals, dtype=float).reshape(-1, sample.shape[-1])
@@ -48,11 +64,11 @@ class Explanation:
         return len(self.counterfactuals)
 
     @property
-    def changes(self) -> np.ndarray:
+    def changes(self) -> FloatArray:
         """``counterfactuals - sample``: how each feature has to change."""
         return self.counterfactuals - self.sample
 
-    def to_frame(self, feature_names=None):
+    def to_frame(self, feature_names: Sequence[str] | None = None) -> "pd.DataFrame":
         """The counterfactuals as a :class:`pandas.DataFrame`.
 
         One row per counterfactual with a column per feature, then

@@ -6,12 +6,23 @@ program; the solution warm-starts the nonlinear optimisation.
 
 import itertools
 import warnings
+from collections.abc import Sequence
+from typing import Any
 
 import numpy as np
+import numpy.typing as npt
 from scipy.optimize import linprog
 
+from explainit.typing import FloatArray
 
-def solve_linear_constraint(coefficients, target, bounds, method="auto", tolerance=1e-8):
+
+def solve_linear_constraint(
+    coefficients: npt.ArrayLike,
+    target: float,
+    bounds: Sequence[tuple[float, float]],
+    method: str = "auto",
+    tolerance: float = 1e-8,
+) -> dict[str, Any]:
     """Find ``x`` with ``|coefficients . x - target| < tolerance`` inside ``bounds``.
 
     Args:
@@ -53,7 +64,9 @@ def solve_linear_constraint(coefficients, target, bounds, method="auto", toleran
             "method_used": None,
         }
 
-    methods_to_try = ["highs", "interior-point"] if method == "auto" else [method]
+    # SciPy validates the method name; "interior-point" was removed in SciPy 1.11,
+    # so with "auto" only HiGHS can succeed before the corner fallback.
+    methods_to_try: list[Any] = ["highs", "interior-point"] if method == "auto" else [method]
 
     for current_method in methods_to_try:
         try:
@@ -94,7 +107,12 @@ def solve_linear_constraint(coefficients, target, bounds, method="auto", toleran
     return _corner_analysis(coefficients, target, bounds, tolerance)
 
 
-def _corner_analysis(coefficients, target, bounds, tolerance):
+def _corner_analysis(
+    coefficients: FloatArray,
+    target: float,
+    bounds: Sequence[tuple[float, float]],
+    tolerance: float,
+) -> dict[str, Any]:
     """Fallback: the box corner closest to the hyperplane, if within tolerance."""
     corners = []
     for bound in bounds:
@@ -103,18 +121,19 @@ def _corner_analysis(coefficients, target, bounds, tolerance):
     corner_points = list(itertools.product(*corners))
 
     best_error = float("inf")
-    best_solution = None
+    best_solution: FloatArray | None = None
 
     for corner in corner_points:
-        corner = np.array(corner)
-        value = np.dot(coefficients, corner)
+        point = np.array(corner)
+        value = np.dot(coefficients, point)
         error = abs(value - target)
 
         if error < best_error:
             best_error = error
-            best_solution = corner
+            best_solution = point
 
     if best_error < tolerance:
+        assert best_solution is not None
         return {
             "success": True,
             "solution": best_solution,

@@ -133,6 +133,10 @@ Features are referred to by **column index**, in the same (preprocessed) space
 the model receives. Results are therefore in model units: if your model expects
 standardised features, so do the priorities.
 
+explainit is fully type-annotated. To annotate your own code, import the
+aliases from `explainit.typing`, e.g. `Model`, `Priorities`, and
+`NumericalPriority`.
+
 ### Numerical priorities
 
 ```python
@@ -268,7 +272,8 @@ explainit/
 ├── explainers/   # RandomSearchExplainer; minlp/ holds MINLPSearchExplainer, one module per stage
 ├── priorities/   # built-in priority functions
 ├── plotting/     # priority and sampling-distribution plots
-└── sampling.py   # priority-weighted sampling
+├── sampling.py   # priority-weighted sampling
+└── typing.py     # type aliases for annotating your own code
 docs/             # additional documentation
 tests/            # pytest suite, including the examples in the docs
 ```

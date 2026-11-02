@@ -7,6 +7,7 @@ the problem definition.
 """
 
 from dataclasses import dataclass
+from typing import Any
 
 import numpy as np
 import pytest
@@ -96,11 +97,15 @@ def problems(draw, allow_fixed):
         # A point with positive priority, used to make the target reachable.
         best_point[i] = rng.uniform(low + 0.1 * (high - low), high - 0.1 * (high - low))
 
-    categorical, columns, effects = {}, (), np.zeros(0)
+    categorical: dict[tuple[int, ...], dict[tuple[float, ...], Any]] = {}
+    columns: tuple[int, ...] = ()
+    effects = np.zeros(0)
     if n_cat:
         columns = tuple(range(n_num, n_features))
         options = [tuple(float(v) for v in row) for row in np.eye(n_cat)]
-        weights = {combo: float(rng.uniform(0.1, 1.0)) for combo in options}
+        weights: dict[tuple[float, ...], float | None] = {
+            combo: float(rng.uniform(0.1, 1.0)) for combo in options
+        }
         forbidden = options[int(rng.integers(n_cat))] if n_cat == 3 else None
         if forbidden is not None:
             weights[forbidden] = None

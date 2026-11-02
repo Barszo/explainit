@@ -7,9 +7,18 @@ sample's or the anchor's category. The search then runs once per combination.
 
 import copy
 import itertools
+from collections.abc import Mapping
+from typing import Any
+
+from explainit.explainers.minlp._types import Assignment, Group, Vector
 
 
-def limit_combinations(priorities, shapley_categorical, sample, anchor):
+def limit_combinations(
+    priorities: dict[str, Any],
+    shapley_categorical: Mapping[Group, float],
+    sample: Vector,
+    anchor: Vector,
+) -> tuple[dict[str, Any], dict[int, Assignment]]:
     """Restrict each categorical group to at most the sample's and the anchor's category.
 
     Args:
@@ -52,7 +61,7 @@ def limit_combinations(priorities, shapley_categorical, sample, anchor):
     combinations = {}
     groups = list(priorities.get("categorical", {}))
     for combination_id, values_per_group in enumerate(itertools.product(*allowed_by_group)):
-        assignment = {}
+        assignment: Assignment = {}
         for group_index, group in enumerate(groups):
             for i, idx in enumerate(group):
                 assignment[idx] = values_per_group[group_index][i]

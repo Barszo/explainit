@@ -5,8 +5,14 @@ from typing import Any
 
 import numpy as np
 
+# ``numpy.random`` (the module, global stream) or a ``numpy.random.RandomState``;
+# both offer the same sampling functions, but no common type describes them.
+type NumpyRandom = Any
+# ``random`` (the module, global stream) or a ``random.Random``.
+type PythonRandom = Any
 
-def make_rngs(seed: int | None = None) -> tuple[Any, Any]:
+
+def make_rngs(seed: int | None = None) -> tuple[NumpyRandom, PythonRandom]:
     """Return ``(numpy_rng, python_rng)`` for one search run.
 
     With ``seed=None`` the global NumPy and :mod:`random` streams are used, so

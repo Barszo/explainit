@@ -67,6 +67,7 @@ Run these from the repository root (prefix with `uv run` when using uv):
 | Test coverage | `pytest --cov` |
 | Lint and format everything | `pre-commit run --all-files` |
 | Lint / format only | `ruff check --fix .` / `ruff format .` |
+| Type check | `mypy` |
 | Build the package | `uv build` (or `python -m build`) |
 
 `pre-commit install` runs Ruff, formatting, spelling, and file checks on
@@ -81,7 +82,7 @@ the lint job.
 3. Update the documentation (`README.md`, `docs/`) if behaviour or the public
    API changes, and add a line to the `Unreleased` section of
    [CHANGELOG.md](CHANGELOG.md).
-4. Run `pytest` and `pre-commit run --all-files`.
+4. Run `pytest`, `mypy`, and `pre-commit run --all-files`.
 5. Push your branch and open a pull request against `main`. Fill in the
    pull request template and link the related issue.
 
@@ -93,6 +94,11 @@ short, imperative summary (e.g. "Add peaked priority function").
 
 - **Style** is enforced by Ruff (lint and format); configuration lives in
   `pyproject.toml`. Don't reformat unrelated code.
+- **Types**: the package is fully annotated and checked with `mypy` in strict
+  mode (tests and benchmarks are checked, but need not be annotated). Shared
+  aliases live in `explainit/typing.py` (public) and
+  `explainit/explainers/minlp/_types.py` (internal). Prefer precise types to
+  `Any`; a `# type: ignore[code]` needs a comment explaining why.
 - **Tests**: every bug fix needs a test that fails without the fix; every new
   feature needs tests for its main behaviour and edge cases. Tests use plain
   `pytest` with `assert`. Keep them fast: use small models and datasets, and

@@ -20,8 +20,11 @@ from explainit.priorities.linear import basic_linear
 def test_normalize_vectors():
     assert normalize_vectors(None) is None
     assert normalize_vectors(3.0) is None
-    assert [v.tolist() for v in normalize_vectors([1, 2])] == [[1.0, 2.0]]
-    assert [v.tolist() for v in normalize_vectors([[1, 2], [3, 4]])] == [[1.0, 2.0], [3.0, 4.0]]
+    one, two = normalize_vectors([1, 2]), normalize_vectors([[1, 2], [3, 4]])
+    assert one is not None
+    assert two is not None
+    assert [v.tolist() for v in one] == [[1.0, 2.0]]
+    assert [v.tolist() for v in two] == [[1.0, 2.0], [3.0, 4.0]]
     with pytest.raises(ValueError, match="ndim=3"):
         normalize_vectors(np.zeros((1, 1, 1)))
 

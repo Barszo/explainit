@@ -5,25 +5,30 @@ which the surrogate hits the pass target. These points start the nonlinear
 optimisation of Stage 5.
 """
 
+from collections.abc import Callable, Mapping, Sequence
+from typing import Any
+
 import numpy as np
 
+from explainit.explainers.minlp._types import Assignment, Vector, VectorFunction
 from explainit.explainers.minlp.linear_program import solve_linear_constraint
 from explainit.logging_config import logger
+from explainit.typing import Model
 
 
 def solve_warm_starts(
-    targets,
-    combinations,
-    indices,
-    coefficients,
-    bounds,
-    sample,
-    surrogate,
-    pass_target,
-    model,
-    target,
-    epsilon,
-):
+    targets: Mapping[int, float],
+    combinations: Mapping[int, Assignment],
+    indices: Sequence[int],
+    coefficients: Sequence[float],
+    bounds: Sequence[tuple[float, float]],
+    sample: Vector,
+    surrogate: VectorFunction,
+    pass_target: Callable[[int], float],
+    model: Model,
+    target: float,
+    epsilon: float,
+) -> tuple[dict[int, dict[str, Any]], list[tuple[float, float]]]:
     """One linear-program warm start per categorical combination.
 
     Args:
@@ -49,8 +54,8 @@ def solve_warm_starts(
         "(coefficients . x = adjusted_target, bounded). The first feasible "
         "x becomes the warm-start for SLSQP later on."
     )
-    warm_starts = {}
-    gaps = []
+    warm_starts: dict[int, dict[str, Any]] = {}
+    gaps: list[tuple[float, float]] = []
 
     for combination_id, lp_target in targets.items():
         logger.info(
@@ -123,7 +128,11 @@ def solve_warm_starts(
     return warm_starts, gaps
 
 
-def warm_start_health(targets, warm_starts, gaps):
+def warm_start_health(
+    targets: Mapping[int, float],
+    warm_starts: Mapping[int, Any],
+    gaps: Sequence[tuple[float, float]],
+) -> dict[str, Any]:
     """Summary of the first pass's warm starts, reported in the search result."""
     best = min(gaps, key=lambda t: t[0]) if gaps else (None, None)
     return {

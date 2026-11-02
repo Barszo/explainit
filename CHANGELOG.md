@@ -49,6 +49,11 @@ change later searches (formerly known issues MINLP-2 and MINLP-4).
   exponential, basic_linear_step, plot_priorities`.
 - `explainit.sampling` with the priority-weighted samplers used by the search
   and the plots.
+- Type hints for the whole package, checked with mypy in strict mode. The
+  package ships a `py.typed` marker, so type checkers use them, and
+  `explainit.typing` provides aliases for annotating your own code (`Model`,
+  `Priorities`, `NumericalPriority`, `CategoricalWeights`, `PriorityFunction`,
+  `FloatArray`, `PathLike`).
 - Test suite (unit, exact-answer, property-based, snapshot, known-bug and
   documentation tests), a quality benchmark with a recorded baseline, Ruff,
   pre-commit hooks, and GitHub Actions CI.

@@ -1,12 +1,17 @@
 """Progress reporting for the MINLP search."""
 
+from collections.abc import Callable
+from typing import Any
+
 import numpy as np
 
 from explainit.explainers.minlp.intervals import in_allowed_intervals
+from explainit.explainers.minlp.state import PrioritiesState
 from explainit.logging_config import logger
+from explainit.typing import FloatArray, Model
 
 
-def log_bounds(priorities_state):
+def log_bounds(priorities_state: PrioritiesState) -> None:
     """Surface the numerical bounds used by both LP and SLSQP."""
     logger.info("--- STAGE 2/6: Collect numerical-feature bounds from priorities ---")
     logger.info(
@@ -21,8 +26,14 @@ def log_bounds(priorities_state):
 
 
 def log_workflow_summary(
-    workflow_log, model, sample, target, dataset, priorities_state, feature_label
-):
+    workflow_log: Callable[..., None],
+    model: Model,
+    sample: Any,
+    target: float,
+    dataset: FloatArray,
+    priorities_state: PrioritiesState,
+    feature_label: Callable[[int], str],
+) -> None:
     """Write the initial prediction and per-feature bounds coverage to ``workflow_log``."""
     initial_prediction = float(model([sample])[0])
     workflow_log("")

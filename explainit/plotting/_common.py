@@ -1,12 +1,17 @@
 """Helpers shared by the plot modules."""
 
-import os
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, overload
 
 import matplotlib.pyplot as plt
 import numpy as np
+import numpy.typing as npt
+from matplotlib.axes import Axes
+from matplotlib.container import BarContainer
+from matplotlib.figure import Figure
+from matplotlib.patches import Rectangle
 
 from explainit.plotting.style import (
     COLORS,
@@ -17,14 +22,12 @@ from explainit.plotting.style import (
     line_color,
     pair_color,
 )
-
-PathLike = str | os.PathLike
-
+from explainit.typing import FloatArray, PathLike
 
 # --- inputs -------------------------------------------------------------------
 
 
-def normalize_vectors(vectors: Any | None) -> list[np.ndarray] | None:
+def normalize_vectors(vectors: Any | None) -> list[FloatArray] | None:
     """``None``, one 1-D vector, or a 2-D array / list of vectors -> list of 1-D vectors."""
     if vectors is None:
         return None
@@ -38,7 +41,7 @@ def normalize_vectors(vectors: Any | None) -> list[np.ndarray] | None:
     raise ValueError(f"Expected 1D or 2D array for sample/exemplar, got ndim={arr.ndim}")
 
 
-def pair_count(samples: list | None, exemplars: list | None) -> int:
+def pair_count(samples: Sequence[Any] | None, exemplars: Sequence[Any] | None) -> int:
     return max(
         len(samples) if samples is not None else 0,
         len(exemplars) if exemplars is not None else 0,
@@ -65,7 +68,7 @@ def normalize_target_values(values: Any | None, n_pairs: int) -> list[float | No
     return out
 
 
-def values_at(vectors: list[np.ndarray] | None, n_pairs: int, idx: int) -> list:
+def values_at(vectors: Sequence[FloatArray] | None, n_pairs: int, idx: int) -> list[float | None]:
     """Finite value of feature ``idx`` in each of ``n_pairs`` vectors (``None`` when missing)."""
     out: list[float | None] = []
     for i in range(n_pairs):
@@ -93,10 +96,10 @@ def is_actionable_numeric(constraint: Any) -> bool:
     max_val = constraint.get("max")
     if min_val is None or max_val is None:
         return False
-    return min_val != max_val
+    return bool(min_val != max_val)
 
 
-def infer_target_type(target_values: np.ndarray) -> str:
+def infer_target_type(target_values: npt.ArrayLike) -> str:
     """``"categorical"`` (at most 12 distinct values), ``"continuous"`` or ``"unknown"``."""
     vals = np.asarray(target_values).flatten()
     vals = vals[np.isfinite(vals)]
@@ -114,11 +117,11 @@ class PriorityCurve:
     low: float
     high: float
     function: Any
-    x: np.ndarray
-    y: np.ndarray
+    x: FloatArray
+    y: FloatArray
 
     @classmethod
-    def from_constraint(cls, constraint, points: int) -> "PriorityCurve":
+    def from_constraint(cls, constraint: Mapping[str, Any], points: int) -> "PriorityCurve":
         low, high = float(constraint["min"]), float(constraint["max"])
         f = constraint["function"]
         x = np.linspace(low, high, points)
@@ -138,7 +141,7 @@ class PriorityCurve:
 # --- drawing ------------------------------------------------------------------
 
 
-def draw_curve(ax, curve: PriorityCurve) -> None:
+def draw_curve(ax: Axes, curve: PriorityCurve) -> None:
     """The priority curve, filled below."""
     ax.plot(
         curve.x,
@@ -152,12 +155,22 @@ def draw_curve(ax, curve: PriorityCurve) -> None:
     ax.fill_between(curve.x, curve.y, alpha=0.2, color=line_color("theoretical"))
 
 
-def draw_connector(ax, x, y, color) -> None:
+def draw_connector(ax: Axes, x: Sequence[float], y: Sequence[float], color: str) -> None:
     """A translucent dashed line joining a sample to its exemplar."""
     ax.plot(x, y, color=color, alpha=0.35, linewidth=2.0, linestyle="--")
 
 
-def draw_marker(ax, x, y, marker, color, *, size, edge_width, label) -> None:
+def draw_marker(
+    ax: Axes,
+    x: float,
+    y: float,
+    marker: str,
+    color: str,
+    *,
+    size: float,
+    edge_width: float,
+    label: str,
+) -> None:
     ax.plot(
         x,
         y,
@@ -171,25 +184,35 @@ def draw_marker(ax, x, y, marker, color, *, size, edge_width, label) -> None:
 
 
 def draw_pairs_on_curve(
-    ax, curve, samples, exemplars, *, size, edge_width, names=("Sample", "Exemplar")
+    ax: Axes,
+    curve: PriorityCurve,
+    samples: Sequence[float | None],
+    exemplars: Sequence[float | None],
+    *,
+    size: float,
+    edge_width: float,
+    names: tuple[str, str] = ("Sample", "Exemplar"),
 ) -> None:
     """Mark each sample (triangle) and exemplar (square) on the priority curve."""
     n_pairs = len(samples)
     for i in range(n_pairs):
         color = pair_color(i)
         s_val, e_val = samples[i], exemplars[i]
+        # ``at`` is ``None`` for a missing value, so a marked value is never ``None``.
         s_y, e_y = curve.at(s_val), curve.at(e_val)
-        if s_y is not None and e_y is not None:
+        if s_val is not None and s_y is not None and e_val is not None and e_y is not None:
             draw_connector(ax, [s_val, e_val], [s_y, e_y], color)
-        if s_y is not None:
+        if s_val is not None and s_y is not None:
             label = f"{pair_label(names[0], i, n_pairs)} ({s_val:.3f})"
             draw_marker(ax, s_val, s_y, "v", color, size=size, edge_width=edge_width, label=label)
-        if e_y is not None:
+        if e_val is not None and e_y is not None:
             label = f"{pair_label(names[1], i, n_pairs)} ({e_val:.3f})"
             draw_marker(ax, e_val, e_y, "s", color, size=size, edge_width=edge_width, label=label)
 
 
-def level_positions(x_vals: np.ndarray, y_vals: np.ndarray, level: float, tol: float = 1e-4):
+def level_positions(
+    x_vals: FloatArray, y_vals: FloatArray, level: float, tol: float = 1e-4
+) -> list[float]:
     """Feature values where the priority curve reaches ``level``.
 
     Interpolated crossings, plus one boundary of every flat run at the level
@@ -226,7 +249,9 @@ def level_positions(x_vals: np.ndarray, y_vals: np.ndarray, level: float, tol: f
     return dedup
 
 
-def draw_level_lines(ax, curve: PriorityCurve, *, linewidth, alpha, label) -> None:
+def draw_level_lines(
+    ax: Axes, curve: PriorityCurve, *, linewidth: float, alpha: float, label: str
+) -> None:
     """Vertical lines where the priority is 1, 0.75, 0.5, 0.25 and 0."""
     for level, color in LEVEL_COLORS.items():
         first = True
@@ -254,7 +279,7 @@ def bar_width(num_categories: int) -> float:
     return 0.8
 
 
-def draw_bars(ax, heights):
+def draw_bars(ax: Axes, heights: FloatArray) -> BarContainer:
     """Themed bars with an inner outline, one per category."""
     num_categories = len(heights)
     bars = ax.bar(
@@ -283,7 +308,7 @@ def draw_bars(ax, heights):
     return bars
 
 
-def draw_bar_label(ax, bar, text, offset) -> None:
+def draw_bar_label(ax: Axes, bar: Rectangle, text: str, offset: float) -> None:
     """A boxed value label above ``bar``."""
     ax.text(
         bar.get_x() + bar.get_width() / 2,
@@ -298,7 +323,9 @@ def draw_bar_label(ax, bar, text, offset) -> None:
     )
 
 
-def group_title(prefix: str, group_indices, feature_names) -> str:
+def group_title(
+    prefix: str, group_indices: Sequence[int], feature_names: Sequence[str] | None
+) -> str:
     if feature_names is not None:
         names = ", ".join(feature_names[i] for i in group_indices if i < len(feature_names))
         return f"{prefix} for Categorical Features [{names}]"
@@ -308,6 +335,10 @@ def group_title(prefix: str, group_indices, feature_names) -> str:
 # --- output -------------------------------------------------------------------
 
 
+@overload
+def ensure_dir(directory: None) -> None: ...
+@overload
+def ensure_dir(directory: PathLike) -> Path: ...
 def ensure_dir(directory: PathLike | None) -> Path | None:
     if directory is None:
         return None
@@ -321,11 +352,11 @@ def numerical_path(directory: Path, prefix: str, idx: int, feature_name: str | N
     return directory / f"{prefix}_{idx}_{slug}.png"
 
 
-def group_path(directory: Path, prefix: str, group_indices) -> Path:
+def group_path(directory: Path, prefix: str, group_indices: Sequence[int]) -> Path:
     return directory / f"{prefix}_{'_'.join(map(str, group_indices))}.png"
 
 
-def finalize(fig, save_path: PathLike | None, show: bool) -> None:
+def finalize(fig: Figure, save_path: PathLike | None, show: bool) -> None:
     """Save ``fig`` if a path is given, then show it or close it."""
     if save_path is not None:
         save_path = Path(save_path)

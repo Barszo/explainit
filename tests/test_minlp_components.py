@@ -5,6 +5,7 @@ own with tiny inputs.
 """
 
 import random
+from typing import Any, ClassVar
 
 import numpy as np
 import pytest
@@ -82,7 +83,9 @@ class TestScoring:
         0: {"min": 0.0, "max": 1.0, "function": _linear(0.0, 1.0)},
         1: {"min": 0.0, "max": 1.0, "function": None},
     }
-    CATEGORICAL = {(2, 3): {(1.0, 0.0): 1.0, (0.0, 1.0): 0.25}}  # noqa: RUF012
+    CATEGORICAL: ClassVar[dict[tuple[int, ...], dict[tuple[float, ...], float | None]]] = {
+        (2, 3): {(1.0, 0.0): 1.0, (0.0, 1.0): 0.25}
+    }
 
     def test_total_weight_sums_priorities_and_category_weights(self):
         assert total_weight([0.5, 9.0, 0.0, 1.0], self.NUMERICAL, self.CATEGORICAL) == 0.75
@@ -111,8 +114,14 @@ class TestSurrogate:
         coefficients, _ = unit_coefficients({0: 4.0, 1: 3.0}, sample, anchor, [0, 1], [])
         assert coefficients == {0: 2.0, 1: 0.0}  # feature 1 does not move
 
-        shapley = {"numerical": {0: 4.0, 1: 3.0}, "categorical": {(2, 3): 0.5}}
-        priorities = {"numerical": {0: {}, 1: {}}, "categorical": {(2, 3): {}}}
+        shapley: dict[str, dict[Any, float]] = {
+            "numerical": {0: 4.0, 1: 3.0},
+            "categorical": {(2, 3): 0.5},
+        }
+        priorities: dict[str, dict[Any, Any]] = {
+            "numerical": {0: {}, 1: {}},
+            "categorical": {(2, 3): {}},
+        }
         h = lambda x: surrogate_prediction(  # noqa: E731
             x, coefficients, shapley, sample, anchor, priorities, basic_prediction=1.0
         )
@@ -123,7 +132,8 @@ class TestSurrogate:
 
     def test_categorical_contribution_of_an_assignment(self):
         sample, anchor = [0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 0.0, 1.0]
-        groups, phi = [(2, 3)], {(2, 3): 0.7}
+        groups: list[tuple[int, ...]] = [(2, 3)]
+        phi: dict[tuple[int, ...], float] = {(2, 3): 0.7}
         assert categorical_contribution({2: 0.0, 3: 1.0}, groups, phi, sample, anchor) == 0.7
         assert categorical_contribution({2: 1.0, 3: 0.0}, groups, phi, sample, anchor) == 0.0
 
@@ -132,7 +142,7 @@ class TestSurrogate:
             1.0, {0: 2.0, 1: -1.0, 2: 5.0}, {0: (0.0, 1.0), 1: (0.0, 2.0), 2: (0.0, 1.0)},
             [0.5, 1.0, 0.0], immutable={2},
         )  # fmt: skip
-        assert (low, high) == (pytest.approx(-1.0), pytest.approx(3.0))
+        assert (low, high) == pytest.approx((-1.0, 3.0))
 
 
 class TestShapley:

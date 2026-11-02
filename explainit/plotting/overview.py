@@ -5,9 +5,9 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+import numpy.typing as npt
 
 from explainit.plotting._common import (
-    PathLike,
     ensure_dir,
     group_path,
     is_actionable_numeric,
@@ -15,6 +15,7 @@ from explainit.plotting._common import (
 )
 from explainit.plotting.categorical import plot_categorical_priority
 from explainit.plotting.numerical import plot_numerical_priority
+from explainit.typing import PathLike
 
 
 def plot_priorities(
@@ -24,8 +25,8 @@ def plot_priorities(
     exemplar: Any | None = None,
     sample_target_value: Any | None = None,
     exemplar_target_value: Any | None = None,
-    feature_matrix: Sequence[Sequence[float]] | None = None,
-    target_values: Sequence[float] | None = None,
+    feature_matrix: npt.ArrayLike | None = None,
+    target_values: npt.ArrayLike | None = None,
     target_name: str = "target",
     target_threshold: float | None = None,
     feature_names: Sequence[str] | None = None,

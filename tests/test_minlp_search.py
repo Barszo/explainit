@@ -155,10 +155,10 @@ class TestExplain:
         explainer = MINLPSearchExplainer(
             mixed_model, mixed_priorities, mixed_dataset, settings=settings
         )
-        np_state = np.random.get_state()[1].copy()
+        np_state = np.random.get_state(legacy=False)["state"]["key"].copy()
         py_state = random.getstate()
         explainer.explain(SAMPLE, target=TARGET, random_seed=3)
-        np.testing.assert_array_equal(np.random.get_state()[1], np_state)
+        np.testing.assert_array_equal(np.random.get_state(legacy=False)["state"]["key"], np_state)
         assert random.getstate() == py_state
 
     @pytest.mark.parametrize(

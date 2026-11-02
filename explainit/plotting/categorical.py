@@ -12,9 +12,10 @@ from typing import Any
 
 import matplotlib.pyplot as plt
 import numpy as np
+import numpy.typing as npt
+from matplotlib.figure import Figure
 
 from explainit.plotting._common import (
-    PathLike,
     bar_width,
     draw_bar_label,
     draw_bars,
@@ -36,22 +37,25 @@ from explainit.plotting.style import (
     style_axes,
     styled_legend,
 )
+from explainit.typing import FloatArray, PathLike
+
+type Combination = tuple[Any, ...]
 
 
 def plot_categorical_priority(
     group_indices: tuple[int, ...],
-    mapping: Mapping[tuple[Any, ...], float],
+    mapping: Mapping[Combination, float | None],
     *,
     sample: Any | None = None,
     exemplar: Any | None = None,
-    feature_matrix: Sequence[Sequence[float]] | None = None,
-    target_values: Sequence[float] | None = None,
+    feature_matrix: npt.ArrayLike | None = None,
+    target_values: npt.ArrayLike | None = None,
     target_name: str = "target",
     feature_names: Sequence[str] | None = None,
     save_path: PathLike | None = None,
     save_dir: PathLike | None = None,
     show: bool = False,
-) -> plt.Figure | None:
+) -> Figure | None:
     """Plot the priority weights of the categorical group ``group_indices``.
 
     Args:
@@ -96,7 +100,11 @@ def plot_categorical_priority(
     return fig
 
 
-def _dataset(group_indices, feature_matrix, target_values):
+def _dataset(
+    group_indices: Sequence[int],
+    feature_matrix: npt.ArrayLike | None,
+    target_values: npt.ArrayLike | None,
+) -> tuple[list[Combination], FloatArray, str] | None:
     """``(combinations, targets, target_type)`` for rows with a finite target, or ``None``."""
     if feature_matrix is None or target_values is None:
         return None
@@ -110,7 +118,15 @@ def _dataset(group_indices, feature_matrix, target_values):
     return kept, targets[mask], infer_target_type(targets)
 
 
-def _target_figure(categories, weights, labels, combinations, targets, target_type, target_name):
+def _target_figure(
+    categories: list[Combination],
+    weights: FloatArray,
+    labels: list[str],
+    combinations: list[Combination],
+    targets: FloatArray,
+    target_type: str,
+    target_name: str,
+) -> tuple[Figure, bool]:
     """Targets per category; returns ``(figure, has_legend)``."""
     fig, ax = plt.subplots(figsize=(12, 8))
     num_categories = len(categories)
@@ -175,7 +191,9 @@ def _target_figure(categories, weights, labels, combinations, targets, target_ty
     return fig, True
 
 
-def _category_index(group_indices, categories, vector):
+def _category_index(
+    group_indices: Sequence[int], categories: list[Combination], vector: FloatArray | None
+) -> int | None:
     """Index of the category ``vector`` has in the group, or ``None``."""
     if vector is None:
         return None
@@ -196,7 +214,15 @@ def _category_index(group_indices, categories, vector):
     return None
 
 
-def _weights_figure(group_indices, categories, weights, labels, samples, exemplars, names):
+def _weights_figure(
+    group_indices: Sequence[int],
+    categories: list[Combination],
+    weights: FloatArray,
+    labels: list[str],
+    samples: list[FloatArray] | None,
+    exemplars: list[FloatArray] | None,
+    names: Sequence[str] | None,
+) -> tuple[Figure, bool]:
     """Bar chart of the weights; returns ``(figure, has_legend)``."""
     fig, ax = plt.subplots(figsize=(12, 8))
     num_categories = len(categories)

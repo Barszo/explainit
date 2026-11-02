@@ -1,6 +1,10 @@
 """Colours and the dark theme shared by all explainit plots."""
 
+from typing import Any, Literal
+
 import matplotlib.pyplot as plt
+from matplotlib.axes import Axes
+from matplotlib.legend import Legend
 
 COLORS = {
     "deep_teal": "#008080",
@@ -95,7 +99,7 @@ def apply_style() -> None:
     plt.rcParams["axes.facecolor"] = COLORS["plot_background"]
 
 
-def style_axes(ax, grid: str = "both") -> None:
+def style_axes(ax: Axes, grid: Literal["both", "x", "y"] = "both") -> None:
     """Theme one axes: open spines, dashed grid (``"both"`` or ``"y"``), large bold labels."""
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
@@ -116,7 +120,9 @@ def style_axes(ax, grid: str = "both") -> None:
     ax.tick_params(axis="y", colors=TEXT, labelsize=24)
 
 
-def styled_legend(ax, *handles_and_labels, fontsize, anchor):
+def styled_legend(
+    ax: Axes, *handles_and_labels: Any, fontsize: float, anchor: tuple[float, float]
+) -> Legend:
     """A themed legend to the right of ``ax``, anchored at ``anchor`` (axes coordinates)."""
     legend = ax.legend(
         *handles_and_labels,
