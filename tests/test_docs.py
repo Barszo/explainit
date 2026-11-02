@@ -1,4 +1,4 @@
-"""Execute the Python examples in the documentation so they cannot go stale.
+"""Keep the documentation correct: run its Python examples and check its links.
 
 Code blocks in a document share one namespace and run in order. When a
 ``python`` block is immediately followed by a ``text`` block, the text block is
@@ -15,6 +15,11 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 DOCUMENTS = [ROOT / "README.md", *sorted((ROOT / "docs").glob("*.md"))]
+MARKDOWN = sorted(
+    [*ROOT.glob("*.md"), *(ROOT / "docs").glob("*.md"), *(ROOT / ".github").rglob("*.md")]
+)
+# Inline links and images: ``[text](target)``; the target ends at a space or ``)``.
+LINK = re.compile(r"!?\[[^\]]*\]\((?P<target>[^)\s]+)")
 BLOCK = re.compile(r"```python\n(?P<code>.*?)```\n(?:\n```text\n(?P<output>.*?)```)?", re.DOTALL)
 
 
@@ -35,3 +40,16 @@ def test_python_examples_run(document, monkeypatch, tmp_path):
             pytest.fail(f"{document.name} code block {number} failed: {exc!r}\n\n{code}")
         if expected is not None:
             assert stdout.getvalue() == expected, f"{document.name} code block {number}"
+
+
+@pytest.mark.parametrize("document", MARKDOWN, ids=lambda p: str(p.relative_to(ROOT)))
+def test_relative_links_point_to_existing_files(document):
+    text = re.sub(r"```.*?```", "", document.read_text(encoding="utf-8"), flags=re.DOTALL)
+    broken = []
+    for match in LINK.finditer(text):
+        target = match["target"].split("#", 1)[0]
+        if not target or re.match(r"[a-z][a-z0-9+.-]*:", target):
+            continue  # an anchor on the same page, or a URL
+        if not (document.parent / target).exists():
+            broken.append(match["target"])
+    assert not broken, f"broken links in {document.name}: {broken}"

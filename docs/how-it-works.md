@@ -19,8 +19,8 @@ proposed; the MINLP search also excludes zero-priority regions) and they
 
 ## Random search (`RandomSearchExplainer`)
 
-Source: [`explainit/explainers/random_search.py`](../explainit/explainers/random_search.py);
-sampling in [`explainit/sampling.py`](../explainit/sampling.py)
+Source: [`src/explainit/explainers/random_search.py`](../src/explainit/explainers/random_search.py);
+sampling in [`src/explainit/sampling.py`](../src/explainit/sampling.py)
 
 1. Immutable features are fixed at their sample value; forbidden categories
    are removed.
@@ -38,7 +38,7 @@ counterfactual.
 
 ## Shapley-guided MINLP search (`MINLPSearchExplainer`)
 
-Source: [`explainit/explainers/minlp/`](../explainit/explainers/minlp/)
+Source: [`src/explainit/explainers/minlp/`](../src/explainit/explainers/minlp/)
 
 The search treats counterfactual generation as a mixed-integer nonlinear
 program: maximise $S(\mathbf{x}')$ subject to reaching the target, with

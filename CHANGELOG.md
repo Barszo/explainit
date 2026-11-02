@@ -77,6 +77,8 @@ change later searches (formerly known issues MINLP-2 and MINLP-4).
   Matplotlib 3.9 (previously Python 3.13.5; the NumPy/SciPy minimums were not
   declared).
 - Packaging metadata moved from `setup.py` to `pyproject.toml`.
+- The source code moved to `src/explainit/` (the "src layout"), so tests
+  always run against the installed package. Imports are unchanged.
 
 ### Removed
 

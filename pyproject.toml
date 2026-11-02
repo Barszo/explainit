@@ -75,6 +75,7 @@ dev = [
 version = { attr = "explainit.__version__" }
 
 [tool.setuptools.packages.find]
+where = ["src"]
 include = ["explainit", "explainit.*"]
 
 [tool.setuptools.package-data]
@@ -135,7 +136,8 @@ combine-as-imports = true
 
 [tool.mypy]
 python_version = "3.12"
-files = ["explainit", "tests", "benchmarks"]
+files = ["src", "tests", "benchmarks"]
+mypy_path = "src"
 # Everything is type-checked; tests and scripts need not be annotated.
 check_untyped_defs = true
 strict_equality = true
